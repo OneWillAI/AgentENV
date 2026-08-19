@@ -10,8 +10,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
-    CreateIdempotencyRecord, CreateIdempotencyRecordState, PersistenceResult,
-    SandboxPersistenceError, SandboxPersister,
+    CreateIdempotencyRecord, PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
@@ -545,6 +544,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::persistence::CreateIdempotencyRecordState;
     use crate::sandbox::{
         mock::{MockBackendFactory, MockSnapshot},
         FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
