@@ -27,7 +27,13 @@ const CREATE_IDEMPOTENCY_DB_DIR: &str = "create-idempotency.db";
 #[serde(rename_all = "snake_case")]
 enum PersistedPausedLifecycle {
     Paused,
+    /// The resumed VM has not yet reached the durable-success point. Keep
+    /// this record and its artifacts across restart: a process crash here may
+    /// have left the previous Firecracker child alive.
     Resuming,
+    /// The resumed VM was published as Running. This durable commit permits
+    /// exact snapshot cleanup, including after a crash during cleanup.
+    Resumed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,6 +41,10 @@ enum PersistedPausedLifecycle {
 struct PersistedPausedRecord {
     version: u32,
     lifecycle: PersistedPausedLifecycle,
+    /// Linux boot identity captured before a resume can launch a new VM.
+    /// Absent legacy records fail closed during startup recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resuming_boot_id: Option<String>,
     metadata: SandboxMetadata,
     artifact_root: PathBuf,
     state: Value,
@@ -71,6 +81,16 @@ impl PersistedPausedRecord {
         self.metadata.paused_state = None;
         self.metadata
     }
+
+    fn into_recovery_pending_metadata<F>(self, factory: &F) -> PersistenceResult<SandboxMetadata>
+    where
+        F: SandboxBackendFactory,
+    {
+        let mut metadata = self.into_metadata(factory)?;
+        metadata.paused_runtime_stopped = false;
+        metadata.resume_recovery_pending = true;
+        Ok(metadata)
+    }
 }
 
 fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
@@ -92,6 +112,25 @@ fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
             source: None,
         })
     }
+}
+
+/// A changed Linux boot ID proves any Firecracker child from an interrupted
+/// prior AgentENV process cannot still be alive. Missing boot IDs deliberately
+/// provide no proof, including for legacy records written before this field.
+fn host_reboot_proves_runtime_absent(
+    recorded_boot_id: Option<&str>,
+    current_boot_id: Option<&str>,
+) -> bool {
+    matches!(
+        (recorded_boot_id, current_boot_id),
+        (Some(recorded), Some(current)) if recorded != current
+    )
+}
+
+fn current_host_boot_id() -> Option<String> {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot_id = boot_id.trim();
+    (!boot_id.is_empty()).then(|| boot_id.to_owned())
 }
 
 fn decode_create_idempotency_record(bytes: &[u8]) -> PersistenceResult<CreateIdempotencyRecord> {
@@ -240,6 +279,44 @@ impl FileBackedSandboxPersister {
         }
     }
 
+    /// Remove only the generation consumed by a committed resume. New pause
+    /// cycles allocate separate generation directories, so deleting the whole
+    /// `<sandbox-id>` directory here would reintroduce a resume/pause race.
+    async fn cleanup_consumed_resume_generation(
+        &self,
+        artifact_root: &Path,
+    ) -> PersistenceResult<()> {
+        Self::remove_artifact_root(artifact_root).await
+    }
+
+    /// Make successful-resume cleanup crash-safe. The `Resumed` marker is the
+    /// durable commit point: if the process dies before it, startup retains a
+    /// `Resuming` tombstone; if it dies after it, startup can finish deleting
+    /// exactly this generation and the record.
+    async fn finalize_resumed_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        let mut record = self.get_record(sandbox_id).await?;
+        match record.lifecycle {
+            PersistedPausedLifecycle::Resuming => {
+                record.lifecycle = PersistedPausedLifecycle::Resumed;
+                record.resuming_boot_id = None;
+                self.put_record(&record).await?;
+            }
+            PersistedPausedLifecycle::Resumed => {}
+            PersistedPausedLifecycle::Paused => {
+                return Err(SandboxPersistenceError::InvalidRecord {
+                    reason: format!(
+                        "cannot finalize paused sandbox {sandbox_id} before it is marked resuming"
+                    ),
+                    source: None,
+                });
+            }
+        }
+
+        self.cleanup_consumed_resume_generation(&record.artifact_root)
+            .await?;
+        self.remove_record(sandbox_id).await
+    }
+
     async fn cleanup_invalid_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "cleaning up invalid paused sandbox record");
         self.remove_record(sandbox_id).await?;
@@ -317,7 +394,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             let sandbox_id_from_key = std::str::from_utf8(&key)
                 .ok()
                 .and_then(|value| SandboxId::parse_str(value).ok());
-            let record = match decode_record(&bytes) {
+            let mut record = match decode_record(&bytes) {
                 Ok(record) => record,
                 Err(err) => {
                     warn!(record_key = %String::from_utf8_lossy(&key), error = %err, "discarding invalid paused sandbox record");
@@ -329,10 +406,43 @@ impl SandboxPersister for FileBackedSandboxPersister {
             };
             let sandbox_id = record.metadata.id;
 
-            if record.lifecycle == PersistedPausedLifecycle::Resuming {
-                warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
-                self.cleanup_invalid_record(&sandbox_id).await?;
+            if record.lifecycle == PersistedPausedLifecycle::Resumed {
+                info!(sandbox_id = %sandbox_id, "finishing committed resumed sandbox cleanup");
+                self.finalize_resumed_record(&sandbox_id).await?;
+                // Do not let the generic orphan sweep remove any sibling
+                // generation here. This cleanup is intentionally exact.
+                retained_artifacts.insert(sandbox_id);
                 continue;
+            }
+
+            if record.lifecycle == PersistedPausedLifecycle::Resuming {
+                if host_reboot_proves_runtime_absent(
+                    record.resuming_boot_id.as_deref(),
+                    current_host_boot_id().as_deref(),
+                ) {
+                    info!(sandbox_id = %sandbox_id, "host reboot proved interrupted resumed runtime absent; restoring paused record");
+                    record.lifecycle = PersistedPausedLifecycle::Paused;
+                    record.resuming_boot_id = None;
+                    record.metadata.paused_runtime_stopped = true;
+                    self.put_record(&record).await?;
+                } else {
+                    warn!(sandbox_id = %sandbox_id, "retaining paused sandbox record left in resuming state until a later host boot proves runtime absence");
+                    retained_artifacts.insert(sandbox_id);
+                    if record.metadata.virtualization_mode != self.virtualization_mode {
+                        let mut metadata = record.into_metadata_without_runtime_state();
+                        metadata.paused_runtime_stopped = false;
+                        metadata.resume_recovery_pending = true;
+                        sandboxes.push(metadata);
+                    } else {
+                        match record.into_recovery_pending_metadata(factory) {
+                            Ok(metadata) => sandboxes.push(metadata),
+                            Err(err) => {
+                                warn!(sandbox_id = %sandbox_id, error = %err, "retaining interrupted resume whose paused state could not be decoded");
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
 
             if record.metadata.virtualization_mode != self.virtualization_mode {
@@ -414,6 +524,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let record = PersistedPausedRecord {
             version: RECORD_VERSION,
             lifecycle: PersistedPausedLifecycle::Paused,
+            resuming_boot_id: None,
             metadata: metadata.clone(),
             artifact_root: artifact_root.to_path_buf(),
             state,
@@ -443,8 +554,15 @@ impl SandboxPersister for FileBackedSandboxPersister {
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "marking paused sandbox as resuming");
+        let boot_id = current_host_boot_id().ok_or_else(|| SandboxPersistenceError::InvalidRecord {
+            reason: format!(
+                "cannot mark paused sandbox {sandbox_id} resuming because the Linux host boot ID is unavailable"
+            ),
+            source: None,
+        })?;
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Resuming;
+        record.resuming_boot_id = Some(boot_id);
         record.metadata.paused_runtime_stopped = false;
         self.put_record(&record).await
     }
@@ -453,13 +571,14 @@ impl SandboxPersister for FileBackedSandboxPersister {
         debug!(sandbox_id = %sandbox_id, "rolling back paused sandbox to paused");
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Paused;
+        record.resuming_boot_id = None;
         record.metadata.paused_runtime_stopped = false;
         self.put_record(&record).await
     }
 
     async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
-        debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record");
-        self.remove_record(sandbox_id).await
+        debug!(sandbox_id = %sandbox_id, "committing resumed sandbox record cleanup");
+        self.finalize_resumed_record(sandbox_id).await
     }
 
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -805,7 +924,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resuming_records_are_cleaned_on_load() -> anyhow::Result<()> {
+    async fn resuming_records_are_retained_as_same_boot_recovery_tombstones() -> anyhow::Result<()>
+    {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -826,9 +946,51 @@ mod tests {
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &metadata.id).await?);
-        assert!(!persister.sandbox_artifact_root(&metadata.id).exists());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, metadata.id);
+        assert_eq!(loaded[0].state, SandboxState::Paused);
+        assert!(loaded[0].resume_recovery_pending);
+        assert!(loaded[0].paused_state.is_some());
+        assert!(has_record(&persister, &metadata.id).await?);
+        assert!(persister.sandbox_artifact_root(&metadata.id).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_boot_reconciles_resuming_record_to_paused() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join("snapshot");
+        let paused_state = paused_state(&snapshot_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .await?;
+        persister.mark_resuming(&sandbox_id).await?;
+
+        // Model a record inherited from a prior Linux boot. A distinct boot
+        // identity is the positive absence proof for the old Firecracker VM.
+        let mut record = persister.get_record(&sandbox_id).await?;
+        let current_boot = current_host_boot_id().expect("Linux test host has a boot ID");
+        record.resuming_boot_id = Some(format!("{current_boot}-previous"));
+        persister.put_record(&record).await?;
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded[0].resume_recovery_pending);
+        assert!(loaded[0].paused_runtime_stopped);
+        let record = persister.get_record(&sandbox_id).await?;
+        assert_eq!(record.lifecycle, PersistedPausedLifecycle::Paused);
+        assert!(record.resuming_boot_id.is_none());
+        assert!(snapshot_root.exists());
         Ok(())
     }
 
@@ -893,16 +1055,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_record_removes_record_but_keeps_artifacts() -> anyhow::Result<()> {
+    async fn successful_resume_removes_only_the_consumed_generation() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        let sandbox_id = SandboxId::new();
+        let consumed_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let next_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let paused_state = paused_state(&consumed_generation);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&consumed_generation), paused_state.as_ref())
+            .await?;
+        persister.mark_resuming(&sandbox_id).await?;
 
         persister.delete_record(&sandbox_id).await?;
 
         assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(snapshot_root.exists());
+        assert!(!consumed_generation.exists());
+        assert!(next_generation.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_finishes_committed_resumed_generation_cleanup() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let consumed_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let sibling_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let paused_state = paused_state(&consumed_generation);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&consumed_generation), paused_state.as_ref())
+            .await?;
+        persister.mark_resuming(&sandbox_id).await?;
+        let mut record = persister.get_record(&sandbox_id).await?;
+        record.lifecycle = PersistedPausedLifecycle::Resumed;
+        record.resuming_boot_id = None;
+        persister.put_record(&record).await?;
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert!(loaded.is_empty());
+        assert!(!has_record(&persister, &sandbox_id).await?);
+        assert!(!consumed_generation.exists());
+        assert!(sibling_generation.exists());
         Ok(())
     }
 

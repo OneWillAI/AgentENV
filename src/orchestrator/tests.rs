@@ -698,6 +698,35 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
 }
 
 #[tokio::test]
+async fn same_boot_resume_tombstone_blocks_resume_and_delete() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let mut paused = paused_resume_metadata(sandbox_id);
+    paused.resume_recovery_pending = true;
+    let persister = RecordingPersister::with_loaded(vec![paused]);
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister,
+    )
+    .await?;
+
+    for result in [
+        orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+            .await
+            .map(|_| ()),
+        orchestrator.delete_sandbox(sandbox_id).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id: id }) if id == sandbox_id
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn new_converts_an_interrupted_create_claim_to_a_durable_tombstone() -> Result<()> {
     setup();
     let sandbox_id = SandboxId::new();
@@ -4575,6 +4604,54 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
     assert!(matches!(err, OrchestratorError::ShuttingDown));
     assert_metrics_values(&orchestrator, 2, 1, 0, 0, 0, 0).await;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_multiple_slow_serial_pauses() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let mut sandbox_ids = Vec::new();
+    for index in 0..3 {
+        let team = format!("shutdown-slow-{index}");
+        sandbox_ids.push(
+            orchestrator
+                .create_sandbox(create_request(Some(60), &[("team", &team)]))
+                .await?
+                .id,
+        );
+    }
+
+    const PAUSE_DELAY: Duration = Duration::from_millis(80);
+    for _ in &sandbox_ids {
+        behavior.push_action(MockOperation::Pause, MockAction::SucceedAfter(PAUSE_DELAY));
+    }
+
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), orchestrator.shutdown())
+        .await
+        .expect("shutdown should wait for every slow pause")?;
+
+    // The shutdown loop pauses each sandbox serially. A systemd timeout must
+    // accommodate all of them, not only the first one that begins snapshotting.
+    assert!(
+        started.elapsed() >= PAUSE_DELAY.saturating_mul(2),
+        "shutdown returned before all serialized pause operations completed"
+    );
+    for sandbox_id in sandbox_ids {
+        assert_eq!(
+            orchestrator
+                .get_sandbox(&sandbox_id)
+                .await?
+                .expect("sandbox should remain after shutdown")
+                .state,
+            SandboxState::Paused
+        );
+    }
     Ok(())
 }
 

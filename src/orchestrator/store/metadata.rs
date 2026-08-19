@@ -58,6 +58,12 @@ pub struct SandboxMetadata {
     /// its resume artifacts were persisted. Legacy records default false.
     #[serde(default)]
     pub paused_runtime_stopped: bool,
+    /// Set when startup finds a `Resuming` persistence record from this same
+    /// host boot. The previous AgentENV process may have left its Firecracker
+    /// child alive, so the retained snapshot must not be resumed or deleted
+    /// until a later host boot proves that child is gone.
+    #[serde(skip)]
+    pub resume_recovery_pending: bool,
     pub network_policy: SandboxNetworkPolicy,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Persisted into committed snapshots so template launches inherit it
@@ -101,6 +107,7 @@ impl Default for SandboxMetadata {
             create_idempotency_key: None,
             create_request_fingerprint: None,
             paused_runtime_stopped: false,
+            resume_recovery_pending: false,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             secure: false,

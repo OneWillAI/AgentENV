@@ -68,6 +68,11 @@ pub enum OrchestratorError {
         state: SandboxState,
     },
 
+    #[error(
+        "sandbox {sandbox_id} has an interrupted resume from the current host boot; reboot this worker before retrying"
+    )]
+    SandboxRecoveryRequired { sandbox_id: SandboxId },
+
     #[error("sandbox {sandbox_id} operation {operation:?} failed: {source}")]
     SandboxOperationFailed {
         sandbox_id: SandboxId,

@@ -1348,15 +1348,21 @@ where
         // failed while removing durable state. Its metadata is intentionally
         // gone, but the in-memory Deleting tombstone allows an exact retry to
         // finish cleanup without releasing the key early.
-        if self.store.get(&sandbox_id).await?.is_none() {
-            if let Some((key, entry)) = self.deleting_create_for_sandbox(sandbox_id).await {
-                self.finish_durable_sandbox_delete(&key, &entry).await?;
-                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-                    .await;
-                info!("sandbox delete cleanup completed");
-                return Ok(());
+        match self.store.get(&sandbox_id).await? {
+            Some(metadata) if metadata.resume_recovery_pending => {
+                return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
             }
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+            Some(_) => {}
+            None => {
+                if let Some((key, entry)) = self.deleting_create_for_sandbox(sandbox_id).await {
+                    self.finish_durable_sandbox_delete(&key, &entry).await?;
+                    self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                        .await;
+                    info!("sandbox delete cleanup completed");
+                    return Ok(());
+                }
+                return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+            }
         }
 
         // Attempt to transition to Killing, retrying after waiting whenever we
@@ -1673,6 +1679,7 @@ where
                             .get(&sandbox_id)
                             .await?
                             .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                        Self::require_resume_recovery_resolved(&metadata)?;
                         Self::require_idempotent_paused_stop_proof(&metadata)
                     }
                     SandboxState::Killing => {
@@ -1899,6 +1906,15 @@ where
         Ok(())
     }
 
+    fn require_resume_recovery_resolved(metadata: &SandboxMetadata) -> Result<()> {
+        if metadata.resume_recovery_pending {
+            return Err(OrchestratorError::SandboxRecoveryRequired {
+                sandbox_id: metadata.id,
+            });
+        }
+        Ok(())
+    }
+
     /// Resumes a paused sandbox from its snapshot.
     ///
     /// If another `resume_sandbox` call is already in progress (`Resuming`
@@ -1944,6 +1960,8 @@ where
                 .wait_for_transition(sandbox_id, SandboxState::Resuming)
                 .await?;
         }
+
+        Self::require_resume_recovery_resolved(&metadata)?;
 
         match metadata.state {
             SandboxState::Killing => {
