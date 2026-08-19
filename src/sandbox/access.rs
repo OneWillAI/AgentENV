@@ -217,7 +217,16 @@ fn create_managed_seed(path: &Path) -> Result<String> {
     let parent = path
         .parent()
         .context("managed envd access-token seed path has no parent")?;
-    fs::create_dir_all(parent)
+    let mut directory = fs::DirBuilder::new();
+    directory.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        directory.mode(0o700);
+    }
+    directory
+        .create(parent)
         .with_context(|| format!("create managed secret directory {}", parent.display()))?;
     validate_managed_seed_directory_identity(parent).with_context(|| {
         format!(
