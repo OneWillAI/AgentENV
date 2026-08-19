@@ -625,8 +625,7 @@ impl FileBackedSandboxPersister {
         if found_sandbox_id.to_string_lossy() != sandbox_id.to_string() {
             return None;
         }
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some()
-        {
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
             return None;
         }
         self.validated_purgeable_artifact_path(path)
@@ -828,12 +827,14 @@ impl FileBackedSandboxPersister {
             })?;
         let mut quarantines = Vec::with_capacity(entries.len());
         for (_key, bytes) in entries {
-            let entry: StoredPausedSandboxQuarantine = serde_json::from_slice(&bytes).map_err(
-                |source| SandboxPersistenceError::InvalidRecord {
-                    reason: "failed to deserialize paused sandbox quarantine record".to_string(),
-                    source: Some(source.into()),
-                },
-            )?;
+            let entry: StoredPausedSandboxQuarantine =
+                serde_json::from_slice(&bytes).map_err(|source| {
+                    SandboxPersistenceError::InvalidRecord {
+                        reason: "failed to deserialize paused sandbox quarantine record"
+                            .to_string(),
+                        source: Some(source.into()),
+                    }
+                })?;
             if entry.version != QUARANTINE_VERSION {
                 return Err(SandboxPersistenceError::InvalidRecord {
                     reason: format!(
@@ -1172,21 +1173,19 @@ impl FileBackedSandboxPersister {
         let marker_path = Self::recovery_marker_path(artifact_root);
         let root = self.root.clone();
         let marker_path_for_remove = marker_path.clone();
-        tokio::task::spawn_blocking(move || {
-            remove_file_and_sync(&marker_path_for_remove, &root)
-        })
-        .await
-        .map_err(|source| SandboxPersistenceError::InvalidRecord {
-            reason: "join paused sandbox recovery marker removal task".to_string(),
-            source: Some(source.into()),
-        })?
-        .map_err(|source| {
-            SandboxPersistenceError::io(
-                "remove paused sandbox recovery marker",
-                &marker_path,
-                source,
-            )
-        })
+        tokio::task::spawn_blocking(move || remove_file_and_sync(&marker_path_for_remove, &root))
+            .await
+            .map_err(|source| SandboxPersistenceError::InvalidRecord {
+                reason: "join paused sandbox recovery marker removal task".to_string(),
+                source: Some(source.into()),
+            })?
+            .map_err(|source| {
+                SandboxPersistenceError::io(
+                    "remove paused sandbox recovery marker",
+                    &marker_path,
+                    source,
+                )
+            })
     }
 
     async fn write_index(&self, entry: &ManifestEntry) -> PersistenceResult<()> {
@@ -1253,8 +1252,8 @@ impl FileBackedSandboxPersister {
             }
         };
         if let Err(source) = self.write_index(&prepared_entry).await {
-                return Err(self
-                    .quarantine_uncertain_commit(
+            return Err(self
+                .quarantine_uncertain_commit(
                     record,
                     "failed to durably index prepared paused sandbox manifest",
                     source,
@@ -1288,8 +1287,8 @@ impl FileBackedSandboxPersister {
             }
         };
         if let Err(source) = self.write_index(&committed_entry).await {
-                return Err(self
-                    .quarantine_uncertain_commit(
+            return Err(self
+                .quarantine_uncertain_commit(
                     record,
                     "failed to durably index committed paused sandbox manifest",
                     source,
@@ -1320,9 +1319,10 @@ impl FileBackedSandboxPersister {
 
     async fn sync_artifact_tree(&self, artifact_root: &Path) -> PersistenceResult<()> {
         let artifact_root = artifact_root.to_path_buf();
+        let sync_artifact_root = artifact_root.clone();
         let sync_root = self.root.clone();
         tokio::task::spawn_blocking(move || {
-            sync_artifact_tree_and_parents(&artifact_root, &sync_root)
+            sync_artifact_tree_and_parents(&sync_artifact_root, &sync_root)
         })
         .await
         .map_err(|source| SandboxPersistenceError::InvalidRecord {
@@ -1617,8 +1617,8 @@ impl FileBackedSandboxPersister {
                 };
                 (record.metadata.id == key_id
                     && self.path_is_managed_generation(&key_id, &record.artifact_root))
-                    .then(|| stdfs::canonicalize(record.artifact_root).ok())
-                    .flatten()
+                .then(|| stdfs::canonicalize(record.artifact_root).ok())
+                .flatten()
             })
             .collect::<HashSet<_>>();
         let (manifests, mut quarantined) = self.scan_manifests(&legacy_artifact_roots).await?;
@@ -1658,10 +1658,11 @@ impl FileBackedSandboxPersister {
         }
         report.quarantined_items = quarantined;
 
-        let recovery_blocks = (!allow_manual_recovery)
-            .then(|| self.recovery_blocks())
-            .transpose()?
-            .unwrap_or_default();
+        let recovery_blocks = if allow_manual_recovery {
+            PausedRecoveryBlocks::default()
+        } else {
+            self.recovery_blocks().await?
+        };
         let mut selected_v2 = HashMap::new();
         let mut legacy = Vec::new();
         let mut blocked = duplicate_ids;
@@ -1709,8 +1710,7 @@ impl FileBackedSandboxPersister {
                         }
                         report.quarantined_items += 2;
                         blocked.insert(sandbox_id);
-                    } else if !self.path_is_managed_generation(&sandbox_id, &record.artifact_root)
-                    {
+                    } else if !self.path_is_managed_generation(&sandbox_id, &record.artifact_root) {
                         self.quarantine(
                             "legacy paused sandbox record references an unsafe artifact path",
                             Some(&key),
@@ -1740,7 +1740,8 @@ impl FileBackedSandboxPersister {
                         report.quarantined_items += 1;
                         continue;
                     };
-                    if blocked.contains(&sandbox_id) || recovery_blocks.contains_sandbox(&sandbox_id)
+                    if blocked.contains(&sandbox_id)
+                        || recovery_blocks.contains_sandbox(&sandbox_id)
                     {
                         blocked.insert(sandbox_id);
                         continue;
