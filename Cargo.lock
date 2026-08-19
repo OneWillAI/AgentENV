@@ -5130,7 +5130,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "http 1.4.0",
  "opendal",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
