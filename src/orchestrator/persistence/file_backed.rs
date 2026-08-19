@@ -97,6 +97,10 @@ struct ManifestEntry {
     path: PathBuf,
     bytes: Vec<u8>,
     record: PersistedPausedRecord,
+    /// This is deliberately outside the manifest fingerprint: the adjacent
+    /// marker is the durable acknowledgement fence for an otherwise
+    /// ambiguous metadata write.
+    recovery_marker_present: bool,
 }
 
 #[derive(Default)]
@@ -628,12 +632,77 @@ impl FileBackedSandboxPersister {
         if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
             return None;
         }
-        self.validated_purgeable_artifact_path(path)
+        let canonical = self.validated_purgeable_artifact_path(path)?;
+        matches!(stdfs::symlink_metadata(&canonical), Ok(metadata) if metadata.file_type().is_dir())
+            .then_some(canonical)
     }
 
     fn path_is_managed_generation(&self, sandbox_id: &SandboxId, path: &Path) -> bool {
         self.validated_managed_generation_path(sandbox_id, path)
             .is_some()
+    }
+
+    /// Version-one records were created by the same allocator used today:
+    /// `<store>/artifacts/<sandbox-id>/<generation>`.  Keep this separate
+    /// policy boundary even though the historical layout is currently the
+    /// same as v2, so accepting a legacy record never relaxes the v2 path
+    /// contract or permits an arbitrary old path to be deleted.
+    fn validated_legacy_artifact_root(
+        &self,
+        sandbox_id: &SandboxId,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        self.validated_managed_generation_path(sandbox_id, path)
+    }
+
+    fn path_is_valid_legacy_artifact_root(&self, sandbox_id: &SandboxId, path: &Path) -> bool {
+        self.validated_legacy_artifact_root(sandbox_id, path)
+            .is_some()
+    }
+
+    /// A raw index can be replaced only when a fully valid, same-ID v2
+    /// manifest already exists.  Preserve the raw bytes in quarantine first.
+    /// Recognizable but conflicting identities, unsupported formats, and
+    /// legacy records remain blocking rather than being silently superseded.
+    fn raw_index_can_be_rebuilt_from_manifest(
+        bytes: &[u8],
+        sandbox_id: &SandboxId,
+        candidate: &ManifestEntry,
+    ) -> bool {
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return true;
+        };
+        let Some(object) = value.as_object() else {
+            return true;
+        };
+
+        let Some(index_version) = object.get("indexVersion") else {
+            // A recognizable persisted record is never an index-repair
+            // candidate, even if it is malformed or unsupported.
+            return object.get("version").is_none();
+        };
+        match index_version.as_u64() {
+            Some(version) if version != u64::from(PAUSED_INDEX_VERSION) => return false,
+            // A string, null, or other malformed representation is damaged
+            // index data. Continue checking any identity fields before using
+            // the coherent v2 manifest as the repair source.
+            Some(_) | None => {}
+        }
+        if let Some(raw_sandbox_id) = object.get("sandboxId").and_then(Value::as_str) {
+            match SandboxId::parse_str(raw_sandbox_id) {
+                Ok(index_sandbox_id) if index_sandbox_id == *sandbox_id => {}
+                Ok(_) => return false,
+                // This is malformed raw index data, not a declared foreign
+                // identity. The coherent manifest remains authoritative.
+                Err(_) => {}
+            }
+        }
+        if let Some(raw_manifest_path) = object.get("manifestPath").and_then(Value::as_str) {
+            if Path::new(raw_manifest_path) != candidate.path {
+                return false;
+            }
+        }
+        true
     }
 
     fn validated_purgeable_artifact_path(&self, path: &Path) -> Option<PathBuf> {
@@ -645,9 +714,27 @@ impl FileBackedSandboxPersister {
         if SandboxId::parse_str(&sandbox_id.to_string_lossy()).is_err() {
             return None;
         }
-        let generation = match (components.next(), components.next()) {
-            (None, None) => None,
-            (Some(Component::Normal(generation)), None) => Some(generation),
+        let target_components = components
+            .map(|component| match component {
+                Component::Normal(component) => Some(component.to_os_string()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        // Never permit recursive sandbox-root deletion: a malformed root
+        // marker or bad raw index must not erase valid sibling generations.
+        // A purge target is either one exact generation, or one of the two
+        // metadata files at a known generation/sandbox location.
+        let (target_name, target_parent_suffix) = match target_components.as_slice() {
+            [] => return None,
+            [name] if name == PAUSED_MANIFEST_FILE || name == PAUSED_RECOVERY_MARKER_FILE => {
+                (name.clone(), Vec::new())
+            }
+            [generation] => (generation.clone(), Vec::new()),
+            [generation, name]
+                if name == PAUSED_MANIFEST_FILE || name == PAUSED_RECOVERY_MARKER_FILE =>
+            {
+                (name.clone(), vec![generation.clone()])
+            }
             _ => return None,
         };
         let artifacts_root = self.artifacts_root();
@@ -660,20 +747,34 @@ impl FileBackedSandboxPersister {
             Err(_) => return None,
         };
         let sandbox_path = self.artifacts_root().join(sandbox_id);
-        let canonical_parent = match generation {
-            None => canonical_artifacts,
-            Some(_) => match stdfs::symlink_metadata(&sandbox_path) {
+        let canonical_sandbox = match stdfs::symlink_metadata(&sandbox_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return None,
+            Ok(_) => {
+                let canonical_sandbox = stdfs::canonicalize(&sandbox_path).ok()?;
+                (canonical_sandbox.parent() == Some(canonical_artifacts.as_path()))
+                    .then_some(canonical_sandbox)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                canonical_artifacts.join(sandbox_id)
+            }
+            Err(_) => return None,
+        };
+        let canonical_parent = if let Some(generation) = target_parent_suffix.first() {
+            let generation_path = sandbox_path.join(generation);
+            match stdfs::symlink_metadata(&generation_path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => return None,
                 Ok(_) => {
-                    let canonical_sandbox = stdfs::canonicalize(&sandbox_path).ok()?;
-                    (canonical_sandbox.parent() == Some(canonical_artifacts.as_path()))
-                        .then_some(canonical_sandbox)?
+                    let canonical_generation = stdfs::canonicalize(&generation_path).ok()?;
+                    (canonical_generation.parent() == Some(canonical_sandbox.as_path()))
+                        .then_some(canonical_generation)?
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    canonical_artifacts.join(sandbox_id)
+                    canonical_sandbox.join(generation)
                 }
                 Err(_) => return None,
-            },
+            }
+        } else {
+            canonical_sandbox
         };
         match stdfs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => None,
@@ -683,10 +784,23 @@ impl FileBackedSandboxPersister {
                     .then_some(canonical_target)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(canonical_parent.join(path.file_name()?))
+                Some(canonical_parent.join(target_name))
             }
             Err(_) => None,
         }
+    }
+
+    fn quarantine_target_for_manifest(
+        &self,
+        directory: &Path,
+        manifest_path: &Path,
+    ) -> Option<PathBuf> {
+        self.validated_purgeable_artifact_path(directory)
+            .map(|_| directory.to_path_buf())
+            .or_else(|| {
+                self.validated_purgeable_artifact_path(manifest_path)
+                    .map(|_| manifest_path.to_path_buf())
+            })
     }
 
     fn quarantine_id(
@@ -767,6 +881,47 @@ impl FileBackedSandboxPersister {
         .await
     }
 
+    /// Keep malformed index bytes for forensic recovery without making a
+    /// coherent v2 manifest permanently unavailable.  The caller must have
+    /// already proven the candidate manifest has the same sandbox identity.
+    async fn quarantine_repairable_index(
+        &self,
+        reason: impl Into<String>,
+        record_key: Option<&[u8]>,
+        record_bytes: Option<&[u8]>,
+        artifact_root: Option<&Path>,
+        manifest_path: Option<&Path>,
+    ) -> PersistenceResult<String> {
+        self.quarantine_nonblocking(
+            reason,
+            record_key,
+            record_bytes,
+            artifact_root,
+            manifest_path,
+        )
+        .await
+    }
+
+    async fn quarantine_nonblocking(
+        &self,
+        reason: impl Into<String>,
+        record_key: Option<&[u8]>,
+        record_bytes: Option<&[u8]>,
+        artifact_root: Option<&Path>,
+        manifest_path: Option<&Path>,
+    ) -> PersistenceResult<String> {
+        self.quarantine_with_policy(
+            reason,
+            record_key,
+            record_bytes,
+            artifact_root,
+            manifest_path,
+            false,
+            false,
+        )
+        .await
+    }
+
     async fn quarantine_with_policy(
         &self,
         reason: impl Into<String>,
@@ -786,7 +941,7 @@ impl FileBackedSandboxPersister {
             requires_manual_recovery,
             reconcile_if_coherent,
         );
-        let entry = StoredPausedSandboxQuarantine {
+        let mut entry = StoredPausedSandboxQuarantine {
             version: QUARANTINE_VERSION,
             id: id.clone(),
             reason,
@@ -800,14 +955,75 @@ impl FileBackedSandboxPersister {
             artifact_root: artifact_root.map(Path::to_path_buf),
             manifest_path: manifest_path.map(Path::to_path_buf),
         };
+        let quarantine_db = self.quarantine_db().await?;
+        // Marker discovery is intentionally idempotent. Do not discard the
+        // original index hash/bytes captured by an uncertain commit merely
+        // because a later startup re-inventories the same marker.
+        if record_bytes.is_none() {
+            if let Some(existing_bytes) =
+                quarantine_db
+                    .get(id.as_bytes().to_vec())
+                    .await
+                    .map_err(|source| {
+                        SandboxPersistenceError::store("read paused sandbox quarantine", source)
+                    })?
+            {
+                let existing: StoredPausedSandboxQuarantine =
+                    serde_json::from_slice(&existing_bytes).map_err(|source| {
+                        SandboxPersistenceError::InvalidRecord {
+                            reason:
+                                "failed to deserialize existing paused sandbox quarantine record"
+                                    .to_string(),
+                            source: Some(source.into()),
+                        }
+                    })?;
+                if existing.version != QUARANTINE_VERSION {
+                    return Err(SandboxPersistenceError::InvalidRecord {
+                        reason: format!(
+                            "unsupported existing paused sandbox quarantine version {}",
+                            existing.version
+                        ),
+                        source: None,
+                    });
+                }
+                entry.record_sha256 = existing.record_sha256;
+                entry.record_bytes_base64 = existing.record_bytes_base64;
+            }
+        }
+        // Marker discovery can happen after an uncertain index write has
+        // returned. Capture the exact current record if it is readable so an
+        // explicit purge can distinguish that known state from a later
+        // replacement. Failure to read RocksDB must not prevent preserving
+        // the durable marker in quarantine.
+        if entry.record_sha256.is_none() {
+            if let Some(record_key) = entry.record_key.clone() {
+                match self.db().await {
+                    Ok(db) => match db.get(record_key.as_bytes().to_vec()).await {
+                        Ok(Some(current)) => {
+                            entry.record_sha256 = Some(sha256_hex(&current));
+                            entry.record_bytes_base64 =
+                                Some(base64::engine::general_purpose::STANDARD.encode(current));
+                        }
+                        Ok(None) => {}
+                        Err(error) => warn!(
+                            error = %error,
+                            "failed to read paused sandbox record while indexing quarantine"
+                        ),
+                    },
+                    Err(error) => warn!(
+                        error = %error,
+                        "failed to open paused sandbox record store while indexing quarantine"
+                    ),
+                }
+            }
+        }
         let bytes = serde_json::to_vec(&entry).map_err(|source| {
             SandboxPersistenceError::InvalidRecord {
                 reason: "failed to serialize paused sandbox quarantine record".to_string(),
                 source: Some(source.into()),
             }
         })?;
-        self.quarantine_db()
-            .await?
+        quarantine_db
             .put(id.as_bytes().to_vec(), bytes)
             .await
             .map_err(|source| {
@@ -886,35 +1102,81 @@ impl FileBackedSandboxPersister {
         // This marker lives with the snapshot rather than only in RocksDB, so
         // restart recovery cannot mistake an ambiguous final index write for
         // a normal committed pause.
-        if let Err(marker_error) = self.write_recovery_marker(sandbox_id, artifact_root).await {
-            warn!(
-                sandbox_id = %sandbox_id,
-                error = %marker_error,
-                "failed to durably mark uncertain paused sandbox commit"
-            );
-        }
+        let marker_written = match self.write_recovery_marker(sandbox_id, artifact_root).await {
+            Ok(()) => true,
+            Err(marker_error) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %marker_error,
+                    "failed to durably mark uncertain paused sandbox commit"
+                );
+                false
+            }
+        };
         let mut recovery_record = record.clone();
         recovery_record.version = PAUSED_MANIFEST_VERSION;
         recovery_record.commit_state = PersistedPausedCommitState::Prepared;
         recovery_record.metadata.resume_recovery_pending = true;
         recovery_record.metadata.paused_runtime_stopped = false;
-        if let Err(manifest_error) = self.write_manifest(&recovery_record).await {
-            warn!(
-                sandbox_id = %sandbox_id,
-                error = %manifest_error,
-                "failed to publish recovery-pending paused sandbox manifest"
-            );
-        }
-        if let Err(quarantine_error) = self
-            .quarantine_uncertain(
+        let recovery_manifest_written = match self.write_manifest(&recovery_record).await {
+            Ok(_) => true,
+            Err(manifest_error) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %manifest_error,
+                    "failed to publish recovery-pending paused sandbox manifest"
+                );
+                false
+            }
+        };
+        // If an index write may actually have committed, retain its exact
+        // current bytes. Purge later refuses a changed replacement, but can
+        // intentionally remove this known uncertain generation.
+        let current_record_bytes = match self.db().await {
+            Ok(db) => match db.get(record_key.as_bytes().to_vec()).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %error,
+                        "failed to read paused sandbox index while recording uncertain commit"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %error,
+                    "failed to open paused sandbox index while recording uncertain commit"
+                );
+                None
+            }
+        };
+        let quarantine_result = if marker_written || recovery_manifest_written {
+            // The manifest/marker is authoritative and will force the
+            // recovery-pending path. Keep a nonblocking inventory entry so
+            // restart can still load the guarded metadata and the CLI has an
+            // explicit purge target.
+            self.quarantine_nonblocking(
                 format!("{reason}; original write error: {source}"),
                 Some(record_key.as_bytes()),
-                None,
+                current_record_bytes.as_deref(),
                 Some(artifact_root),
                 Some(&manifest_path),
             )
             .await
-        {
+        } else {
+            self.quarantine_uncertain(
+                format!("{reason}; original write error: {source}"),
+                Some(record_key.as_bytes()),
+                current_record_bytes.as_deref(),
+                Some(artifact_root),
+                Some(&manifest_path),
+            )
+            .await
+        };
+        if let Err(quarantine_error) = quarantine_result {
             warn!(
                 sandbox_id = %sandbox_id,
                 error = %quarantine_error,
@@ -1071,13 +1333,14 @@ impl FileBackedSandboxPersister {
             }
         }
         let marker_path = Self::recovery_marker_path(&record.artifact_root);
-        match fs::symlink_metadata(&marker_path).await {
+        let recovery_marker_present = match fs::symlink_metadata(&marker_path).await {
             Ok(metadata) if metadata.file_type().is_file() => {
                 // The marker is deliberately fail-closed. Its presence means
                 // a metadata write was observed as ambiguous, even if RocksDB
                 // later happens to contain a matching index.
                 record.metadata.resume_recovery_pending = true;
                 record.metadata.paused_runtime_stopped = false;
+                true
             }
             Ok(_) => {
                 return Err(SandboxPersistenceError::InvalidRecord {
@@ -1088,7 +1351,7 @@ impl FileBackedSandboxPersister {
                     source: None,
                 });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(source) => {
                 return Err(SandboxPersistenceError::io(
                     "inspect paused sandbox recovery marker",
@@ -1096,11 +1359,12 @@ impl FileBackedSandboxPersister {
                     source,
                 ));
             }
-        }
+        };
         Ok(ManifestEntry {
             path: manifest_path.to_path_buf(),
             bytes,
             record,
+            recovery_marker_present,
         })
     }
 
@@ -1133,6 +1397,7 @@ impl FileBackedSandboxPersister {
             path: manifest_path,
             bytes,
             record: record.clone(),
+            recovery_marker_present: false,
         })
     }
 
@@ -1417,20 +1682,46 @@ impl FileBackedSandboxPersister {
         quarantined: &mut usize,
     ) -> PersistenceResult<bool> {
         let manifest_path = Self::manifest_path(directory);
+        let quarantine_target = self.quarantine_target_for_manifest(directory, &manifest_path);
         match fs::symlink_metadata(&manifest_path).await {
             Ok(metadata) if metadata.file_type().is_file() => {
                 match self
                     .read_manifest(&manifest_path, expected_sandbox_id)
                     .await
                 {
-                    Ok(entry) => entries.push(entry),
+                    Ok(entry) => {
+                        if entry.recovery_marker_present
+                            || entry.record.commit_state == PersistedPausedCommitState::Prepared
+                            || entry.record.metadata.resume_recovery_pending
+                        {
+                            // A failed quarantine write must not make an
+                            // on-tree uncertain record invisible to the
+                            // host-local recovery utility. The marker is
+                            // authoritative when present, but a crash may
+                            // have happened after a durable Prepared manifest
+                            // and before marker publication. Inventory all
+                            // recovery-pending forms nonblockingly: their
+                            // manifest state still prevents resume/delete.
+                            let record_key = entry.sandbox_id().to_string();
+                            self.quarantine_nonblocking(
+                                "durable paused sandbox manifest requires explicit host recovery",
+                                Some(record_key.as_bytes()),
+                                None,
+                                Some(&entry.record.artifact_root),
+                                Some(&entry.path),
+                            )
+                            .await?;
+                            *quarantined += 1;
+                        }
+                        entries.push(entry);
+                    }
                     Err(error) => {
                         warn!(manifest = %manifest_path.display(), error = %error, "quarantining invalid paused sandbox manifest");
                         self.quarantine(
                             format!("invalid paused sandbox manifest: {error}"),
                             None,
                             None,
-                            Some(directory),
+                            quarantine_target.as_deref(),
                             Some(&manifest_path),
                         )
                         .await?;
@@ -1444,7 +1735,7 @@ impl FileBackedSandboxPersister {
                     "paused sandbox manifest path is not a regular file",
                     None,
                     None,
-                    Some(directory),
+                    quarantine_target.as_deref(),
                     Some(&manifest_path),
                 )
                 .await?;
@@ -1579,13 +1870,15 @@ impl FileBackedSandboxPersister {
         entry: &ManifestEntry,
         report: &mut PausedSandboxRecoveryReport,
     ) -> PersistenceResult<()> {
-        self.write_index(entry).await.map_err(|source| {
-            SandboxPersistenceError::UncertainCommit {
-                sandbox_id: entry.sandbox_id(),
-                reason: "failed to rebuild paused sandbox index from a valid manifest".to_string(),
-                source: Some(anyhow::Error::new(source)),
-            }
-        })?;
+        if let Err(source) = self.write_index(entry).await {
+            return Err(self
+                .quarantine_uncertain_commit(
+                    &entry.record,
+                    "failed to rebuild paused sandbox index from a valid manifest",
+                    source,
+                )
+                .await);
+        }
         report.indexed_manifests += 1;
         Ok(())
     }
@@ -1616,7 +1909,7 @@ impl FileBackedSandboxPersister {
                     return None;
                 };
                 (record.metadata.id == key_id
-                    && self.path_is_managed_generation(&key_id, &record.artifact_root))
+                    && self.path_is_valid_legacy_artifact_root(&key_id, &record.artifact_root))
                 .then(|| stdfs::canonicalize(record.artifact_root).ok())
                 .flatten()
             })
@@ -1684,7 +1977,11 @@ impl FileBackedSandboxPersister {
                             "legacy paused sandbox record key does not match metadata",
                             Some(&key),
                             Some(&bytes),
-                            Some(&record.artifact_root),
+                            // Neither a foreign key nor declared metadata
+                            // identity can authorize deleting this path.
+                            // Preserve the record bytes for recovery, but do
+                            // not retain a purgeable artifact target.
+                            None,
                             None,
                         )
                         .await?;
@@ -1710,7 +2007,9 @@ impl FileBackedSandboxPersister {
                         }
                         report.quarantined_items += 2;
                         blocked.insert(sandbox_id);
-                    } else if !self.path_is_managed_generation(&sandbox_id, &record.artifact_root) {
+                    } else if !self
+                        .path_is_valid_legacy_artifact_root(&sandbox_id, &record.artifact_root)
+                    {
                         self.quarantine(
                             "legacy paused sandbox record references an unsafe artifact path",
                             Some(&key),
@@ -1787,19 +2086,45 @@ impl FileBackedSandboxPersister {
                     }
                 }
                 Err(error) => {
-                    let inferred_artifact_root =
-                        key_id.map(|sandbox_id| self.sandbox_artifact_root(&sandbox_id));
-                    self.quarantine(
-                        format!("invalid or unsupported paused sandbox record: {error}"),
-                        Some(&key),
-                        Some(&bytes),
-                        inferred_artifact_root.as_deref(),
-                        None,
-                    )
-                    .await?;
-                    report.quarantined_items += 1;
-                    if let Some(sandbox_id) = key_id {
-                        blocked.insert(sandbox_id);
+                    let repairable_candidate = key_id.and_then(|sandbox_id| {
+                        candidates.get(&sandbox_id).filter(|candidate| {
+                            Self::raw_index_can_be_rebuilt_from_manifest(
+                                &bytes,
+                                &sandbox_id,
+                                candidate,
+                            )
+                        })
+                    });
+                    if let Some(candidate) = repairable_candidate {
+                        // Retain the exact damaged index bytes in a
+                        // nonblocking quarantine record. The manifest is a
+                        // valid same-ID durable source, so rebuilding its
+                        // index is safe and preserves availability across a
+                        // second startup.
+                        self.quarantine_repairable_index(
+                            format!(
+                                "malformed paused sandbox index rebuilt from coherent v2 manifest: {error}"
+                            ),
+                            Some(&key),
+                            Some(&bytes),
+                            Some(&candidate.record.artifact_root),
+                            Some(&candidate.path),
+                        )
+                        .await?;
+                        report.quarantined_items += 1;
+                    } else {
+                        self.quarantine(
+                            format!("invalid or unsupported paused sandbox record: {error}"),
+                            Some(&key),
+                            Some(&bytes),
+                            None,
+                            None,
+                        )
+                        .await?;
+                        report.quarantined_items += 1;
+                        if let Some(sandbox_id) = key_id {
+                            blocked.insert(sandbox_id);
+                        }
                     }
                 }
             }
@@ -1873,6 +2198,20 @@ impl FileBackedSandboxPersister {
                     source: Some(source.into()),
                 }
             })?;
+        if entry.version != QUARANTINE_VERSION {
+            return Err(SandboxPersistenceError::InvalidRecord {
+                reason: format!(
+                    "unsupported paused sandbox quarantine version {}",
+                    entry.version
+                ),
+                source: None,
+            });
+        }
+
+        let expected_sandbox_id = entry
+            .record_key
+            .as_deref()
+            .and_then(|record_key| SandboxId::parse_str(record_key).ok());
 
         let mut remove_record = None;
         if let Some(record_key) = entry.record_key.as_deref() {
@@ -1900,14 +2239,21 @@ impl FileBackedSandboxPersister {
             }
         }
         if let Some(path) = entry.artifact_root.as_deref() {
-            let canonical_artifact_path = self
-                .validated_purgeable_artifact_path(path)
-                .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
-                    reason: format!(
-                        "refusing to purge paused sandbox quarantine {quarantine_id}: artifact path is not a managed sandbox root or generation"
+            let canonical_artifact_path = match expected_sandbox_id {
+                Some(sandbox_id) => self.validated_managed_generation_path(&sandbox_id, path),
+                None => self.validated_purgeable_artifact_path(path),
+            }
+            .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
+                reason: match expected_sandbox_id {
+                    Some(sandbox_id) => format!(
+                        "refusing to purge paused sandbox quarantine {quarantine_id}: artifact path is not an exact managed generation for sandbox {sandbox_id}"
                     ),
-                    source: None,
-                })?;
+                    None => format!(
+                        "refusing to purge paused sandbox quarantine {quarantine_id}: artifact path is not an exact managed generation or metadata file"
+                    ),
+                },
+                source: None,
+            })?;
             Self::remove_artifact_root(&canonical_artifact_path).await?;
         }
         if let Some(record_key) = remove_record {
@@ -2218,7 +2564,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
                         "refusing automatic deletion of unreferenced paused sandbox artifacts",
                         Some(record_key.as_bytes()),
                         None,
-                        Some(&sandbox_root),
+                        None,
                         None,
                     )
                     .await?;
@@ -2244,18 +2590,13 @@ impl SandboxPersister for FileBackedSandboxPersister {
                             source,
                         )
                     })?;
-                let sandbox_root = self.sandbox_artifact_root(sandbox_id);
-                let artifact_root = fs::symlink_metadata(&sandbox_root)
-                    .await
-                    .ok()
-                    .map(|_| sandbox_root.as_path());
                 self.quarantine(
                     format!(
                         "refusing automatic deletion of invalid paused sandbox record: {error}"
                     ),
                     Some(record_key.as_bytes()),
                     record_bytes.as_deref(),
-                    artifact_root,
+                    None,
                     None,
                 )
                 .await?;
@@ -2273,14 +2614,37 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 source: None,
             });
         }
-        let canonical_artifact_root = self
-            .validated_managed_generation_path(sandbox_id, &record.artifact_root)
-            .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
+        // Revalidate immediately before deletion and remove only the
+        // canonical managed generation. A decodable legacy record is not a
+        // deletion authorization for an arbitrary path.
+        let canonical_artifact_root = match record.version {
+            LEGACY_RECORD_VERSION => {
+                self.validated_legacy_artifact_root(sandbox_id, &record.artifact_root)
+            }
+            PAUSED_MANIFEST_VERSION => {
+                self.validated_managed_generation_path(sandbox_id, &record.artifact_root)
+            }
+            _ => None,
+        };
+        let Some(canonical_artifact_root) = canonical_artifact_root else {
+            let record_key = sandbox_id.to_string();
+            self.quarantine(
+                "refusing automatic deletion of paused sandbox record with an unsafe artifact root",
+                Some(record_key.as_bytes()),
+                None,
+                Some(&record.artifact_root),
+                (record.version == PAUSED_MANIFEST_VERSION)
+                    .then(|| Self::manifest_path(&record.artifact_root))
+                    .as_deref(),
+            )
+            .await?;
+            return Err(SandboxPersistenceError::InvalidRecord {
                 reason: format!(
                     "refusing automatic deletion of paused sandbox {sandbox_id}: artifact root is not an exact managed generation"
                 ),
                 source: None,
-            })?;
+            });
+        };
         self.remove_record(sandbox_id).await?;
         // Delete only the indexed generation.  Any sibling generation may be
         // a quarantine candidate and must remain until an administrator
@@ -2437,22 +2801,29 @@ mod tests {
             .with_durability(LocalStoreDurability::Memory)
     }
 
+    fn test_snapshot_root(
+        persister: &FileBackedSandboxPersister,
+        sandbox_id: &SandboxId,
+    ) -> PathBuf {
+        persister.sandbox_artifact_root(sandbox_id).join("snapshot")
+    }
+
     async fn persist_test_record(
         persister: &FileBackedSandboxPersister,
-        snapshot_root: &Path,
-    ) -> anyhow::Result<(SandboxId, Arc<dyn PausedSandboxState>)> {
-        let paused_state = paused_state(snapshot_root);
+    ) -> anyhow::Result<(SandboxId, PathBuf, Arc<dyn PausedSandboxState>)> {
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(persister, &sandbox_id);
+        let paused_state = paused_state(&snapshot_root);
         let metadata = SandboxMetadata {
-            id: SandboxId::new(),
+            id: sandbox_id,
             virtualization_mode: persister.virtualization_mode,
             paused_state: Some(Arc::clone(&paused_state)),
             ..Default::default()
         };
-        let sandbox_id = metadata.id;
         persister
-            .persist_paused(&metadata, Some(snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
             .await?;
-        Ok((sandbox_id, paused_state))
+        Ok((sandbox_id, snapshot_root, paused_state))
     }
 
     async fn has_record(
@@ -2505,9 +2876,11 @@ mod tests {
     async fn file_persister_round_trips_paused_record() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
         let paused_state = paused_state(&snapshot_root);
         let metadata = SandboxMetadata {
+            id: sandbox_id,
             timeout: Some(Duration::from_secs(5)),
             paused_state: Some(Arc::clone(&paused_state)),
             ..Default::default()
@@ -2534,8 +2907,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
 
         let index_bytes = persister
             .db()
@@ -2566,8 +2938,7 @@ mod tests {
     async fn load_all_rebuilds_a_missing_v2_index_from_a_valid_manifest() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        let (sandbox_id, _snapshot_root, _paused_state) = persist_test_record(&persister).await?;
         persister.db().await?.delete(sandbox_id.to_string()).await?;
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
@@ -2584,8 +2955,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
         persister
             .db()
             .await?
@@ -2608,7 +2978,97 @@ mod tests {
             )?,
             StoredPausedEntry::Index(_)
         ));
-        assert!(!persister.list_quarantines().await?.is_empty());
+        let quarantines = persister.list_quarantines().await?;
+        assert_eq!(quarantines.len(), 1);
+        assert!(
+            !quarantines[0].requires_manual_recovery,
+            "a coherent same-ID manifest may repair malformed raw index bytes"
+        );
+
+        // The forensic quarantine stays recorded, but it must not block a
+        // second startup after the valid manifest has republished its index.
+        let loaded_again = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded_again.len(), 1);
+        assert_eq!(loaded_again[0].id, sandbox_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_v2_index_identity_mismatch_is_quarantined_without_rebuild(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
+        let original = persister
+            .db()
+            .await?
+            .get(sandbox_id.to_string())
+            .await?
+            .expect("index exists");
+        let StoredPausedEntry::Index(mut index) = decode_stored_paused_entry(&original)? else {
+            anyhow::bail!("v2 record must be indexed");
+        };
+        index.manifest_path = temp.path().join("outside-manifest.json");
+        let mismatched = serde_json::to_vec(&index)?;
+        persister
+            .db()
+            .await?
+            .put(sandbox_id.to_string(), &mismatched)
+            .await?;
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert!(loaded.is_empty());
+        assert!(snapshot_root.exists());
+        assert_eq!(
+            persister
+                .db()
+                .await?
+                .get(sandbox_id.to_string())
+                .await?
+                .as_deref(),
+            Some(mismatched.as_slice())
+        );
+        assert!(persister
+            .list_quarantines()
+            .await?
+            .into_iter()
+            .any(|entry| entry.requires_manual_recovery));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_json_index_version_rebuilds_from_a_coherent_manifest() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
+        let malformed = serde_json::to_vec(&serde_json::json!({
+            "indexVersion": "not-a-number",
+            "sandboxId": sandbox_id,
+            "manifestPath": FileBackedSandboxPersister::manifest_path(&snapshot_root),
+        }))?;
+        persister
+            .db()
+            .await?
+            .put(sandbox_id.to_string(), malformed)
+            .await?;
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert!(matches!(
+            decode_stored_paused_entry(
+                &persister
+                    .db()
+                    .await?
+                    .get(sandbox_id.to_string())
+                    .await?
+                    .expect("coherent manifest should republish its index")
+            )?,
+            StoredPausedEntry::Index(_)
+        ));
         Ok(())
     }
 
@@ -2617,7 +3077,7 @@ mod tests {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
-        let snapshot_root = temp.path().join("legacy-artifacts");
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
         let paused_state = paused_state(&snapshot_root);
         let record = PersistedPausedRecord {
             version: LEGACY_RECORD_VERSION,
@@ -2648,12 +3108,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsafe_legacy_v1_artifact_path_is_quarantined_and_never_auto_deleted(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let outside = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = outside.path().join("legacy-snapshot");
+        let paused_state = paused_state(&snapshot_root);
+        let record = PersistedPausedRecord {
+            version: LEGACY_RECORD_VERSION,
+            commit_state: PersistedPausedCommitState::Committed,
+            lifecycle: PersistedPausedLifecycle::Paused,
+            resuming_boot_id: None,
+            metadata: SandboxMetadata {
+                id: sandbox_id,
+                paused_state: Some(Arc::clone(&paused_state)),
+                ..Default::default()
+            },
+            artifact_root: snapshot_root.clone(),
+            state: paused_state.encode()?,
+        };
+        persister
+            .db()
+            .await?
+            .put(sandbox_id.to_string(), serde_json::to_vec(&record)?)
+            .await?;
+
+        let error = persister
+            .delete_record_and_artifacts(&sandbox_id)
+            .await
+            .expect_err("unsafe legacy paths must require quarantine recovery");
+
+        assert!(matches!(
+            error,
+            SandboxPersistenceError::InvalidRecord { .. }
+        ));
+        assert!(snapshot_root.exists());
+        assert!(has_record(&persister, &sandbox_id).await?);
+        assert_eq!(persister.list_quarantines().await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cross_sandbox_legacy_quarantine_cannot_purge_another_sandbox_generation(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_a = SandboxId::new();
+        let sandbox_b = SandboxId::new();
+        let sandbox_a_key = sandbox_a.to_string();
+        let sandbox_b_root = test_snapshot_root(&persister, &sandbox_b);
+        let paused_state = paused_state(&sandbox_b_root);
+        let sandbox_b_metadata = SandboxMetadata {
+            id: sandbox_b,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(
+                &sandbox_b_metadata,
+                Some(&sandbox_b_root),
+                paused_state.as_ref(),
+            )
+            .await?;
+        let unsafe_legacy_record = PersistedPausedRecord {
+            version: LEGACY_RECORD_VERSION,
+            commit_state: PersistedPausedCommitState::Committed,
+            lifecycle: PersistedPausedLifecycle::Paused,
+            resuming_boot_id: None,
+            metadata: SandboxMetadata {
+                id: sandbox_a,
+                paused_state: Some(Arc::clone(&paused_state)),
+                ..Default::default()
+            },
+            artifact_root: sandbox_b_root.clone(),
+            state: paused_state.encode()?,
+        };
+        persister
+            .db()
+            .await?
+            .put(
+                sandbox_a.to_string(),
+                serde_json::to_vec(&unsafe_legacy_record)?,
+            )
+            .await?;
+
+        persister
+            .delete_record_and_artifacts(&sandbox_a)
+            .await
+            .expect_err("cross-sandbox legacy target must be quarantined");
+        let quarantine = persister
+            .list_quarantines()
+            .await?
+            .into_iter()
+            .find(|entry| entry.record_key.as_deref() == Some(sandbox_a_key.as_str()))
+            .expect("unsafe legacy record should have a quarantine entry");
+
+        let error = persister
+            .purge_quarantine(&quarantine.id)
+            .await
+            .expect_err("purge must reject a target owned by another sandbox");
+
+        assert!(matches!(
+            error,
+            SandboxPersistenceError::InvalidRecord { .. }
+        ));
+        assert!(sandbox_b_root.exists());
+        assert!(has_record(&persister, &sandbox_a).await?);
+        assert!(has_record(&persister, &sandbox_b).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mismatched_legacy_database_key_never_retains_a_purgeable_generation_target(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let declared_sandbox = SandboxId::new();
+        let database_key_sandbox = SandboxId::new();
+        let database_key = database_key_sandbox.to_string();
+        let database_key_root = test_snapshot_root(&persister, &database_key_sandbox);
+        let paused_state = paused_state(&database_key_root);
+        let mismatched_record = PersistedPausedRecord {
+            version: LEGACY_RECORD_VERSION,
+            commit_state: PersistedPausedCommitState::Committed,
+            lifecycle: PersistedPausedLifecycle::Paused,
+            resuming_boot_id: None,
+            metadata: SandboxMetadata {
+                id: declared_sandbox,
+                paused_state: Some(Arc::clone(&paused_state)),
+                ..Default::default()
+            },
+            artifact_root: database_key_root.clone(),
+            state: paused_state.encode()?,
+        };
+        persister
+            .db()
+            .await?
+            .put(
+                database_key.clone(),
+                serde_json::to_vec(&mismatched_record)?,
+            )
+            .await?;
+
+        assert!(persister
+            .load_all(&MockBackendFactory::new())
+            .await?
+            .is_empty());
+        let quarantine = persister
+            .list_quarantines()
+            .await?
+            .into_iter()
+            .find(|entry| {
+                entry.record_key.as_deref() == Some(database_key.as_str())
+                    && entry.artifact_root.is_none()
+            })
+            .expect("key/metadata mismatch must retain only the raw record, not a purge target");
+
+        persister.purge_quarantine(&quarantine.id).await?;
+
+        assert!(database_key_root.exists());
+        assert!(!has_record(&persister, &database_key_sandbox).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn missing_v2_commit_state_is_quarantined_without_deleting_the_manifest(
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
         let manifest_path = FileBackedSandboxPersister::manifest_path(&snapshot_root);
         let mut value: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
         value
@@ -2678,9 +3303,11 @@ mod tests {
         let records_db_path = temp.path().join(RECORD_DB_DIR);
         std::fs::write(&records_db_path, b"not-a-rocksdb-directory")?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
         let paused_state = paused_state(&snapshot_root);
         let metadata = SandboxMetadata {
+            id: sandbox_id,
             paused_state: Some(Arc::clone(&paused_state)),
             ..Default::default()
         };
@@ -2696,7 +3323,182 @@ mod tests {
         ));
         assert!(snapshot_root.exists());
         assert!(FileBackedSandboxPersister::manifest_path(&snapshot_root).exists());
+        assert!(FileBackedSandboxPersister::recovery_marker_path(&snapshot_root).exists());
         assert_eq!(persister.list_quarantines().await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_manifest_index_rebuild_writes_a_durable_recovery_marker() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        std::fs::write(temp.path().join(RECORD_DB_DIR), b"not-a-rocksdb-directory")?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
+        let paused_state = paused_state(&snapshot_root);
+        let record = PersistedPausedRecord {
+            version: PAUSED_MANIFEST_VERSION,
+            commit_state: PersistedPausedCommitState::Committed,
+            lifecycle: PersistedPausedLifecycle::Paused,
+            resuming_boot_id: None,
+            metadata: SandboxMetadata {
+                id: sandbox_id,
+                paused_state: Some(Arc::clone(&paused_state)),
+                ..Default::default()
+            },
+            artifact_root: snapshot_root.clone(),
+            state: paused_state.encode()?,
+        };
+        let manifest = persister.write_manifest(&record).await?;
+        let mut report = PausedSandboxRecoveryReport::default();
+
+        let error = persister
+            .index_manifest_or_quarantine(&manifest, &mut report)
+            .await
+            .expect_err("failed rebuild write must be uncertain");
+
+        assert!(matches!(
+            error,
+            SandboxPersistenceError::UncertainCommit { .. }
+        ));
+        assert!(FileBackedSandboxPersister::recovery_marker_path(&snapshot_root).exists());
+        let recovered_manifest = persister
+            .read_manifest(
+                &FileBackedSandboxPersister::manifest_path(&snapshot_root),
+                None,
+            )
+            .await?;
+        assert!(recovered_manifest.recovery_marker_present);
+        assert!(recovered_manifest.record.metadata.resume_recovery_pending);
+        assert_eq!(
+            recovered_manifest.record.commit_state,
+            PersistedPausedCommitState::Prepared
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_marker_recreates_quarantine_and_allows_only_pending_metadata(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
+
+        persister
+            .write_recovery_marker(sandbox_id, &snapshot_root)
+            .await?;
+        let quarantines = persister.quarantine_db().await?.entries().await?;
+        for (key, _) in quarantines {
+            persister.quarantine_db().await?.delete(key).await?;
+        }
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert!(loaded[0].resume_recovery_pending);
+        assert!(!loaded[0].paused_runtime_stopped);
+        assert_eq!(persister.list_quarantines().await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_manifest_without_marker_is_quarantined_and_loaded_only_recovery_pending(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
+        let paused_state = paused_state(&snapshot_root);
+        let mut metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        metadata.resume_recovery_pending = true;
+        metadata.paused_runtime_stopped = false;
+        let record = PersistedPausedRecord {
+            version: PAUSED_MANIFEST_VERSION,
+            commit_state: PersistedPausedCommitState::Prepared,
+            lifecycle: PersistedPausedLifecycle::Paused,
+            resuming_boot_id: None,
+            metadata,
+            artifact_root: snapshot_root.clone(),
+            state: paused_state.encode()?,
+        };
+        persister.write_manifest(&record).await?;
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert!(loaded[0].resume_recovery_pending);
+        assert!(!loaded[0].paused_runtime_stopped);
+        assert!(!FileBackedSandboxPersister::recovery_marker_path(&snapshot_root).exists());
+        assert_eq!(persister.list_quarantines().await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_purge_can_remove_a_known_marker_quarantine_but_not_a_replacement(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
+        persister
+            .write_recovery_marker(sandbox_id, &snapshot_root)
+            .await?;
+        persister.load_all(&MockBackendFactory::new()).await?;
+        let quarantine = persister
+            .list_quarantines()
+            .await?
+            .into_iter()
+            .next()
+            .expect("marker should be indexed for host-local purge");
+
+        persister.purge_quarantine(&quarantine.id).await?;
+
+        assert!(!snapshot_root.exists());
+        assert!(!has_record(&persister, &sandbox_id).await?);
+        assert!(persister.list_quarantines().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purging_a_misplaced_root_marker_cannot_remove_a_valid_sibling_generation(
+    ) -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
+        let paused_state = paused_state(&snapshot_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .await?;
+        let misplaced_marker = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join(PAUSED_MANIFEST_FILE);
+        std::fs::write(&misplaced_marker, b"malformed-root-marker")?;
+
+        persister.load_all(&MockBackendFactory::new()).await?;
+        let quarantine = persister
+            .list_quarantines()
+            .await?
+            .into_iter()
+            .find(|entry| entry.artifact_root.as_deref() == Some(misplaced_marker.as_path()))
+            .expect("misplaced marker should be quarantined as a file target");
+
+        persister.purge_quarantine(&quarantine.id).await?;
+
+        assert!(!misplaced_marker.exists());
+        assert!(snapshot_root.exists());
+        assert!(has_record(&persister, &sandbox_id).await?);
         Ok(())
     }
 
@@ -2704,9 +3506,8 @@ mod tests {
     async fn paused_record_from_other_mode_is_visible_but_not_resumable() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let kvm_persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) =
-            persist_test_record(&kvm_persister, &snapshot_root).await?;
+        let (sandbox_id, snapshot_root, _paused_state) =
+            persist_test_record(&kvm_persister).await?;
         drop(kvm_persister);
         let pvm_persister =
             FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
@@ -2728,15 +3529,13 @@ mod tests {
     async fn mixed_mode_records_are_both_visible_and_retained() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let kvm_persister = test_persister(temp.path());
-        let kvm_root = temp.path().join("kvm-artifacts");
-        let (kvm_id, _kvm_state) = persist_test_record(&kvm_persister, &kvm_root).await?;
+        let (kvm_id, kvm_root, _kvm_state) = persist_test_record(&kvm_persister).await?;
         drop(kvm_persister);
 
         let pvm_persister =
             FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
                 .with_durability(LocalStoreDurability::Memory);
-        let pvm_root = temp.path().join("pvm-artifacts");
-        let (pvm_id, _pvm_state) = persist_test_record(&pvm_persister, &pvm_root).await?;
+        let (pvm_id, pvm_root, _pvm_state) = persist_test_record(&pvm_persister).await?;
 
         let mut loaded = pvm_persister.load_all(&MockBackendFactory::new()).await?;
         loaded.sort_by_key(|metadata| metadata.id);
@@ -2870,9 +3669,13 @@ mod tests {
     async fn persist_paused_accepts_backend_agnostic_state() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
         let paused_state = paused_state(&snapshot_root);
-        let metadata = SandboxMetadata::default();
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            ..Default::default()
+        };
 
         persister
             .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
@@ -2888,15 +3691,16 @@ mod tests {
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
         tokio::fs::create_dir_all(&snapshot_root).await?;
         let paused_state: Arc<dyn PausedSandboxState> = Arc::new(FailingEncodeState);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            ..Default::default()
+        };
         let err = persister
-            .persist_paused(
-                &SandboxMetadata::default(),
-                Some(&snapshot_root),
-                paused_state.as_ref(),
-            )
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
             .await
             .expect_err("encode failure should reject paused state");
 
@@ -2911,15 +3715,16 @@ mod tests {
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
         tokio::fs::create_dir_all(&snapshot_root).await?;
         let paused_state: Arc<dyn PausedSandboxState> = Arc::new(FailingEncodeState);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            ..Default::default()
+        };
         persister
-            .persist_paused(
-                &SandboxMetadata::default(),
-                Some(&snapshot_root),
-                paused_state.as_ref(),
-            )
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
             .await
             .expect_err("encode failure should create a quarantine");
         let quarantine = persister
@@ -2940,8 +3745,7 @@ mod tests {
     async fn mark_resuming_and_rollback_preserve_loadability() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
 
         persister.mark_resuming(&sandbox_id).await?;
         assert_eq!(

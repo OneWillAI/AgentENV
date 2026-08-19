@@ -8,11 +8,17 @@ artifact generations; those items are quarantined on the local worker.
 
 The recovery utility is intentionally host-local and has no HTTP/API surface.
 Run it as a host administrator on the worker that owns the persisted-sandbox
-disk, with the AgentENV server stopped so it does not race normal persistence:
+disk, with the AgentENV server stopped so it does not race normal persistence.
+Hambody worker releases install it at
+`/opt/agentenv/current/worker/bin/aenv-paused-recovery`; standalone AgentENV
+Linux packages install it at `/usr/local/sbin/aenv-paused-recovery`.
+Use the path present on the host:
 
 ```sh
-sudo aenv-paused-recovery --store /var/lib/aenv/persisted-sandboxes list
-sudo aenv-paused-recovery --store /var/lib/aenv/persisted-sandboxes reconcile
+sudo /opt/agentenv/current/worker/bin/aenv-paused-recovery \
+  --store /var/lib/aenv/persisted-sandboxes list
+sudo /opt/agentenv/current/worker/bin/aenv-paused-recovery \
+  --store /var/lib/aenv/persisted-sandboxes reconcile
 ```
 
 `reconcile` is non-destructive: it rebuilds only missing or corrupt index
@@ -21,7 +27,8 @@ entries from valid manifests. Review `list` output before any removal.
 To deliberately discard one quarantined item and its tracked artifacts:
 
 ```sh
-sudo aenv-paused-recovery --store /var/lib/aenv/persisted-sandboxes \
+sudo /opt/agentenv/current/worker/bin/aenv-paused-recovery \
+  --store /var/lib/aenv/persisted-sandboxes \
   purge paused-<id> --yes
 ```
 

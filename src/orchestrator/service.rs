@@ -2950,6 +2950,18 @@ where
                     Ok(()) => true,
                     Err(err) => {
                         warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
+                        if err.is_uncertain_commit() {
+                            // The rollback write may have committed despite
+                            // its error. Never carry forward an in-memory
+                            // stop proof or let a later resume/delete treat
+                            // the snapshot as safe until host recovery has
+                            // reconciled the durable marker.
+                            self.mark_resume_recovery_pending_after_launch_rollback(
+                                plan.sandbox_id(),
+                                expected_state,
+                            )
+                            .await;
+                        }
                         false
                     }
                 };
@@ -2974,10 +2986,43 @@ where
                         }
                         Err(err) => {
                             warn!(error = %format_args!("{err:#}"), "failed to restore durable paused runtime stop proof after launch rollback");
+                            if err.is_uncertain_commit() {
+                                self.mark_resume_recovery_pending_after_launch_rollback(
+                                    plan.sandbox_id(),
+                                    expected_state,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+
+    async fn mark_resume_recovery_pending_after_launch_rollback(
+        &self,
+        sandbox_id: SandboxId,
+        expected_state: SandboxState,
+    ) {
+        if let Err(error) = self
+            .store
+            .update_if_state(
+                &sandbox_id,
+                &[SandboxState::Paused, SandboxState::Resuming, expected_state],
+                |metadata| {
+                    metadata.state = SandboxState::Paused;
+                    metadata.paused_runtime_stopped = false;
+                    metadata.resume_recovery_pending = true;
+                },
+            )
+            .await
+        {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %format_args!("{error:#}"),
+                "failed to mark paused sandbox recovery-pending after uncertain launch rollback"
+            );
         }
     }
 
