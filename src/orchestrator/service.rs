@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -6,6 +7,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use futures::FutureExt;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
@@ -27,12 +29,15 @@ use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
-use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
+use super::persistence::{
+    CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister,
+    FileBackedSandboxPersister, SandboxPersister,
+};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
-    CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxState, SnapshotCaptureResult,
+    CreateSandboxIdempotency, CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -74,6 +79,76 @@ enum FailedLaunchStage {
     RunningPersisted,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreateIdempotencyState {
+    Creating,
+    Succeeded,
+    Failed(String),
+    Deleting,
+}
+
+#[derive(Debug)]
+struct CreateIdempotencyEntry {
+    sandbox_id: SandboxId,
+    request_fingerprint: String,
+    state: watch::Sender<CreateIdempotencyState>,
+}
+
+impl CreateIdempotencyEntry {
+    fn durable_record(
+        &self,
+        key: impl Into<String>,
+        state: CreateIdempotencyRecordState,
+    ) -> CreateIdempotencyRecord {
+        CreateIdempotencyRecord {
+            key: key.into(),
+            request_fingerprint: self.request_fingerprint.clone(),
+            sandbox_id: self.sandbox_id,
+            state,
+        }
+    }
+}
+
+/// Ensures an unexpected panic/abort cannot leave in-process replays waiting on
+/// `Creating` forever. The durable journal remains `Creating` in that case and
+/// startup converts it to a fail-closed tombstone.
+struct CreateIdempotencyCompletionGuard {
+    entry: Arc<CreateIdempotencyEntry>,
+    armed: bool,
+}
+
+impl CreateIdempotencyCompletionGuard {
+    fn new(entry: Arc<CreateIdempotencyEntry>) -> Self {
+        Self { entry, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreateIdempotencyCompletionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.entry.state.send_if_modified(|state| {
+                if matches!(state, CreateIdempotencyState::Creating) {
+                    *state = CreateIdempotencyState::Failed(
+                        "create operation ended unexpectedly".to_string(),
+                    );
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+}
+
+enum CreateIdempotencyClaim {
+    Owner(Arc<CreateIdempotencyEntry>),
+    Replay(Arc<CreateIdempotencyEntry>),
+}
+
 impl FailedLaunchStage {
     fn rollback_expected_state(self, plan: &LaunchPlan) -> Option<SandboxState> {
         match self {
@@ -107,6 +182,7 @@ pub struct Orchestrator<
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
+    create_idempotency: Mutex<HashMap<String, Arc<CreateIdempotencyEntry>>>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -161,7 +237,14 @@ where
 
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
-        let persisted = persister.load_all(&factory).await?;
+        let mut persisted = persister.load_all(&factory).await?;
+        let durable_create_idempotency = persister.load_create_idempotency_records().await?;
+        let create_idempotency = Self::restore_create_idempotency(
+            &persister,
+            &mut persisted,
+            durable_create_idempotency,
+        )
+        .await?;
         let managed_seed_must_exist = persisted.iter().any(|metadata| metadata.secure);
         let access_tokens = tokio::task::spawn_blocking(move || {
             SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
@@ -197,6 +280,7 @@ where
             shutdown_outcome: OnceCell::new(),
             image_refs,
             access_tokens,
+            create_idempotency: Mutex::new(create_idempotency),
         });
 
         // Start the auto-evict task.
@@ -227,6 +311,156 @@ where
         }
 
         Ok(orchestrator)
+    }
+
+    async fn restore_create_idempotency(
+        persister: &P,
+        persisted: &mut Vec<SandboxMetadata>,
+        records: Vec<CreateIdempotencyRecord>,
+    ) -> Result<HashMap<String, Arc<CreateIdempotencyEntry>>> {
+        let invalid = |message: String| OrchestratorError::InternalError(message);
+        let mut durable = HashMap::new();
+        for record in records {
+            CreateSandboxIdempotency::new(record.key.clone(), record.request_fingerprint.clone())
+                .map_err(|message| {
+                invalid(format!(
+                    "invalid durable create idempotency record for sandbox {}: {message}",
+                    record.sandbox_id
+                ))
+            })?;
+            let key = record.key.clone();
+            if durable.insert(key.clone(), record).is_some() {
+                return Err(invalid(format!(
+                    "duplicate durable create idempotency key '{key}'"
+                )));
+            }
+        }
+
+        // Paused metadata predates the standalone journal. Migrate it once, but
+        // reject duplicates instead of choosing a sandbox based on DB order.
+        let mut paused_keys = HashMap::<String, (SandboxId, String)>::new();
+        for metadata in persisted.iter() {
+            let (key, request_fingerprint) = match (
+                metadata.create_idempotency_key.as_ref(),
+                metadata.create_request_fingerprint.as_ref(),
+            ) {
+                (None, None) => continue,
+                (Some(key), Some(request_fingerprint)) => (key, request_fingerprint),
+                _ => {
+                    return Err(invalid(format!(
+                        "sandbox {} has incomplete create idempotency metadata",
+                        metadata.id
+                    )));
+                }
+            };
+            CreateSandboxIdempotency::new(key.clone(), request_fingerprint.clone()).map_err(
+                |message| {
+                    invalid(format!(
+                        "sandbox {} has invalid create idempotency metadata: {message}",
+                        metadata.id
+                    ))
+                },
+            )?;
+            if let Some((other_id, _)) =
+                paused_keys.insert(key.clone(), (metadata.id, request_fingerprint.clone()))
+            {
+                return Err(invalid(format!(
+                    "paused sandboxes {other_id} and {} share create idempotency key '{key}'",
+                    metadata.id
+                )));
+            }
+
+            match durable.get_mut(key) {
+                Some(record)
+                    if record.sandbox_id != metadata.id
+                        || record.request_fingerprint != *request_fingerprint =>
+                {
+                    return Err(invalid(format!(
+                        "paused sandbox {} conflicts with durable create idempotency key '{key}'",
+                        metadata.id
+                    )));
+                }
+                Some(record) if record.state == CreateIdempotencyRecordState::Creating => {
+                    // A fully persisted paused sandbox is positive evidence that
+                    // this create completed before its journal update.
+                    record.state = CreateIdempotencyRecordState::Succeeded;
+                    persister.persist_create_idempotency_record(record).await?;
+                }
+                Some(record) if record.state == CreateIdempotencyRecordState::Failed => {
+                    return Err(invalid(format!(
+                        "paused sandbox {} conflicts with failed create idempotency key '{key}'",
+                        metadata.id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    let record = CreateIdempotencyRecord {
+                        key: key.clone(),
+                        request_fingerprint: request_fingerprint.clone(),
+                        sandbox_id: metadata.id,
+                        state: CreateIdempotencyRecordState::Succeeded,
+                    };
+                    persister.persist_create_idempotency_record(&record).await?;
+                    durable.insert(key.clone(), record);
+                }
+            }
+        }
+
+        let mut deleting_keys = HashSet::new();
+        let mut deleting_sandboxes = HashSet::new();
+        for (key, record) in durable.iter_mut() {
+            match record.state {
+                CreateIdempotencyRecordState::Deleting => {
+                    // `Deleting` is written only after runtime stop succeeds.
+                    // Completing both durable removals proves absence before the
+                    // key can be released.
+                    persister
+                        .delete_record_and_artifacts(&record.sandbox_id)
+                        .await?;
+                    persister.delete_create_idempotency_record(key).await?;
+                    deleting_keys.insert(key.clone());
+                    deleting_sandboxes.insert(record.sandbox_id);
+                }
+                CreateIdempotencyRecordState::Creating => {
+                    // No paused sandbox corroborated this interrupted create.
+                    // Retain a durable tombstone so restart never allocates a
+                    // second runtime for an uncertain first attempt.
+                    record.state = CreateIdempotencyRecordState::Failed;
+                    persister.persist_create_idempotency_record(record).await?;
+                }
+                CreateIdempotencyRecordState::Succeeded | CreateIdempotencyRecordState::Failed => {}
+            }
+        }
+        persisted.retain(|metadata| !deleting_sandboxes.contains(&metadata.id));
+
+        let mut entries = HashMap::new();
+        for (key, record) in durable {
+            if deleting_keys.contains(&key) {
+                continue;
+            }
+            let restored_state = match record.state {
+                CreateIdempotencyRecordState::Creating => unreachable!(
+                    "interrupted creating records are converted to failed before restoration"
+                ),
+                CreateIdempotencyRecordState::Succeeded => CreateIdempotencyState::Succeeded,
+                CreateIdempotencyRecordState::Failed => CreateIdempotencyState::Failed(
+                    "previous create outcome is unavailable after restart".to_string(),
+                ),
+                CreateIdempotencyRecordState::Deleting => {
+                    unreachable!("deleting records are reconciled before restoration")
+                }
+            };
+            let (state, _) = watch::channel(restored_state);
+            entries.insert(
+                key,
+                Arc::new(CreateIdempotencyEntry {
+                    sandbox_id: record.sandbox_id,
+                    request_fingerprint: record.request_fingerprint,
+                    state,
+                }),
+            );
+        }
+        Ok(entries)
     }
 
     async fn run_cancellation_safe<T>(
@@ -334,9 +568,218 @@ where
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request).await
+            if request.idempotency.is_some() {
+                this.create_idempotent_sandbox(sandbox_id, request).await
+            } else {
+                this.create_sandbox_inner(sandbox_id, request).await
+            }
         })
         .await
+    }
+
+    /// Supervise the entire idempotent operation, including the first durable
+    /// claim write and its publication in memory. The caller only waits on the
+    /// outer oneshot, so cancellation cannot detach an in-flight RocksDB write
+    /// from the claim that owns it.
+    async fn create_idempotent_sandbox(
+        self: Arc<Self>,
+        candidate_sandbox_id: SandboxId,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
+        let idempotency = request
+            .idempotency
+            .clone()
+            .expect("idempotent create supervisor requires idempotency");
+        match self
+            .claim_create_idempotency(&idempotency, candidate_sandbox_id)
+            .await?
+        {
+            CreateIdempotencyClaim::Replay(entry) => {
+                self.replay_idempotent_create(idempotency.key(), entry)
+                    .await
+            }
+            CreateIdempotencyClaim::Owner(entry) => {
+                let sandbox_id = entry.sandbox_id;
+                let key = idempotency.key().to_string();
+                let mut completion_guard =
+                    CreateIdempotencyCompletionGuard::new(Arc::clone(&entry));
+                let result = match AssertUnwindSafe(
+                    Arc::clone(&self).create_sandbox_inner(sandbox_id, request),
+                )
+                .catch_unwind()
+                .await
+                {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let message = payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic payload".to_string());
+                        Err(OrchestratorError::InternalError(format!(
+                            "idempotent create panicked: {message}"
+                        )))
+                    }
+                };
+                let result = self.finish_idempotent_create(&key, &entry, result).await;
+                completion_guard.disarm();
+                result
+            }
+        }
+    }
+
+    /// Return or join an existing create claim without allocating a new one.
+    /// API handlers use this before mutable template/image resolution so a
+    /// successful replay cannot be invalidated by later source changes.
+    pub async fn replay_create_if_present(
+        &self,
+        idempotency: &CreateSandboxIdempotency,
+    ) -> Result<Option<SandboxMetadata>> {
+        let entry = {
+            let entries = self.create_idempotency.lock().await;
+            let Some(entry) = entries.get(idempotency.key()) else {
+                return Ok(None);
+            };
+            if entry.request_fingerprint != idempotency.request_fingerprint() {
+                return Err(OrchestratorError::CreateIdempotencyConflict {
+                    key: idempotency.key().to_string(),
+                });
+            }
+            Arc::clone(entry)
+        };
+        self.replay_idempotent_create(idempotency.key(), entry)
+            .await
+            .map(Some)
+    }
+
+    async fn claim_create_idempotency(
+        &self,
+        idempotency: &CreateSandboxIdempotency,
+        candidate_sandbox_id: SandboxId,
+    ) -> Result<CreateIdempotencyClaim> {
+        let mut entries = self.create_idempotency.lock().await;
+        if let Some(entry) = entries.get(idempotency.key()) {
+            if entry.request_fingerprint != idempotency.request_fingerprint() {
+                return Err(OrchestratorError::CreateIdempotencyConflict {
+                    key: idempotency.key().to_string(),
+                });
+            }
+            return Ok(CreateIdempotencyClaim::Replay(Arc::clone(entry)));
+        }
+
+        let (state, _) = watch::channel(CreateIdempotencyState::Creating);
+        let entry = Arc::new(CreateIdempotencyEntry {
+            sandbox_id: candidate_sandbox_id,
+            request_fingerprint: idempotency.request_fingerprint().to_string(),
+            state,
+        });
+        self.persister
+            .persist_create_idempotency_record(
+                &entry.durable_record(idempotency.key(), CreateIdempotencyRecordState::Creating),
+            )
+            .await?;
+        entries.insert(idempotency.key().to_string(), Arc::clone(&entry));
+        Ok(CreateIdempotencyClaim::Owner(entry))
+    }
+
+    async fn replay_idempotent_create(
+        &self,
+        key: &str,
+        entry: Arc<CreateIdempotencyEntry>,
+    ) -> Result<SandboxMetadata> {
+        let mut state = entry.state.subscribe();
+        loop {
+            let current = state.borrow_and_update().clone();
+            match current {
+                CreateIdempotencyState::Creating => {
+                    state.changed().await.map_err(|_| {
+                        OrchestratorError::InternalError(format!(
+                            "idempotent create state closed before completion for key '{key}'"
+                        ))
+                    })?;
+                }
+                CreateIdempotencyState::Succeeded => {
+                    return self.store.get(&entry.sandbox_id).await?.ok_or_else(|| {
+                        OrchestratorError::CreateIdempotencyResultUnavailable {
+                            key: key.to_string(),
+                        }
+                    });
+                }
+                CreateIdempotencyState::Failed(message) => {
+                    return Err(OrchestratorError::InternalError(format!(
+                        "idempotent create for key '{key}' failed: {message}"
+                    )));
+                }
+                CreateIdempotencyState::Deleting => {
+                    return Err(OrchestratorError::CreateIdempotencyResultUnavailable {
+                        key: key.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn finish_idempotent_create(
+        &self,
+        key: &str,
+        entry: &Arc<CreateIdempotencyEntry>,
+        result: Result<SandboxMetadata>,
+    ) -> Result<SandboxMetadata> {
+        // Serialize owner completion with deletion and any later claim. A
+        // delete may observe Running metadata just before this function; once
+        // it marks the entry Deleting, this owner must never overwrite that
+        // journal phase with Succeeded or Failed.
+        let entries = self.create_idempotency.lock().await;
+        let current = entries.get(key);
+        if !current.is_some_and(|current| Arc::ptr_eq(current, entry))
+            || !matches!(&*entry.state.borrow(), CreateIdempotencyState::Creating)
+        {
+            return match result {
+                Ok(_) => Err(OrchestratorError::CreateIdempotencyResultUnavailable {
+                    key: key.to_string(),
+                }),
+                Err(err) => Err(err),
+            };
+        }
+
+        match result {
+            Ok(metadata) => {
+                if let Err(err) = self
+                    .persister
+                    .persist_create_idempotency_record(
+                        &entry.durable_record(key, CreateIdempotencyRecordState::Succeeded),
+                    )
+                    .await
+                {
+                    let message = format!("failed to persist successful create result: {err}");
+                    let _ = entry
+                        .state
+                        .send_replace(CreateIdempotencyState::Failed(message));
+                    // The durable Creating record and in-memory Failed state are
+                    // both fail-closed; never return an unjournaled success.
+                    return Err(OrchestratorError::from(err));
+                }
+                let _ = entry.state.send_replace(CreateIdempotencyState::Succeeded);
+                Ok(metadata)
+            }
+            Err(err) => {
+                if let Err(persist_err) = self
+                    .persister
+                    .persist_create_idempotency_record(
+                        &entry.durable_record(key, CreateIdempotencyRecordState::Failed),
+                    )
+                    .await
+                {
+                    // The original durable Creating record remains a safe
+                    // tombstone and startup converts it to Failed.
+                    warn!(error = ?persist_err, "failed to persist create failure tombstone");
+                }
+                let _ = entry
+                    .state
+                    .send_replace(CreateIdempotencyState::Failed(err.to_string()));
+                Err(err)
+            }
+        }
     }
 
     #[tracing::instrument(
@@ -364,7 +807,12 @@ where
             network_policy,
             custom_extension_params,
             secure,
+            idempotency,
         } = request;
+        let create_idempotency_key = idempotency.as_ref().map(|value| value.key().to_string());
+        let create_request_fingerprint = idempotency
+            .as_ref()
+            .map(|value| value.request_fingerprint().to_string());
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
 
@@ -416,6 +864,8 @@ where
                     timeout_action,
                     auto_resume,
                     user_metadata,
+                    create_idempotency_key,
+                    create_request_fingerprint,
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
                     secure,
@@ -476,6 +926,8 @@ where
                     timeout_action,
                     auto_resume,
                     user_metadata,
+                    create_idempotency_key,
+                    create_request_fingerprint,
                     network_policy,
                     custom_extension_params,
                     secure,
@@ -646,6 +1098,12 @@ where
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
             metadata.paused_state = None;
+            // A fork is a distinct runtime, not the result of the source's
+            // create operation. Carrying these fields into the child would
+            // create duplicate durable keys after pause/restart.
+            metadata.create_idempotency_key = None;
+            metadata.create_request_fingerprint = None;
+            metadata.paused_runtime_stopped = false;
             metadata.update_timeout(new_timeout);
 
             let proxy_target = match Self::proxy_target_from_sandbox(backend.as_ref()) {
@@ -886,6 +1344,21 @@ where
     async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("deleting sandbox");
 
+        // A previous delete may have positively stopped the runtime and then
+        // failed while removing durable state. Its metadata is intentionally
+        // gone, but the in-memory Deleting tombstone allows an exact retry to
+        // finish cleanup without releasing the key early.
+        if self.store.get(&sandbox_id).await?.is_none() {
+            if let Some((key, entry)) = self.deleting_create_for_sandbox(sandbox_id).await {
+                self.finish_durable_sandbox_delete(&key, &entry).await?;
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                info!("sandbox delete cleanup completed");
+                return Ok(());
+            }
+            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+        }
+
         // Attempt to transition to Killing, retrying after waiting whenever we
         // find the sandbox in a transitional state.
         let previous_state = loop {
@@ -913,6 +1386,15 @@ where
                                 continue;
                             }
                             Err(OrchestratorError::SandboxNotFound(_)) => {
+                                if let Some((key, entry)) =
+                                    self.deleting_create_for_sandbox(sandbox_id).await
+                                {
+                                    self.finish_durable_sandbox_delete(&key, &entry).await?;
+                                    self.release_image_refs(RuntimeImageOwner::PausedSandbox(
+                                        sandbox_id,
+                                    ))
+                                    .await;
+                                }
                                 info!("sandbox was deleted by a concurrent delete");
                                 return Ok(());
                             }
@@ -939,6 +1421,15 @@ where
                             Err(OrchestratorError::SandboxNotFound(_)) => {
                                 // Sandbox was removed while we waited (e.g. by
                                 // another concurrent delete).
+                                if let Some((key, entry)) =
+                                    self.deleting_create_for_sandbox(sandbox_id).await
+                                {
+                                    self.finish_durable_sandbox_delete(&key, &entry).await?;
+                                    self.release_image_refs(RuntimeImageOwner::PausedSandbox(
+                                        sandbox_id,
+                                    ))
+                                    .await;
+                                }
                                 info!("sandbox was deleted while waiting for transitional state");
                                 return Ok(());
                             }
@@ -957,7 +1448,58 @@ where
             }
         };
 
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        let idempotent_delete = if let Some(key) = metadata.create_idempotency_key.as_ref() {
+            let entry = {
+                let entries = self.create_idempotency.lock().await;
+                entries.get(key).cloned()
+            };
+            let Some(entry) = entry else {
+                self.store
+                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                    .await?;
+                return Err(OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} is missing create idempotency entry '{key}'"
+                )));
+            };
+            if entry.sandbox_id != sandbox_id {
+                self.store
+                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                    .await?;
+                return Err(OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} create idempotency entry '{key}' points to {}",
+                    entry.sandbox_id
+                )));
+            }
+            Some((key.clone(), entry))
+        } else {
+            None
+        };
+
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+
+        // A record without its runtime handle is not proof that an idempotent
+        // runtime is absent. Even Paused is persisted before stop() completes,
+        // so a crash or ignored stop failure can leave a live process behind.
+        // Keep the key fail-closed unless the paused record carries the durable
+        // positive-stop proof written after stop() succeeded. Preserve the
+        // legacy direct-delete behavior for non-idempotent Paused records.
+        if handle.is_none()
+            && (previous_state != SandboxState::Paused
+                || (idempotent_delete.is_some() && !metadata.paused_runtime_stopped))
+        {
+            self.restore_proxy_route(sandbox_id, removed_route).await;
+            self.store
+                .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                .await?;
+            return Err(OrchestratorError::InternalError(format!(
+                "cannot prove runtime absence for {previous_state} sandbox {sandbox_id}: runtime handle is missing"
+            )));
+        }
 
         // If the sandbox is still in memory, attempt to stop it.
         if let Some(handle) = handle {
@@ -982,26 +1524,87 @@ where
             }
         }
 
-        // Now the sandbox is successfully stopped, remove its metadata.
-        let metadata = self.store.remove(&sandbox_id).await?;
-        if let Some(metadata) = metadata {
-            self.publish_sandbox_event(
-                SandboxLifecycleEventType::Delete,
-                metadata.id,
-                metadata.resources,
-            );
+        // Runtime absence is now positively proven. Mark the entry Deleting
+        // before removing in-memory metadata; every failure from this point is
+        // fail-closed and can be retried by sandbox ID or reconciled at startup.
+        if let Some((key, entry)) = idempotent_delete.as_ref() {
+            let entries = self.create_idempotency.lock().await;
+            if !entries
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, entry))
+            {
+                return Err(OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} create idempotency entry '{key}' changed during delete"
+                )));
+            }
+            let _ = entry.state.send_replace(CreateIdempotencyState::Deleting);
         }
-        if let Err(err) = self
-            .persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-        {
-            warn!(error = ?err, "failed to delete persisted sandbox state");
+        self.store.remove(&sandbox_id).await?;
+
+        if let Some((key, entry)) = idempotent_delete.as_ref() {
+            self.finish_durable_sandbox_delete(key, entry).await?;
+        } else {
+            self.persister
+                .delete_record_and_artifacts(&sandbox_id)
+                .await?;
         }
+        self.publish_sandbox_event(
+            SandboxLifecycleEventType::Delete,
+            metadata.id,
+            metadata.resources,
+        );
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
         info!("sandbox deleted");
 
+        Ok(())
+    }
+
+    async fn deleting_create_for_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<(String, Arc<CreateIdempotencyEntry>)> {
+        self.create_idempotency
+            .lock()
+            .await
+            .iter()
+            .find(|(_, entry)| {
+                entry.sandbox_id == sandbox_id
+                    && matches!(&*entry.state.borrow(), CreateIdempotencyState::Deleting)
+            })
+            .map(|(key, entry)| (key.clone(), Arc::clone(entry)))
+    }
+
+    async fn finish_durable_sandbox_delete(
+        &self,
+        key: &str,
+        entry: &Arc<CreateIdempotencyEntry>,
+    ) -> Result<()> {
+        // Serialize the complete release transition with claims and other
+        // delete finishers. Without this lock, a stale concurrent finisher
+        // could delete a newly claimed journal record after the first finisher
+        // releases the key.
+        let mut entries = self.create_idempotency.lock().await;
+        let Some(current) = entries.get(key) else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(current, entry) {
+            return Ok(());
+        }
+
+        // Sync the phase marker before touching the paused record. Startup only
+        // treats Deleting as proof of runtime absence because callers reach this
+        // helper after stop succeeds.
+        self.persister
+            .persist_create_idempotency_record(
+                &entry.durable_record(key, CreateIdempotencyRecordState::Deleting),
+            )
+            .await?;
+        self.persister
+            .delete_record_and_artifacts(&entry.sandbox_id)
+            .await?;
+        self.persister.delete_create_idempotency_record(key).await?;
+        entries.remove(key);
         Ok(())
     }
 
@@ -1064,7 +1667,14 @@ where
                     // Another task is already performing the pause.  Wait for
                     // it to finish and then report the final outcome.
                     SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
-                    SandboxState::Paused => Ok(()),
+                    SandboxState::Paused => {
+                        let metadata = self
+                            .store
+                            .get(&sandbox_id)
+                            .await?
+                            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                        Self::require_idempotent_paused_stop_proof(&metadata)
+                    }
                     SandboxState::Killing => {
                         info!("sandbox is being deleted while pausing");
                         Err(OrchestratorError::SandboxNotFound(sandbox_id))
@@ -1194,6 +1804,7 @@ where
                 .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
             metadata.state = SandboxState::Paused;
             metadata.paused_state = Some(paused_state.clone());
+            metadata.paused_runtime_stopped = false;
             metadata
         };
         if let Err(err) = self
@@ -1242,6 +1853,7 @@ where
             )));
         }
         let resources = persisted_metadata.resources;
+        let idempotent_pause = persisted_metadata.create_idempotency_key.is_some();
         self.store.update(persisted_metadata).await?;
 
         // Stop the sandbox to free up resources.
@@ -1249,12 +1861,41 @@ where
             let mut sandbox = handle.lock().await;
             sandbox.stop().await
         };
-        if let Err(err) = stop_result {
-            warn!(error = ?err, "failed to stop sandbox after pausing");
+        match stop_result {
+            Ok(()) => {
+                self.persister
+                    .mark_paused_runtime_stopped(&sandbox_id)
+                    .await?;
+                self.store
+                    .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
+                        metadata.paused_runtime_stopped = true;
+                    })
+                    .await?;
+            }
+            Err(err) => {
+                warn!(error = ?err, "failed to stop sandbox after pausing");
+                if idempotent_pause {
+                    return Err(OrchestratorError::SandboxOperationFailed {
+                        sandbox_id,
+                        operation: SandboxOperation::Stop,
+                        source: err,
+                    });
+                }
+            }
         }
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
 
+        Ok(())
+    }
+
+    fn require_idempotent_paused_stop_proof(metadata: &SandboxMetadata) -> Result<()> {
+        if metadata.create_idempotency_key.is_some() && !metadata.paused_runtime_stopped {
+            return Err(OrchestratorError::InternalError(format!(
+                "cannot use paused sandbox {}: durable runtime stop proof is unavailable",
+                metadata.id
+            )));
+        }
         Ok(())
     }
 
@@ -1318,6 +1959,8 @@ where
             }
         }
 
+        Self::require_idempotent_paused_stop_proof(&metadata)?;
+
         let node_mode = ConfigManager::global_config().virtualization_mode;
         if metadata.virtualization_mode != node_mode {
             return Err(OrchestratorError::VirtualizationModeMismatch {
@@ -1327,9 +1970,13 @@ where
             });
         }
 
+        let prior_paused_stop_proof = metadata.paused_runtime_stopped;
         match self
             .store
-            .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
+            .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
+                metadata.state = SandboxState::Resuming;
+                metadata.paused_runtime_stopped = false;
+            })
             .await
         {
             Ok(_) => {}
@@ -1364,7 +2011,10 @@ where
             warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
             let _ = self
                 .store
-                .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Resuming])
+                .update_if_state(&sandbox_id, &[SandboxState::Resuming], |metadata| {
+                    metadata.state = SandboxState::Paused;
+                    metadata.paused_runtime_stopped = prior_paused_stop_proof;
+                })
                 .await;
             return Err(OrchestratorError::InternalError(format!(
                 "failed to mark persisted sandbox record as resuming: {err:#}"
@@ -1790,7 +2440,7 @@ where
         match m.state {
             SandboxState::Paused => {
                 debug!("concurrent pause succeeded");
-                Ok(())
+                Self::require_idempotent_paused_stop_proof(&m)
             }
             SandboxState::Running => {
                 info!("concurrent pause failed; sandbox returned to running state");
@@ -1972,7 +2622,7 @@ where
         let mut sandbox = match self.build_sandbox(&plan) {
             Ok(sandbox) => sandbox,
             Err(err) => {
-                self.rollback_failed_launch_metadata(&plan, transitional_state)
+                self.rollback_failed_launch_metadata(&plan, transitional_state, true)
                     .await;
                 return Err(err);
             }
@@ -1989,16 +2639,20 @@ where
             .await
         {
             warn!(error = %format_args!("{err:#}"), "failed to protect starting runtime artifacts");
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            self.rollback_failed_launch_metadata(&plan, transitional_state, true)
                 .await;
             return Err(err);
         }
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
-            if let Err(stop_err) = sandbox.stop().await {
-                warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
-            }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            let runtime_absence_proven = match sandbox.stop().await {
+                Ok(()) => true,
+                Err(stop_err) => {
+                    warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
+                    false
+                }
+            };
+            self.rollback_failed_launch_metadata(&plan, transitional_state, runtime_absence_proven)
                 .await;
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
@@ -2011,10 +2665,14 @@ where
         // If the orchestrator started shutting down, stop here before we persist any state.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down just after starting the sandbox");
-            if let Err(err) = sandbox.stop().await {
-                warn!(error = %format_args!("{err:#}"), "failed to stop sandbox");
-            }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            let runtime_absence_proven = match sandbox.stop().await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(error = %format_args!("{err:#}"), "failed to stop sandbox");
+                    false
+                }
+            };
+            self.rollback_failed_launch_metadata(&plan, transitional_state, runtime_absence_proven)
                 .await;
             return Err(OrchestratorError::ShuttingDown);
         }
@@ -2088,6 +2746,7 @@ where
                 move |metadata| {
                     metadata.resources = runtime_resources;
                     metadata.state = SandboxState::Running;
+                    metadata.paused_runtime_stopped = false;
                     metadata.update_timeout(launch_timeout);
                 },
             )
@@ -2178,6 +2837,7 @@ where
             let mut sandbox = handle.lock().await;
             sandbox.stop().await
         };
+        let runtime_absence_proven = stop_result.is_ok();
         if let Err(err) = stop_result {
             warn!(error = %format_args!("{err:#}"), "failed to stop sandbox while rolling back launch");
         }
@@ -2187,7 +2847,7 @@ where
         }
 
         if let Some(expected_state) = stage.rollback_expected_state(plan) {
-            self.rollback_failed_launch_metadata(plan, expected_state)
+            self.rollback_failed_launch_metadata(plan, expected_state, runtime_absence_proven)
                 .await;
         }
     }
@@ -2196,6 +2856,7 @@ where
         &self,
         plan: &LaunchPlan,
         expected_state: SandboxState,
+        runtime_absence_proven: bool,
     ) {
         self.release_image_refs(RuntimeImageOwner::StartingSandbox(plan.sandbox_id()))
             .await;
@@ -2208,17 +2869,52 @@ where
             LaunchPlan::Resume(_) => {
                 if let Err(err) = self
                     .store
-                    .update_state_if_state(
+                    .update_if_state(
                         &plan.sandbox_id(),
-                        SandboxState::Paused,
                         std::slice::from_ref(&expected_state),
+                        |metadata| {
+                            metadata.state = SandboxState::Paused;
+                            metadata.paused_runtime_stopped = false;
+                        },
                     )
                     .await
                 {
                     warn!(error = %format_args!("{err:#}"), "failed to restore sandbox metadata during launch rollback");
                 }
-                if let Err(err) = self.persister.rollback_resuming(&plan.sandbox_id()).await {
-                    warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
+                let durable_rollback_succeeded = match self
+                    .persister
+                    .rollback_resuming(&plan.sandbox_id())
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
+                        false
+                    }
+                };
+                if runtime_absence_proven && durable_rollback_succeeded {
+                    match self
+                        .persister
+                        .mark_paused_runtime_stopped(&plan.sandbox_id())
+                        .await
+                    {
+                        Ok(()) => {
+                            if let Err(err) = self
+                                .store
+                                .update_if_state(
+                                    &plan.sandbox_id(),
+                                    &[SandboxState::Paused],
+                                    |metadata| metadata.paused_runtime_stopped = true,
+                                )
+                                .await
+                            {
+                                warn!(error = %format_args!("{err:#}"), "failed to restore paused runtime stop proof in metadata");
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %format_args!("{err:#}"), "failed to restore durable paused runtime stop proof after launch rollback");
+                        }
+                    }
                 }
             }
         }

@@ -3,6 +3,7 @@ mod file_backed;
 mod mock;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::orchestrator::store::SandboxMetadata;
@@ -14,6 +15,30 @@ pub use file_backed::FileBackedSandboxPersister;
 pub(crate) use mock::{RecordingCall, RecordingPersister};
 
 pub type PersistenceResult<T> = std::result::Result<T, SandboxPersistenceError>;
+
+/// Durable state for one node-local sandbox-create idempotency claim.
+///
+/// Records are written before a runtime is started and are retained on every
+/// uncertain failure. `Deleting` is written only after the runtime has been
+/// positively stopped; startup may therefore finish deleting its paused
+/// record and release the key without risking a live orphan.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateIdempotencyRecordState {
+    Creating,
+    Succeeded,
+    Failed,
+    Deleting,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateIdempotencyRecord {
+    pub key: String,
+    pub request_fingerprint: String,
+    pub sandbox_id: SandboxId,
+    pub state: CreateIdempotencyRecordState,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxPersistenceError {
@@ -83,6 +108,16 @@ pub trait SandboxPersister: Send + Sync {
         paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()>;
 
+    /// Durably record that the live runtime was positively stopped after its
+    /// paused state was persisted. Existing persisters fail closed until they
+    /// implement this proof transition.
+    async fn mark_paused_runtime_stopped(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        Err(SandboxPersistenceError::InvalidRecord {
+            reason: "paused runtime stop proof is not supported by this persister".to_string(),
+            source: None,
+        })
+    }
+
     /// Mark a paused sandbox as resuming.
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
@@ -94,6 +129,37 @@ pub trait SandboxPersister: Send + Sync {
 
     /// Delete the persistence record and all associated artifacts.
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+
+    /// Load the durable create-idempotency journal.
+    ///
+    /// The default keeps existing third-party persister implementations source
+    /// compatible. Such implementations fail closed when an idempotent create
+    /// is attempted until they provide durable journal storage.
+    async fn load_create_idempotency_records(
+        &self,
+    ) -> PersistenceResult<Vec<CreateIdempotencyRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically persist one create-idempotency record before acknowledging
+    /// its state transition.
+    async fn persist_create_idempotency_record(
+        &self,
+        _record: &CreateIdempotencyRecord,
+    ) -> PersistenceResult<()> {
+        Err(SandboxPersistenceError::InvalidRecord {
+            reason: "create idempotency persistence is not supported by this persister".to_string(),
+            source: None,
+        })
+    }
+
+    /// Durably release an idempotency key after deletion is proven complete.
+    async fn delete_create_idempotency_record(&self, _key: &str) -> PersistenceResult<()> {
+        Err(SandboxPersistenceError::InvalidRecord {
+            reason: "create idempotency persistence is not supported by this persister".to_string(),
+            source: None,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -124,6 +190,10 @@ impl SandboxPersister for DisabledSandboxPersister {
         Ok(())
     }
 
+    async fn mark_paused_runtime_stopped(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        Ok(())
+    }
+
     async fn mark_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         Ok(())
     }
@@ -137,6 +207,17 @@ impl SandboxPersister for DisabledSandboxPersister {
     }
 
     async fn delete_record_and_artifacts(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        Ok(())
+    }
+
+    async fn persist_create_idempotency_record(
+        &self,
+        _record: &CreateIdempotencyRecord,
+    ) -> PersistenceResult<()> {
+        Ok(())
+    }
+
+    async fn delete_create_idempotency_record(&self, _key: &str) -> PersistenceResult<()> {
         Ok(())
     }
 }

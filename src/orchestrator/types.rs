@@ -9,6 +9,55 @@ use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::CommandContext;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
+pub const MAX_CREATE_IDEMPOTENCY_KEY_LEN: usize = 128;
+
+/// Client-supplied identity for safely retrying one sandbox create operation.
+///
+/// The key is opaque to AgentENV. The fingerprint is computed by the API from
+/// the create route and request body so reusing a key for a different request
+/// is rejected instead of silently returning an unrelated sandbox. Claims are
+/// coordinated within one orchestrator node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateSandboxIdempotency {
+    key: String,
+    request_fingerprint: String,
+}
+
+impl CreateSandboxIdempotency {
+    pub fn new(
+        key: impl Into<String>,
+        request_fingerprint: impl Into<String>,
+    ) -> std::result::Result<Self, String> {
+        let key = key.into();
+        if key.is_empty() {
+            return Err("idempotencyKey must not be empty".to_string());
+        }
+        if key.chars().count() > MAX_CREATE_IDEMPOTENCY_KEY_LEN {
+            return Err(format!(
+                "idempotencyKey must not exceed {MAX_CREATE_IDEMPOTENCY_KEY_LEN} characters"
+            ));
+        }
+
+        let request_fingerprint = request_fingerprint.into();
+        if request_fingerprint.is_empty() {
+            return Err("create request fingerprint must not be empty".to_string());
+        }
+
+        Ok(Self {
+            key,
+            request_fingerprint,
+        })
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn request_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+}
+
 #[derive(Clone)]
 pub enum SandboxLaunchSource {
     Snapshot(Box<crate::snapshot::RunnableSnapshot>),
@@ -34,6 +83,8 @@ pub struct CreateSandboxRequest {
     pub env_vars: Option<HashMap<String, String>>,
     pub network_policy: crate::sandbox::SandboxNetworkPolicy,
     pub secure: bool,
+    /// Optional retry identity for this create operation.
+    pub idempotency: Option<CreateSandboxIdempotency>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     pub custom_extension_params: Option<CustomExtensionParams>,
 }

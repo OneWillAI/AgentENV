@@ -11,8 +11,8 @@ use crate::virtualization::VirtualizationMode;
 
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
-    DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
-    SandboxPersistenceError, SandboxPersister,
+    CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister,
+    FileBackedSandboxPersister, PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
@@ -21,8 +21,8 @@ pub use store::{
     SandboxTimeoutAction,
 };
 pub use types::{
-    CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxState, SnapshotCaptureResult,
+    CreateSandboxIdempotency, CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult, MAX_CREATE_IDEMPOTENCY_KEY_LEN,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -81,6 +81,12 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         operation: SandboxOperation,
     },
+
+    #[error("idempotency key '{key}' was already used for a different create request")]
+    CreateIdempotencyConflict { key: String },
+
+    #[error("the result for idempotency key '{key}' is no longer available")]
+    CreateIdempotencyResultUnavailable { key: String },
 
     #[error("store operation failed: {0}")]
     StoreOperationFailed(#[source] store::StoreError),

@@ -2503,6 +2503,12 @@ pub struct NewColdSandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub image: String,
 
+    /// Opaque identity for safely retrying this create request. A successful replay routed to the same AgentENV node returns the original sandbox while its result remains available. Uncertain or restarted outcomes fail closed, and reusing the key with a different request is rejected.
+    #[serde(rename = "idempotencyKey")]
+    #[validate(length(min = 1, max = 128), custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+
     /// Time to live for the sandbox in seconds.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
@@ -2586,6 +2592,7 @@ impl NewColdSandbox {
     pub fn new(image: String) -> NewColdSandbox {
         NewColdSandbox {
             image,
+            idempotency_key: None,
             timeout: Some(15),
             auto_pause: Some(true),
             auto_resume: None,
@@ -2612,6 +2619,9 @@ impl std::fmt::Display for NewColdSandbox {
         let params: Vec<Option<String>> = vec![
             Some("image".to_string()),
             Some(self.image.to_string()),
+            self.idempotency_key.as_ref().map(|idempotency_key| {
+                ["idempotencyKey".to_string(), idempotency_key.to_string()].join(",")
+            }),
             self.timeout
                 .as_ref()
                 .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
@@ -2674,6 +2684,7 @@ impl std::str::FromStr for NewColdSandbox {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub image: Vec<String>,
+            pub idempotency_key: Vec<String>,
             pub timeout: Vec<u32>,
             pub auto_pause: Vec<bool>,
             pub auto_resume: Vec<models::SandboxAutoResumeConfig>,
@@ -2712,6 +2723,10 @@ impl std::str::FromStr for NewColdSandbox {
                 match key {
                     #[allow(clippy::redundant_clone)]
                     "image" => intermediate_rep.image.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "idempotencyKey" => intermediate_rep.idempotency_key.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -2799,6 +2814,7 @@ impl std::str::FromStr for NewColdSandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "image missing in NewColdSandbox".to_string())?,
+            idempotency_key: intermediate_rep.idempotency_key.into_iter().next(),
             timeout: intermediate_rep.timeout.into_iter().next(),
             auto_pause: intermediate_rep.auto_pause.into_iter().next(),
             auto_resume: intermediate_rep.auto_resume.into_iter().next(),
@@ -2867,6 +2883,12 @@ pub struct NewSandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub template_id: String,
 
+    /// Opaque identity for safely retrying this create request. A successful replay routed to the same AgentENV node returns the original sandbox while its result remains available. Uncertain or restarted outcomes fail closed, and reusing the key with a different request is rejected.
+    #[serde(rename = "idempotencyKey")]
+    #[validate(length(min = 1, max = 128), custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+
     /// Time to live for the sandbox in seconds.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
@@ -2927,6 +2949,7 @@ impl NewSandbox {
     pub fn new(template_id: String) -> NewSandbox {
         NewSandbox {
             template_id,
+            idempotency_key: None,
             timeout: Some(15),
             auto_pause: Some(true),
             auto_resume: None,
@@ -2949,6 +2972,9 @@ impl std::fmt::Display for NewSandbox {
         let params: Vec<Option<String>> = vec![
             Some("templateID".to_string()),
             Some(self.template_id.to_string()),
+            self.idempotency_key.as_ref().map(|idempotency_key| {
+                ["idempotencyKey".to_string(), idempotency_key.to_string()].join(",")
+            }),
             self.timeout
                 .as_ref()
                 .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
@@ -3001,6 +3027,7 @@ impl std::str::FromStr for NewSandbox {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub template_id: Vec<String>,
+            pub idempotency_key: Vec<String>,
             pub timeout: Vec<u32>,
             pub auto_pause: Vec<bool>,
             pub auto_resume: Vec<models::SandboxAutoResumeConfig>,
@@ -3035,6 +3062,10 @@ impl std::str::FromStr for NewSandbox {
                 match key {
                     #[allow(clippy::redundant_clone)]
                     "templateID" => intermediate_rep.template_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "idempotencyKey" => intermediate_rep.idempotency_key.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -3106,6 +3137,7 @@ impl std::str::FromStr for NewSandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "templateID missing in NewSandbox".to_string())?,
+            idempotency_key: intermediate_rep.idempotency_key.into_iter().next(),
             timeout: intermediate_rep.timeout.into_iter().next(),
             auto_pause: intermediate_rep.auto_pause.into_iter().next(),
             auto_resume: intermediate_rep.auto_resume.into_iter().next(),
