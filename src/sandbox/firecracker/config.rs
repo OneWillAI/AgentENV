@@ -17,7 +17,7 @@ use crate::sandbox::UblkBackend;
 use crate::sandbox::{
     validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
 };
-use crate::snapshot::{RunnableSnapshot, SnapshotSource};
+use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
 use overlaybd::config::UpperMode;
 use serde::{Deserialize, Serialize};
@@ -482,30 +482,13 @@ impl FirecrackerSnapshotConfig {
                 app_config.virtualization_mode
             );
         }
-        let persisted_tools_drive_version =
-            &snapshot.committed().runtime_versions.tools_drive_version;
-        if persisted_tools_drive_version.trim().is_empty() {
-            // Current-layout base templates intentionally omit the tools drive
-            // from their immutable snapshot metadata. Resolve that legacy
-            // representation against the node's installed, content-addressed
-            // tools drive. Paused/user snapshots must retain an explicit
-            // version so a resume cannot silently change its runtime ABI.
-            if matches!(&snapshot.record().source, SnapshotSource::Template { .. })
-                && snapshot.committed().attached_drives.is_empty()
-            {
-                tracing::warn!(
-                    snapshot_id = %snapshot.record().id,
-                    tools_drive_version = %base_common.tools_drive_version,
-                    "resolving current-layout template without persisted tools drive metadata"
-                );
-            } else {
-                bail!(
-                    "snapshot does not record a tools drive version; migrate its metadata before launching it"
-                );
-            }
-        } else {
-            base_common.tools_drive_version = persisted_tools_drive_version.clone();
+        let tools_drive_version = &snapshot.committed().runtime_versions.tools_drive_version;
+        if tools_drive_version.trim().is_empty() {
+            bail!(
+                "snapshot does not record a tools drive version; migrate its metadata before launching it"
+            );
         }
+        base_common.tools_drive_version = tools_drive_version.clone();
         let rootfs_image_config = OverlaybdConfig {
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: app_config.ublk.overlaybd.read_only,
@@ -915,11 +898,8 @@ mod tests {
     fn runnable_snapshot_without_tools_drive_version_is_not_launchable() {
         let mut committed = CommittedSnapshot::mock();
         committed.runtime_versions.tools_drive_version.clear();
-        let mut record = SnapshotRecord::mock_ready(committed);
-        record.source = SnapshotSource::Sandbox {
-            source_sandbox_id: "sandbox".to_string(),
-        };
-        let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let snapshot =
+            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
 
         let err = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
             .expect_err("legacy snapshot must not launch without a tools drive version");
