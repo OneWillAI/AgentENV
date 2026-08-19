@@ -45,6 +45,7 @@
 # Troubleshooting
 
 - [Common Issues](./troubleshooting/common-issues.md)
+- [Paused Sandbox Recovery](./troubleshooting/paused-sandbox-recovery.md)
 
 ---
 

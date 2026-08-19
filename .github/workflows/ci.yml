@@ -14,8 +14,10 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/verify-paused-recovery-packaging.sh"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
   push:
     paths:
       - "**.rs"
@@ -28,8 +30,10 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/verify-paused-recovery-packaging.sh"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
 
 jobs:
   fmt:

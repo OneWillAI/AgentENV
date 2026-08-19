@@ -12,7 +12,8 @@ use crate::virtualization::VirtualizationMode;
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
     CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister,
-    FileBackedSandboxPersister, PersistenceResult, SandboxPersistenceError, SandboxPersister,
+    FileBackedSandboxPersister, PausedSandboxQuarantine, PausedSandboxRecoveryReport,
+    PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;

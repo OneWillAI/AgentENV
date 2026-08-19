@@ -1824,6 +1824,27 @@ where
             .await
         {
             warn!(error = ?err, "failed to persist paused sandbox state");
+            if err.is_uncertain_commit() {
+                // A durable manifest may exist even though the RocksDB index
+                // write reported an error.  Do not resume the paused VM (or
+                // delete its snapshot): retain the artifacts and expose the
+                // existing recovery-pending guard until startup/admin
+                // reconciliation can prove the record is coherent.
+                let mut recovery_metadata = persisted_metadata.clone();
+                recovery_metadata.resume_recovery_pending = true;
+                recovery_metadata.paused_runtime_stopped = false;
+                if let Err(store_error) = self.store.update(recovery_metadata).await {
+                    warn!(error = ?store_error, "failed to mark uncertain paused sandbox recovery-pending");
+                }
+                let stop_result = {
+                    let mut sandbox = handle.lock().await;
+                    sandbox.stop().await
+                };
+                if let Err(stop_error) = stop_result {
+                    warn!(error = ?stop_error, "failed to stop sandbox after uncertain paused-state commit");
+                }
+                return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+            }
             let resume_result = {
                 let mut sandbox = handle.lock().await;
                 sandbox.resume().await
@@ -1870,9 +1891,26 @@ where
         };
         match stop_result {
             Ok(()) => {
-                self.persister
+                if let Err(err) = self
+                    .persister
                     .mark_paused_runtime_stopped(&sandbox_id)
-                    .await?;
+                    .await
+                {
+                    if err.is_uncertain_commit() {
+                        if let Err(store_error) = self
+                            .store
+                            .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
+                                metadata.paused_runtime_stopped = false;
+                                metadata.resume_recovery_pending = true;
+                            })
+                            .await
+                        {
+                            warn!(error = ?store_error, "failed to mark paused sandbox recovery-pending after uncertain stop proof");
+                        }
+                        return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+                    }
+                    return Err(OrchestratorError::from(err));
+                }
                 self.store
                     .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
                         metadata.paused_runtime_stopped = true;
@@ -2027,13 +2065,18 @@ where
 
         if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
             warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
+            let uncertain_commit = err.is_uncertain_commit();
             let _ = self
                 .store
                 .update_if_state(&sandbox_id, &[SandboxState::Resuming], |metadata| {
                     metadata.state = SandboxState::Paused;
                     metadata.paused_runtime_stopped = prior_paused_stop_proof;
+                    metadata.resume_recovery_pending = uncertain_commit;
                 })
                 .await;
+            if uncertain_commit {
+                return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+            }
             return Err(OrchestratorError::InternalError(format!(
                 "failed to mark persisted sandbox record as resuming: {err:#}"
             )));
