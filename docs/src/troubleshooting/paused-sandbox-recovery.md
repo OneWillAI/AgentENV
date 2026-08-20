@@ -10,6 +10,10 @@ releases the create-idempotency key after recording the quarantine, and
 continues serving new sandboxes. `purge` is only required to discard the
 retained files.
 
+Resume drops the paused index but keeps the last memory generation. The next
+Stop still needs that `mem_image.json` as the parent layer list. A later
+pause retires the replaced generation; destroy removes the last copy.
+
 The recovery utility is intentionally host-local and has no HTTP/API surface.
 Run it as a host administrator on the worker that owns the persisted-sandbox
 disk, with the AgentENV server stopped so it does not race normal persistence.

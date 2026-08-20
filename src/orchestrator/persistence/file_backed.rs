@@ -44,8 +44,8 @@ enum PersistedPausedLifecycle {
     /// this record and its artifacts across restart: a process crash here may
     /// have left the previous Firecracker child alive.
     Resuming,
-    /// The resumed VM was published as Running. This durable commit permits
-    /// exact snapshot cleanup, including after a crash during cleanup.
+    /// The resumed VM was published as Running. The last memory generation
+    /// stays on disk; startup seeing this marker restores it as Paused.
     Resumed,
 }
 
@@ -1640,28 +1640,47 @@ impl FileBackedSandboxPersister {
         })
     }
 
-    /// Remove only the generation consumed by a committed resume. New pause
-    /// cycles allocate separate generation directories, so deleting the whole
-    /// `<sandbox-id>` directory here would reintroduce a resume/pause race.
-    async fn cleanup_consumed_resume_generation(
+    /// Drop every managed generation except `keep`. The next incremental pause
+    /// still needs the last memory config, so resume must not call this.
+    async fn retire_replaced_generations(
         &self,
         sandbox_id: &SandboxId,
-        artifact_root: &Path,
+        keep: &Path,
     ) -> PersistenceResult<()> {
-        let canonical_artifact_root = self
-            .validated_managed_generation_path(sandbox_id, artifact_root)
-            .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
-                reason: format!(
-                    "refusing cleanup for paused sandbox {sandbox_id}: artifact root is not an exact managed generation"
-                ),
-                source: None,
+        let Some(keep) = self.validated_managed_generation_path(sandbox_id, keep) else {
+            return Ok(());
+        };
+        let sandbox_root = self.sandbox_artifact_root(sandbox_id);
+        let mut entries = match fs::read_dir(&sandbox_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "read paused sandbox generations",
+                    sandbox_root,
+                    source,
+                ));
+            }
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(|source| {
+            SandboxPersistenceError::io("scan paused sandbox generations", &sandbox_root, source)
+        })? {
+            let path = entry.path();
+            if path == keep {
+                continue;
+            }
+            let file_type = entry.file_type().await.map_err(|source| {
+                SandboxPersistenceError::io("inspect paused sandbox generation", &path, source)
             })?;
-        Self::remove_artifact_root(&canonical_artifact_root).await?;
-        self.remove_empty_sandbox_artifact_root(sandbox_id).await
+            if file_type.is_dir() && self.path_is_managed_generation(sandbox_id, &path) {
+                Self::remove_artifact_root(&path).await?;
+            }
+        }
+        Ok(())
     }
 
-    /// Resume and delete leave the `<sandbox-id>` directory behind after the
-    /// generation is gone. An empty leftover is not recovery data: if it stays,
+    /// Destroy may leave an empty `<sandbox-id>` directory after the last
+    /// generation is gone. That leftover is not recovery data: if it stays,
     /// the next delete sees "unreferenced artifacts" and fail-closes.
     async fn remove_empty_sandbox_artifact_root(
         &self,
@@ -1686,37 +1705,9 @@ impl FileBackedSandboxPersister {
         }
     }
 
-    async fn leftover_sandbox_artifact_root_is_empty(
-        sandbox_root: &Path,
-    ) -> PersistenceResult<bool> {
-        let mut entries = match fs::read_dir(sandbox_root).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(source) => {
-                return Err(SandboxPersistenceError::io(
-                    "read leftover paused sandbox artifact root",
-                    sandbox_root,
-                    source,
-                ));
-            }
-        };
-        Ok(entries
-            .next_entry()
-            .await
-            .map_err(|source| {
-                SandboxPersistenceError::io(
-                    "scan leftover paused sandbox artifact root",
-                    sandbox_root,
-                    source,
-                )
-            })?
-            .is_none())
-    }
-
-    /// Make successful-resume cleanup crash-safe. The `Resumed` marker is the
-    /// durable commit point: if the process dies before it, startup retains a
-    /// `Resuming` tombstone; if it dies after it, startup can finish deleting
-    /// exactly this generation and the index.
+    /// Drop the paused index after a live resume. Keep the last generation:
+    /// the next incremental pause still reads that memory config, and a
+    /// worker restart can rehydrate it from the on-disk manifest.
     async fn finalize_resumed_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         let mut record = self.get_record(sandbox_id).await?;
         if record.metadata.resume_recovery_pending
@@ -1746,8 +1737,6 @@ impl FileBackedSandboxPersister {
             }
         }
 
-        self.cleanup_consumed_resume_generation(sandbox_id, &record.artifact_root)
-            .await?;
         self.remove_record(sandbox_id).await
     }
 
@@ -2413,9 +2402,11 @@ impl SandboxPersister for FileBackedSandboxPersister {
             }
 
             if record.lifecycle == PersistedPausedLifecycle::Resumed {
-                info!(sandbox_id = %sandbox_id, "finishing committed resumed sandbox cleanup");
-                self.finalize_resumed_record(&sandbox_id).await?;
-                continue;
+                info!(sandbox_id = %sandbox_id, "restoring last paused snapshot after a committed resume; the live VM cannot still be running");
+                record.lifecycle = PersistedPausedLifecycle::Paused;
+                record.resuming_boot_id = None;
+                record.metadata.paused_runtime_stopped = true;
+                self.put_record(&record).await?;
             }
 
             if record.lifecycle == PersistedPausedLifecycle::Resuming {
@@ -2581,7 +2572,18 @@ impl SandboxPersister for FileBackedSandboxPersister {
             artifact_root: artifact_root.to_path_buf(),
             state,
         };
-        self.put_record(&record).await
+        self.put_record(&record).await?;
+        if let Err(error) = self
+            .retire_replaced_generations(&metadata.id, artifact_root)
+            .await
+        {
+            warn!(
+                sandbox_id = %metadata.id,
+                error = %error,
+                "failed to retire replaced paused generations"
+            );
+        }
+        Ok(())
     }
 
     async fn mark_paused_runtime_stopped(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -2633,29 +2635,16 @@ impl SandboxPersister for FileBackedSandboxPersister {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
         let record = match self.get_record(sandbox_id).await {
             Ok(record) => record,
-            Err(SandboxPersistenceError::InvalidRecord { reason, source })
+            Err(SandboxPersistenceError::InvalidRecord { reason, .. })
                 if reason == format!("paused sandbox record {sandbox_id} not found") =>
             {
                 let sandbox_root = self.sandbox_artifact_root(sandbox_id);
-                let record_key = sandbox_id.to_string();
                 if fs::symlink_metadata(&sandbox_root).await.is_ok() {
-                    if Self::leftover_sandbox_artifact_root_is_empty(&sandbox_root).await? {
-                        Self::remove_artifact_root(&sandbox_root).await?;
-                        return Ok(());
-                    }
-                    self.quarantine(
-                        "refusing automatic deletion of unreferenced paused sandbox artifacts",
-                        Some(record_key.as_bytes()),
-                        None,
-                        Some(&sandbox_root),
-                        None,
-                    )
-                    .await?;
-                    return Err(SandboxPersistenceError::manual_recovery(
-                        *sandbox_id,
-                        "unreferenced artifacts; use the host-local recovery purge command",
-                        source,
-                    ));
+                    // Resume keeps the last generation after dropping the
+                    // index. An explicit destroy has already proven the
+                    // runtime is gone, so this last copy may be removed.
+                    Self::remove_artifact_root(&sandbox_root).await?;
+                    return Ok(());
                 }
                 return Ok(());
             }
@@ -3849,15 +3838,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_resume_removes_only_the_consumed_generation() -> anyhow::Result<()> {
+    async fn successful_resume_keeps_the_last_memory_generation() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
         let consumed_generation = persister
-            .allocate_artifact_root(&sandbox_id)
-            .await?
-            .expect("file-backed persister should allocate artifacts");
-        let next_generation = persister
             .allocate_artifact_root(&sandbox_id)
             .await?
             .expect("file-backed persister should allocate artifacts");
@@ -3875,21 +3860,85 @@ mod tests {
         persister.delete_record(&sandbox_id).await?;
 
         assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(!consumed_generation.exists());
-        assert!(next_generation.exists());
+        assert!(consumed_generation.exists());
         Ok(())
     }
 
     #[tokio::test]
-    async fn startup_finishes_committed_resumed_generation_cleanup() -> anyhow::Result<()> {
+    async fn successful_resume_rehydrates_the_last_snapshot_on_startup() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let last_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let paused_state = paused_state(&last_generation);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&last_generation), paused_state.as_ref())
+            .await?;
+        persister.mark_resuming(&sandbox_id).await?;
+        persister.delete_record(&sandbox_id).await?;
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert_eq!(loaded[0].state, SandboxState::Paused);
+        assert!(has_record(&persister, &sandbox_id).await?);
+        assert!(last_generation.exists());
+        assert!(persister.list_quarantines().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_pause_retires_the_replaced_generation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let first_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let first_state = paused_state(&first_generation);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&first_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&first_generation), first_state.as_ref())
+            .await?;
+        persister.mark_resuming(&sandbox_id).await?;
+        persister.delete_record(&sandbox_id).await?;
+
+        let second_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let second_state = paused_state(&second_generation);
+        persister
+            .persist_paused(&metadata, Some(&second_generation), second_state.as_ref())
+            .await?;
+
+        assert!(has_record(&persister, &sandbox_id).await?);
+        assert!(!first_generation.exists());
+        assert!(second_generation.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_restores_a_committed_resume_as_the_last_paused_snapshot() -> anyhow::Result<()>
+    {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
         let consumed_generation = persister
-            .allocate_artifact_root(&sandbox_id)
-            .await?
-            .expect("file-backed persister should allocate artifacts");
-        let sibling_generation = persister
             .allocate_artifact_root(&sandbox_id)
             .await?
             .expect("file-backed persister should allocate artifacts");
@@ -3910,10 +3959,11 @@ mod tests {
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(!consumed_generation.exists());
-        assert!(sibling_generation.exists());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert_eq!(loaded[0].state, SandboxState::Paused);
+        assert!(has_record(&persister, &sandbox_id).await?);
+        assert!(consumed_generation.exists());
         Ok(())
     }
 
@@ -3988,46 +4038,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_record_and_artifacts_refuses_unreferenced_artifacts() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let sandbox_artifact_root = persister.sandbox_artifact_root(&sandbox_id);
-        tokio::fs::create_dir_all(sandbox_artifact_root.join("stale-generation")).await?;
-
-        let err = persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-            .expect_err("unreferenced artifacts must require explicit recovery purge");
-
-        assert!(err.requires_explicit_purge());
-        assert!(sandbox_artifact_root.exists());
-        assert_eq!(persister.list_quarantines().await?.len(), 1);
-
-        let quarantine = persister
-            .list_quarantines()
-            .await?
-            .into_iter()
-            .next()
-            .expect("unreferenced leftover should be listed for purge");
-        persister.purge_quarantine(&quarantine.id).await?;
-        assert!(!sandbox_artifact_root.exists());
-        assert!(persister.list_quarantines().await?.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_record_and_artifacts_removes_empty_leftover_sandbox_root() -> anyhow::Result<()>
+    async fn delete_record_and_artifacts_removes_the_last_copy_after_resume() -> anyhow::Result<()>
     {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
-        let sandbox_artifact_root = persister.sandbox_artifact_root(&sandbox_id);
-        tokio::fs::create_dir_all(&sandbox_artifact_root).await?;
+        let last_generation = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister should allocate artifacts");
+        let paused_state = paused_state(&last_generation);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&last_generation), paused_state.as_ref())
+            .await?;
+        persister.mark_resuming(&sandbox_id).await?;
+        persister.delete_record(&sandbox_id).await?;
+        assert!(last_generation.exists());
 
         persister.delete_record_and_artifacts(&sandbox_id).await?;
 
-        assert!(!sandbox_artifact_root.exists());
+        assert!(!has_record(&persister, &sandbox_id).await?);
+        assert!(!last_generation.exists());
+        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
         assert!(persister.list_quarantines().await?.is_empty());
         Ok(())
     }
