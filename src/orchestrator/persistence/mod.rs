@@ -75,6 +75,16 @@ pub enum SandboxPersistenceError {
         #[source]
         source: Option<anyhow::Error>,
     },
+    /// The paused tree is preserved in the host-local quarantine. Automatic
+    /// delete/startup cleanup must not erase it, and startup must not treat
+    /// this as a reason to refuse to boot the worker.
+    #[error("paused sandbox {sandbox_id} requires host-local recovery: {reason}")]
+    ManualRecoveryRequired {
+        sandbox_id: SandboxId,
+        reason: String,
+        #[source]
+        source: Option<anyhow::Error>,
+    },
 }
 
 impl SandboxPersistenceError {
@@ -96,6 +106,22 @@ impl SandboxPersistenceError {
 
     pub fn is_uncertain_commit(&self) -> bool {
         matches!(self, Self::UncertainCommit { .. })
+    }
+
+    pub fn requires_explicit_purge(&self) -> bool {
+        matches!(self, Self::ManualRecoveryRequired { .. })
+    }
+
+    pub(super) fn manual_recovery(
+        sandbox_id: SandboxId,
+        reason: impl Into<String>,
+        source: Option<anyhow::Error>,
+    ) -> Self {
+        Self::ManualRecoveryRequired {
+            sandbox_id,
+            reason: reason.into(),
+            source,
+        }
     }
 }
 

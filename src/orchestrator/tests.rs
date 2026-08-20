@@ -826,6 +826,64 @@ async fn restart_finishes_a_durable_deleting_record_before_releasing_the_key() -
 }
 
 #[tokio::test]
+async fn restart_releases_a_deleting_record_when_artifacts_require_manual_recovery() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let key = "delete-quarantine-restart";
+    let fingerprint = "sha256:delete-quarantine-restart";
+    let record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        sandbox_id,
+        state: CreateIdempotencyRecordState::Deleting,
+    };
+    let persister =
+        RecordingPersister::with_loaded_and_create_idempotency(Vec::new(), vec![record]);
+    persister.fail_next_manual_recovery(RecordingCall::DeleteRecordAndArtifacts);
+
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await
+    .expect("unreferenced paused artifacts must not prevent worker startup");
+    assert!(restarted.get_sandbox(&sandbox_id).await?.is_none());
+    assert!(persister.create_idempotency_records().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_keeps_a_failed_create_tombstone_when_delete_cleanup_fails() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let key = "delete-cleanup-io-restart";
+    let fingerprint = "sha256:delete-cleanup-io-restart";
+    let record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        sandbox_id,
+        state: CreateIdempotencyRecordState::Deleting,
+    };
+    let persister =
+        RecordingPersister::with_loaded_and_create_idempotency(Vec::new(), vec![record]);
+    persister.fail_next(RecordingCall::DeleteRecordAndArtifacts);
+
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await
+    .expect("a failed paused delete at startup must not prevent worker boot");
+    assert!(restarted.get_sandbox(&sandbox_id).await?.is_none());
+    let retained = persister.create_idempotency_records();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].state, CreateIdempotencyRecordState::Failed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn restored_paused_idempotent_delete_retains_the_key_and_durable_record() -> Result<()> {
     setup();
     let sandbox_id = SandboxId::new();

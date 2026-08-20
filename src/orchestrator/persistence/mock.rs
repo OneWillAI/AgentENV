@@ -59,6 +59,7 @@ pub(crate) struct RecordingPersister {
     create_idempotency: Arc<Mutex<HashMap<String, CreateIdempotencyRecord>>>,
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
     uncertain_failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
+    manual_recovery_failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
     next_create_idempotency_persist_barrier: Arc<Mutex<Option<RecordingPersistBarrier>>>,
 }
 
@@ -136,6 +137,11 @@ impl RecordingPersister {
         *failures.entry(call).or_default() += 1;
     }
 
+    pub(crate) fn fail_next_manual_recovery(&self, call: RecordingCall) {
+        let mut failures = self.manual_recovery_failures.lock().unwrap();
+        *failures.entry(call).or_default() += 1;
+    }
+
     fn maybe_fail(&self, call: RecordingCall) -> PersistenceResult<()> {
         if let Some(remaining) = self.failures.lock().unwrap().get_mut(&call) {
             if *remaining > 0 {
@@ -154,6 +160,16 @@ impl RecordingPersister {
                     reason: format!("forced uncertain {call} failure"),
                     source: None,
                 });
+            }
+        }
+        if let Some(remaining) = self.manual_recovery_failures.lock().unwrap().get_mut(&call) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(SandboxPersistenceError::manual_recovery(
+                    SandboxId::new(),
+                    format!("forced {call} host-local recovery"),
+                    None,
+                ));
             }
         }
         Ok(())

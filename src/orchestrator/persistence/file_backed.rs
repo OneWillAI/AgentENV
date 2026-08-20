@@ -642,6 +642,29 @@ impl FileBackedSandboxPersister {
             .is_some()
     }
 
+    /// The leftover `<store>/artifacts/<sandbox-id>` directory after the index
+    /// is gone. Purge may remove that exact tree; it still refuses `..` and
+    /// anything that is not this sandbox's managed root.
+    fn validated_managed_sandbox_root_path(
+        &self,
+        sandbox_id: &SandboxId,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        let relative = path.strip_prefix(self.artifacts_root()).ok()?;
+        let mut components = relative.components();
+        let Some(Component::Normal(found_sandbox_id)) = components.next() else {
+            return None;
+        };
+        if found_sandbox_id.to_string_lossy() != sandbox_id.to_string()
+            || components.next().is_some()
+        {
+            return None;
+        }
+        let canonical = self.validated_managed_artifact_path(path)?;
+        matches!(stdfs::symlink_metadata(&canonical), Ok(metadata) if metadata.file_type().is_dir())
+            .then_some(canonical)
+    }
+
     /// Version-one records were created by the same allocator used today:
     /// `<store>/artifacts/<sandbox-id>/<generation>`.  Keep this separate
     /// policy boundary even though the historical layout is currently the
@@ -1633,7 +1656,61 @@ impl FileBackedSandboxPersister {
                 ),
                 source: None,
             })?;
-        Self::remove_artifact_root(&canonical_artifact_root).await
+        Self::remove_artifact_root(&canonical_artifact_root).await?;
+        self.remove_empty_sandbox_artifact_root(sandbox_id).await
+    }
+
+    /// Resume and delete leave the `<sandbox-id>` directory behind after the
+    /// generation is gone. An empty leftover is not recovery data: if it stays,
+    /// the next delete sees "unreferenced artifacts" and fail-closes.
+    async fn remove_empty_sandbox_artifact_root(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<()> {
+        let sandbox_root = self.sandbox_artifact_root(sandbox_id);
+        match fs::remove_dir(&sandbox_root).await {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Ok(())
+            }
+            Err(source) => Err(SandboxPersistenceError::io(
+                "remove empty paused sandbox artifact root",
+                sandbox_root,
+                source,
+            )),
+        }
+    }
+
+    async fn leftover_sandbox_artifact_root_is_empty(
+        sandbox_root: &Path,
+    ) -> PersistenceResult<bool> {
+        let mut entries = match fs::read_dir(sandbox_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "read leftover paused sandbox artifact root",
+                    sandbox_root,
+                    source,
+                ));
+            }
+        };
+        Ok(entries
+            .next_entry()
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::io(
+                    "scan leftover paused sandbox artifact root",
+                    sandbox_root,
+                    source,
+                )
+            })?
+            .is_none())
     }
 
     /// Make successful-resume cleanup crash-safe. The `Resumed` marker is the
@@ -2240,7 +2317,9 @@ impl FileBackedSandboxPersister {
         }
         if let Some(path) = entry.artifact_root.as_deref() {
             let canonical_artifact_path = match expected_sandbox_id {
-                Some(sandbox_id) => self.validated_managed_generation_path(&sandbox_id, path),
+                Some(sandbox_id) => self
+                    .validated_managed_generation_path(&sandbox_id, path)
+                    .or_else(|| self.validated_managed_sandbox_root_path(&sandbox_id, path)),
                 None => self.validated_purgeable_artifact_path(path),
             }
             .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
@@ -2560,20 +2639,23 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 let sandbox_root = self.sandbox_artifact_root(sandbox_id);
                 let record_key = sandbox_id.to_string();
                 if fs::symlink_metadata(&sandbox_root).await.is_ok() {
+                    if Self::leftover_sandbox_artifact_root_is_empty(&sandbox_root).await? {
+                        Self::remove_artifact_root(&sandbox_root).await?;
+                        return Ok(());
+                    }
                     self.quarantine(
                         "refusing automatic deletion of unreferenced paused sandbox artifacts",
                         Some(record_key.as_bytes()),
                         None,
-                        None,
+                        Some(&sandbox_root),
                         None,
                     )
                     .await?;
-                    return Err(SandboxPersistenceError::InvalidRecord {
-                        reason: format!(
-                            "paused sandbox {sandbox_id} has unreferenced artifacts; use the host-local recovery purge command"
-                        ),
+                    return Err(SandboxPersistenceError::manual_recovery(
+                        *sandbox_id,
+                        "unreferenced artifacts; use the host-local recovery purge command",
                         source,
-                    });
+                    ));
                 }
                 return Ok(());
             }
@@ -2600,7 +2682,11 @@ impl SandboxPersister for FileBackedSandboxPersister {
                     None,
                 )
                 .await?;
-                return Err(error);
+                return Err(SandboxPersistenceError::manual_recovery(
+                    *sandbox_id,
+                    format!("invalid paused sandbox record: {error}"),
+                    None,
+                ));
             }
             Err(error) => return Err(error),
         };
@@ -2638,18 +2724,21 @@ impl SandboxPersister for FileBackedSandboxPersister {
                     .as_deref(),
             )
             .await?;
-            return Err(SandboxPersistenceError::InvalidRecord {
-                reason: format!(
-                    "refusing automatic deletion of paused sandbox {sandbox_id}: artifact root is not an exact managed generation"
-                ),
-                source: None,
-            });
+            return Err(SandboxPersistenceError::manual_recovery(
+                *sandbox_id,
+                "artifact root is not an exact managed generation",
+                None,
+            ));
         };
-        self.remove_record(sandbox_id).await?;
-        // Delete only the indexed generation.  Any sibling generation may be
-        // a quarantine candidate and must remain until an administrator
-        // explicitly purges it.
+        // Remove the generation first. If the process dies after this, startup
+        // sees a record whose artifacts are gone and quarantines it; if it
+        // dies after dropping the index instead, leftover files become
+        // unreferenced and used to prevent the worker from booting.
         Self::remove_artifact_root(&canonical_artifact_root).await?;
+        self.remove_record(sandbox_id).await?;
+        // Sibling generations stay until an administrator purges them. An
+        // empty `<sandbox-id>` directory is not recovery data.
+        self.remove_empty_sandbox_artifact_root(sandbox_id).await?;
         Ok(())
     }
 
@@ -3140,10 +3229,7 @@ mod tests {
             .await
             .expect_err("unsafe legacy paths must require quarantine recovery");
 
-        assert!(matches!(
-            error,
-            SandboxPersistenceError::InvalidRecord { .. }
-        ));
+        assert!(error.requires_explicit_purge());
         assert!(snapshot_root.exists());
         assert!(has_record(&persister, &sandbox_id).await?);
         assert_eq!(persister.list_quarantines().await?.len(), 1);
@@ -3897,6 +3983,7 @@ mod tests {
 
         assert!(!has_record(&persister, &sandbox_id).await?);
         assert!(!snapshot_root.exists());
+        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
         Ok(())
     }
 
@@ -3913,9 +4000,35 @@ mod tests {
             .await
             .expect_err("unreferenced artifacts must require explicit recovery purge");
 
-        assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
+        assert!(err.requires_explicit_purge());
         assert!(sandbox_artifact_root.exists());
         assert_eq!(persister.list_quarantines().await?.len(), 1);
+
+        let quarantine = persister
+            .list_quarantines()
+            .await?
+            .into_iter()
+            .next()
+            .expect("unreferenced leftover should be listed for purge");
+        persister.purge_quarantine(&quarantine.id).await?;
+        assert!(!sandbox_artifact_root.exists());
+        assert!(persister.list_quarantines().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_record_and_artifacts_removes_empty_leftover_sandbox_root() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let sandbox_artifact_root = persister.sandbox_artifact_root(&sandbox_id);
+        tokio::fs::create_dir_all(&sandbox_artifact_root).await?;
+
+        persister.delete_record_and_artifacts(&sandbox_id).await?;
+
+        assert!(!sandbox_artifact_root.exists());
+        assert!(persister.list_quarantines().await?.is_empty());
         Ok(())
     }
 
@@ -3935,7 +4048,7 @@ mod tests {
             .await
             .expect_err("invalid records must not be removed automatically");
 
-        assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
+        assert!(err.requires_explicit_purge());
         assert!(has_record(&persister, &sandbox_id).await?);
         assert_eq!(persister.list_quarantines().await?.len(), 1);
         Ok(())

@@ -413,13 +413,38 @@ where
                 CreateIdempotencyRecordState::Deleting => {
                     // `Deleting` is written only after runtime stop succeeds.
                     // Completing both durable removals proves absence before the
-                    // key can be released.
-                    persister
+                    // key can be released. Leftover files that cannot be proven
+                    // safe to erase stay in host-local quarantine; that is an
+                    // operator recovery item, not a reason to refuse boot.
+                    match persister
                         .delete_record_and_artifacts(&record.sandbox_id)
-                        .await?;
-                    persister.delete_create_idempotency_record(key).await?;
-                    deleting_keys.insert(key.clone());
-                    deleting_sandboxes.insert(record.sandbox_id);
+                        .await
+                    {
+                        Ok(()) => {
+                            persister.delete_create_idempotency_record(key).await?;
+                            deleting_keys.insert(key.clone());
+                            deleting_sandboxes.insert(record.sandbox_id);
+                        }
+                        Err(error) if error.requires_explicit_purge() => {
+                            warn!(
+                                sandbox_id = %record.sandbox_id,
+                                error = %error,
+                                "paused sandbox delete at startup left artifacts in host-local quarantine; releasing the create key"
+                            );
+                            persister.delete_create_idempotency_record(key).await?;
+                            deleting_keys.insert(key.clone());
+                            deleting_sandboxes.insert(record.sandbox_id);
+                        }
+                        Err(error) => {
+                            warn!(
+                                sandbox_id = %record.sandbox_id,
+                                error = %error,
+                                "paused sandbox delete at startup could not finish; retaining a failed create-key tombstone"
+                            );
+                            record.state = CreateIdempotencyRecordState::Failed;
+                            persister.persist_create_idempotency_record(record).await?;
+                        }
+                    }
                 }
                 CreateIdempotencyRecordState::Creating => {
                     // No paused sandbox corroborated this interrupted create.

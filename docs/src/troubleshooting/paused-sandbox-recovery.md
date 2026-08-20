@@ -4,7 +4,11 @@ AgentENV preserves paused-sandbox artifacts when it cannot prove that their
 metadata is valid or durably indexed. Startup automatically repairs a missing
 or corrupt v2 RocksDB index when its adjacent manifest is valid. It does not
 guess through manifest/index disagreement, malformed manifests, or markerless
-artifact generations; those items are quarantined on the local worker.
+artifact generations; those items are quarantined on the local worker. A
+quarantined leftover does not prevent the worker from booting: startup
+releases the create-idempotency key after recording the quarantine, and
+continues serving new sandboxes. `purge` is only required to discard the
+retained files.
 
 The recovery utility is intentionally host-local and has no HTTP/API surface.
 Run it as a host administrator on the worker that owns the persisted-sandbox
