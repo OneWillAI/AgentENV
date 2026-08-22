@@ -537,10 +537,12 @@ impl Slot {
         let tap_ip = self.address_plan.tap_ip();
         let vm_ip = self.address_plan.vm_ip();
         thread::spawn(move || {
-            for _ in 0..40 {
+            for attempt in 0..40 {
                 if let Err(error) = refresh_guest_arp_in(netns_path.clone(), tap_ip, vm_ip) {
-                    warn!(error = %error, "guest ARP refresh failed");
-                    return;
+                    // tap0's sysfs node is not visible from the host mount
+                    // immediately after resume. Keep announcing; one missed
+                    // frame must not give up the ~2s refresh window.
+                    warn!(error = %error, attempt, "guest ARP refresh failed");
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -947,12 +949,47 @@ fn build_arp_frame(sender_mac: [u8; 6], opcode: u16, sender_ip: Ipv4Addr, target
     frame
 }
 
+fn tap_mac_and_index(interface: &str) -> Result<([u8; 6], i32)> {
+    // ioctl after setns sees tap0 in this netns. Host /sys/class/net has no
+    // tap0, so reading sysfs here is ENOENT and the refresh never runs.
+    anyhow::ensure!(
+        !interface.is_empty() && interface.len() < libc::IFNAMSIZ,
+        "interface name is invalid: {interface}"
+    );
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open ioctl socket for tap identity");
+    }
+    let _owned = unsafe { File::from_raw_fd(fd) };
+    let mut req = unsafe { std::mem::zeroed::<libc::ifreq>() };
+    for (index, byte) in interface.as_bytes().iter().enumerate() {
+        req.ifr_name[index] = *byte as libc::c_char;
+    }
+    if unsafe { libc::ioctl(fd, libc::SIOCGIFINDEX, &mut req) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("resolve {interface} ifindex"));
+    }
+    let ifindex = unsafe { req.ifr_ifru.ifru_ivalue };
+    if unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR, &mut req) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("resolve {interface} MAC"));
+    }
+    let data = unsafe { req.ifr_ifru.ifru_hwaddr.sa_data };
+    Ok((
+        [
+            data[0] as u8,
+            data[1] as u8,
+            data[2] as u8,
+            data[3] as u8,
+            data[4] as u8,
+            data[5] as u8,
+        ],
+        ifindex,
+    ))
+}
+
 fn send_arp_on_tap(interface: &str, opcode: u16, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Result<()> {
-    let mac = parse_mac(&fs::read_to_string(format!("/sys/class/net/{interface}/address"))?)?;
-    let ifindex: i32 = fs::read_to_string(format!("/sys/class/net/{interface}/ifindex"))?
-        .trim()
-        .parse()
-        .context("parse tap ifindex")?;
+    let (mac, ifindex) = tap_mac_and_index(interface)?;
     let frame = build_arp_frame(mac, opcode, sender_ip, target_ip);
     let fd = unsafe {
         libc::socket(
@@ -1180,6 +1217,16 @@ mod tests {
         assert_eq!(
             parse_mac("0a:00:00:00:00:01\n").unwrap(),
             [0x0a, 0x00, 0x00, 0x00, 0x00, 0x01]
+        );
+    }
+
+    #[test]
+    fn tap_mac_and_index_uses_ioctl_not_host_sysfs() {
+        let error = tap_mac_and_index("tap-missing-for-arp-test").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ifindex"),
+            "ioctl path must report a missing tap in this netns: {message}"
         );
     }
 
