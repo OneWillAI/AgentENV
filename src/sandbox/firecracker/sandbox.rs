@@ -1,13 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -594,12 +595,23 @@ impl FirecrackerSandbox {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
+        if let Some(slot) = self.network_slot.as_ref() {
+            if let Err(error) = slot.refresh_guest_arp() {
+                warn!(error = %error, "failed to refresh guest ARP before envd health");
+            }
+            slot.spawn_guest_arp_refresh();
+        }
+        let health_started = Instant::now();
         envd_instance
             .wait_for_ready(
                 self.runtime_policy.envd_timeout,
                 self.runtime_policy.envd_poll_interval,
             )
             .await?;
+        info!(
+            elapsed_ms = health_started.elapsed().as_millis(),
+            "sandbox envd health ready"
+        );
         if let Some(device_key) = &self.mem_snapshot_image_config_path {
             // envd is up: release held background downloads for this memory
             // device. Best-effort — downloads would also start after the
@@ -614,13 +626,19 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
+        let init_started = Instant::now();
         envd_instance
             .init(
                 self.launch.common().env_vars.clone(),
                 self.launch.common().default_workdir.clone(),
                 self.launch.common().default_user.clone(),
             )
-            .await
+            .await?;
+        info!(
+            elapsed_ms = init_started.elapsed().as_millis(),
+            "sandbox envd initialized"
+        );
+        Ok(())
     }
 
     /// Pause the running sandbox and create a snapshot for later resume.
@@ -1591,6 +1609,9 @@ impl FirecrackerSandbox {
             .context("reconcile disk rate limiter on snapshot resume")?;
 
         self.fc_instance.resume().await?;
+        if let Some(slot) = self.network_slot.as_ref() {
+            slot.spawn_guest_arp_refresh();
+        }
 
         debug!("sandbox restored from snapshot config");
         Ok(())
