@@ -22,10 +22,14 @@ The fragment to apply is [`config/kernel/erofs-guest.fragment`](../../config/ker
 
 - `CONFIG_EROFS_FS=y`
 - `CONFIG_EROFS_FS_ZIP=y`
-- `CONFIG_EROFS_FS_BACKED_BY_FILE=y` (present on 6.1.112+; the KVM pin is 6.1.175)
+- `CONFIG_EROFS_FS_BACKED_BY_FILE=y` (Linux **6.12+**. Vanilla `6.1.175` has
+  erofs and ZIP only; `olddefconfig` drops this symbol because the Kconfig
+  option does not exist.)
 
 Loop-mount erofs works without file-backed support. File-backed is required so
-each topping does not consume a loop device.
+each topping does not consume a loop device. The KVM guest should follow
+current [kernel.org longterm](https://www.kernel.org/) (`6.18.45`), not the
+Firecracker 6.1 CI pin.
 
 ## Rollout
 

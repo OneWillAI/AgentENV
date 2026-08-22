@@ -6,9 +6,11 @@
 # this fragment is built into a new vmlinux and pinned in deps_manifest.toml,
 # hosted guests cannot mount those images.
 #
-# Apply on the same kernel tree already used for the pin (6.1.175 for KVM;
-# CONFIG_EROFS_FS_BACKED_BY_FILE exists on 6.1.112+). Rebuild vmlinux, publish
-# the artifact, bump [kernel.kvm] / [kernel.pvm], roll workers, and rebuild the
+# File-backed mounts need Linux 6.12+. Vanilla 6.1.y has CONFIG_EROFS_FS and
+# ZIP, but not CONFIG_EROFS_FS_BACKED_BY_FILE (that option landed in 6.12).
+# The KVM guest pin should follow current kernel.org longterm (6.18.45), not
+# the Firecracker 6.1 CI kernel or the older 6.12 LTS. Rebuild vmlinux,
+# publish the artifact, bump [kernel.kvm], roll workers, and rebuild the
 # default guest template. Paused VMs keep the old kernel until relaunch.
 #
 # Do not compile this kernel on a Mac. Use the persistent GCP burst builder.
