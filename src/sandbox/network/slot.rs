@@ -961,15 +961,17 @@ fn tap_mac_and_index(interface: &str) -> Result<([u8; 6], i32)> {
         return Err(std::io::Error::last_os_error()).context("open ioctl socket for tap identity");
     }
     let _owned = unsafe { File::from_raw_fd(fd) };
+    let c_name = std::ffi::CString::new(interface)
+        .with_context(|| format!("interface name is invalid: {interface}"))?;
+    let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if ifindex == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("resolve {interface} ifindex"));
+    }
     let mut req = unsafe { std::mem::zeroed::<libc::ifreq>() };
     for (index, byte) in interface.as_bytes().iter().enumerate() {
         req.ifr_name[index] = *byte as libc::c_char;
     }
-    if unsafe { libc::ioctl(fd, libc::SIOCGIFINDEX, &mut req) } < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("resolve {interface} ifindex"));
-    }
-    let ifindex = unsafe { req.ifr_ifru.ifru_ivalue };
     if unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR, &mut req) } < 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("resolve {interface} MAC"));
@@ -984,7 +986,7 @@ fn tap_mac_and_index(interface: &str) -> Result<([u8; 6], i32)> {
             data[4] as u8,
             data[5] as u8,
         ],
-        ifindex,
+        ifindex as i32,
     ))
 }
 
