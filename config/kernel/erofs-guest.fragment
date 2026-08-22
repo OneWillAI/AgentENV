@@ -1,0 +1,20 @@
+# Guest kernel fragment for Hambody topping images.
+#
+# Published Firecracker kernels (kernel.kvm vmlinux-6.1.175 and kernel.pvm
+# 6.12.33-pvm) ship overlay, squashfs, fuse, and ext4. They do not ship erofs.
+# Hambody attaches each topping as a file-backed erofs plus overlayfs. Until
+# this fragment is built into a new vmlinux and pinned in deps_manifest.toml,
+# hosted guests cannot mount those images.
+#
+# Apply on the same kernel tree already used for the pin (6.1.175 for KVM;
+# CONFIG_EROFS_FS_BACKED_BY_FILE exists on 6.1.112+). Rebuild vmlinux, publish
+# the artifact, bump [kernel.kvm] / [kernel.pvm], roll workers, and rebuild the
+# default guest template. Paused VMs keep the old kernel until relaunch.
+#
+# Do not compile this kernel on a Mac. Use the persistent GCP burst builder.
+
+CONFIG_EROFS_FS=y
+CONFIG_EROFS_FS_ZIP=y
+CONFIG_EROFS_FS_BACKED_BY_FILE=y
+# File-backed mounts plus an in-guest range hydrator; not kernel ondemand.
+# CONFIG_EROFS_FS_ONDEMAND is not required.
