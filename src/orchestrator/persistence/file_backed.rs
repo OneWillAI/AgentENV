@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::fs as stdfs;
 use std::path::{Component, Path, PathBuf};
 
@@ -29,7 +28,9 @@ use super::{
     CreateIdempotencyRecord, PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
-use crate::orchestrator::{store::SandboxMetadata, SandboxState};
+use crate::orchestrator::store::SandboxMetadata;
+#[cfg(test)]
+use crate::orchestrator::SandboxState;
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
@@ -2976,7 +2977,7 @@ mod tests {
         persister
             .db()
             .await?
-            .put(sandbox_id.to_string(), &mismatched)
+            .put(sandbox_id.to_string(), mismatched.clone())
             .await?;
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
