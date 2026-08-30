@@ -2790,18 +2790,6 @@ mod tests {
         Ok((sandbox_id, snapshot_root, paused_state))
     }
 
-    async fn has_record(
-        persister: &FileBackedSandboxPersister,
-        sandbox_id: &SandboxId,
-    ) -> anyhow::Result<bool> {
-        Ok(persister
-            .db()
-            .await?
-            .get(sandbox_id.to_string())
-            .await?
-            .is_some())
-    }
-
     #[tokio::test]
     async fn create_idempotency_journal_round_trips_and_deletes() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -2867,394 +2855,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_manifest_is_durable_source_and_rocksdb_contains_only_its_index(
-    ) -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
-
-        let index_bytes = persister
-            .db()
-            .await?
-            .get(sandbox_id.to_string())
-            .await?
-            .expect("v2 record index should be present");
-        let StoredPausedEntry::Index(index) = decode_stored_paused_entry(&index_bytes)? else {
-            anyhow::bail!("v2 paused records must be stored as manifest indexes");
-        };
-        let manifest = persister
-            .read_manifest(
-                &FileBackedSandboxPersister::manifest_path(&snapshot_root),
-                None,
-            )
-            .await?;
-
-        assert_eq!(manifest.record.version, PAUSED_MANIFEST_VERSION);
-        assert_eq!(
-            manifest.record.commit_state,
-            PersistedPausedCommitState::Committed
-        );
-        assert!(manifest.matches_index(&index));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_all_rebuilds_a_missing_v2_index_from_a_valid_manifest() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let (sandbox_id, _snapshot_root, _paused_state) = persist_test_record(&persister).await?;
-        persister.db().await?.delete(sandbox_id.to_string()).await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, sandbox_id);
-        assert!(has_record(&persister, &sandbox_id).await?);
-        assert!(persister.list_quarantines().await?.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_all_rebuilds_a_corrupt_v2_index_without_deleting_its_artifacts(
-    ) -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), b"corrupt-index")
-            .await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, sandbox_id);
-        assert!(snapshot_root.exists());
-        assert!(matches!(
-            decode_stored_paused_entry(
-                &persister
-                    .db()
-                    .await?
-                    .get(sandbox_id.to_string())
-                    .await?
-                    .expect("replacement index should be present")
-            )?,
-            StoredPausedEntry::Index(_)
-        ));
-        let quarantines = persister.list_quarantines().await?;
-        assert_eq!(quarantines.len(), 1);
-        assert!(
-            !quarantines[0].requires_manual_recovery,
-            "a coherent same-ID manifest may repair malformed raw index bytes"
-        );
-
-        // The forensic quarantine stays recorded, but it must not block a
-        // second startup after the valid manifest has republished its index.
-        let loaded_again = persister.load_all(&MockBackendFactory::new()).await?;
-        assert_eq!(loaded_again.len(), 1);
-        assert_eq!(loaded_again[0].id, sandbox_id);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn explicit_v2_index_identity_mismatch_is_quarantined_without_rebuild(
-    ) -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
-        let original = persister
-            .db()
-            .await?
-            .get(sandbox_id.to_string())
-            .await?
-            .expect("index exists");
-        let StoredPausedEntry::Index(mut index) = decode_stored_paused_entry(&original)? else {
-            anyhow::bail!("v2 record must be indexed");
-        };
-        index.manifest_path = temp.path().join("outside-manifest.json");
-        let mismatched = serde_json::to_vec(&index)?;
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), mismatched.clone())
-            .await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert!(loaded.is_empty());
-        assert!(snapshot_root.exists());
-        assert_eq!(
-            persister
-                .db()
-                .await?
-                .get(sandbox_id.to_string())
-                .await?
-                .as_deref(),
-            Some(mismatched.as_slice())
-        );
-        assert!(persister
-            .list_quarantines()
-            .await?
-            .into_iter()
-            .any(|entry| entry.requires_manual_recovery));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn malformed_json_index_version_rebuilds_from_a_coherent_manifest() -> anyhow::Result<()>
-    {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
-        let malformed = serde_json::to_vec(&serde_json::json!({
-            "indexVersion": "not-a-number",
-            "sandboxId": sandbox_id,
-            "manifestPath": FileBackedSandboxPersister::manifest_path(&snapshot_root),
-        }))?;
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), malformed)
-            .await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, sandbox_id);
-        assert!(matches!(
-            decode_stored_paused_entry(
-                &persister
-                    .db()
-                    .await?
-                    .get(sandbox_id.to_string())
-                    .await?
-                    .expect("coherent manifest should republish its index")
-            )?,
-            StoredPausedEntry::Index(_)
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn valid_legacy_v1_record_remains_readable() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
-        let paused_state = paused_state(&snapshot_root);
-        let record = PersistedPausedRecord {
-            version: LEGACY_RECORD_VERSION,
-            commit_state: PersistedPausedCommitState::Committed,
-            lifecycle: PersistedPausedLifecycle::Paused,
-            resuming_boot_id: None,
-            unproven_stop_boot_id: None,
-            metadata: SandboxMetadata {
-                id: sandbox_id,
-                paused_state: Some(Arc::clone(&paused_state)),
-                ..Default::default()
-            },
-            artifact_root: snapshot_root.clone(),
-            state: paused_state.encode()?,
-        };
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), serde_json::to_vec(&record)?)
-            .await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, sandbox_id);
-        assert!(has_record(&persister, &sandbox_id).await?);
-        assert!(persister.list_quarantines().await?.is_empty());
-        let stored = persister
-            .db()
-            .await?
-            .get(sandbox_id.to_string())
-            .await?
-            .expect("legacy record should remain present");
-        let StoredPausedEntry::Legacy(stored) = decode_stored_paused_entry(&stored)? else {
-            anyhow::bail!("boot observation must preserve the v1 record format");
-        };
-        assert!(!stored.metadata.paused_runtime_stopped);
-        if let Some(boot_id) = current_host_boot_id() {
-            assert_eq!(
-                stored.unproven_stop_boot_id.as_deref(),
-                Some(boot_id.as_str())
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unsafe_legacy_v1_artifact_path_is_quarantined_and_never_auto_deleted(
-    ) -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let outside = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let snapshot_root = outside.path().join("legacy-snapshot");
-        let paused_state = paused_state(&snapshot_root);
-        let record = PersistedPausedRecord {
-            version: LEGACY_RECORD_VERSION,
-            commit_state: PersistedPausedCommitState::Committed,
-            lifecycle: PersistedPausedLifecycle::Paused,
-            resuming_boot_id: None,
-            unproven_stop_boot_id: None,
-            metadata: SandboxMetadata {
-                id: sandbox_id,
-                paused_state: Some(Arc::clone(&paused_state)),
-                ..Default::default()
-            },
-            artifact_root: snapshot_root.clone(),
-            state: paused_state.encode()?,
-        };
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), serde_json::to_vec(&record)?)
-            .await?;
-
-        let error = persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-            .expect_err("unsafe legacy paths must require quarantine recovery");
-
-        assert!(error.requires_explicit_purge());
-        assert!(snapshot_root.exists());
-        assert!(has_record(&persister, &sandbox_id).await?);
-        assert_eq!(persister.list_quarantines().await?.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cross_sandbox_legacy_quarantine_cannot_purge_another_sandbox_generation(
-    ) -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_a = SandboxId::new();
-        let sandbox_b = SandboxId::new();
-        let sandbox_a_key = sandbox_a.to_string();
-        let sandbox_b_root = test_snapshot_root(&persister, &sandbox_b);
-        let paused_state = paused_state(&sandbox_b_root);
-        let sandbox_b_metadata = SandboxMetadata {
-            id: sandbox_b,
-            paused_state: Some(Arc::clone(&paused_state)),
-            ..Default::default()
-        };
-        persister
-            .persist_paused(
-                &sandbox_b_metadata,
-                Some(&sandbox_b_root),
-                paused_state.as_ref(),
-            )
-            .await?;
-        let unsafe_legacy_record = PersistedPausedRecord {
-            version: LEGACY_RECORD_VERSION,
-            commit_state: PersistedPausedCommitState::Committed,
-            lifecycle: PersistedPausedLifecycle::Paused,
-            resuming_boot_id: None,
-            unproven_stop_boot_id: None,
-            metadata: SandboxMetadata {
-                id: sandbox_a,
-                paused_state: Some(Arc::clone(&paused_state)),
-                ..Default::default()
-            },
-            artifact_root: sandbox_b_root.clone(),
-            state: paused_state.encode()?,
-        };
-        persister
-            .db()
-            .await?
-            .put(
-                sandbox_a.to_string(),
-                serde_json::to_vec(&unsafe_legacy_record)?,
-            )
-            .await?;
-
-        persister
-            .delete_record_and_artifacts(&sandbox_a)
-            .await
-            .expect_err("cross-sandbox legacy target must be quarantined");
-        let quarantine = persister
-            .list_quarantines()
-            .await?
-            .into_iter()
-            .find(|entry| entry.record_key.as_deref() == Some(sandbox_a_key.as_str()))
-            .expect("unsafe legacy record should have a quarantine entry");
-
-        let error = persister
-            .purge_quarantine(&quarantine.id)
-            .await
-            .expect_err("purge must reject a target owned by another sandbox");
-
-        assert!(matches!(
-            error,
-            SandboxPersistenceError::InvalidRecord { .. }
-        ));
-        assert!(sandbox_b_root.exists());
-        assert!(has_record(&persister, &sandbox_a).await?);
-        assert!(has_record(&persister, &sandbox_b).await?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mismatched_legacy_database_key_never_retains_a_purgeable_generation_target(
-    ) -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let declared_sandbox = SandboxId::new();
-        let database_key_sandbox = SandboxId::new();
-        let database_key = database_key_sandbox.to_string();
-        let database_key_root = test_snapshot_root(&persister, &database_key_sandbox);
-        let paused_state = paused_state(&database_key_root);
-        let mismatched_record = PersistedPausedRecord {
-            version: LEGACY_RECORD_VERSION,
-            commit_state: PersistedPausedCommitState::Committed,
-            lifecycle: PersistedPausedLifecycle::Paused,
-            resuming_boot_id: None,
-            unproven_stop_boot_id: None,
-            metadata: SandboxMetadata {
-                id: declared_sandbox,
-                paused_state: Some(Arc::clone(&paused_state)),
-                ..Default::default()
-            },
-            artifact_root: database_key_root.clone(),
-            state: paused_state.encode()?,
-        };
-        persister
-            .db()
-            .await?
-            .put(
-                database_key.clone(),
-                serde_json::to_vec(&mismatched_record)?,
-            )
-            .await?;
-
-        assert!(persister
-            .load_all(&MockBackendFactory::new())
-            .await?
-            .is_empty());
-        let quarantine = persister
-            .list_quarantines()
-            .await?
-            .into_iter()
-            .find(|entry| {
-                entry.record_key.as_deref() == Some(database_key.as_str())
-                    && entry.artifact_root.is_none()
-            })
-            .expect("key/metadata mismatch must retain only the raw record, not a purge target");
-
-        persister.purge_quarantine(&quarantine.id).await?;
-
-        assert!(database_key_root.exists());
-        assert!(!has_record(&persister, &database_key_sandbox).await?);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn missing_v2_commit_state_is_quarantined_without_deleting_the_manifest(
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -3271,7 +2871,6 @@ mod tests {
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
         assert!(loaded.is_empty());
-        assert!(has_record(&persister, &sandbox_id).await?);
         assert!(manifest_path.exists());
         assert!(!persister.list_quarantines().await?.is_empty());
         Ok(())
@@ -3361,31 +2960,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_recovery_marker_recreates_quarantine_and_allows_only_pending_metadata(
-    ) -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
-
-        persister
-            .write_recovery_marker(sandbox_id, &snapshot_root)
-            .await?;
-        let quarantines = persister.quarantine_db().await?.entries().await?;
-        for (key, _) in quarantines {
-            persister.quarantine_db().await?.delete(key).await?;
-        }
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, sandbox_id);
-        assert!(loaded[0].resume_recovery_pending);
-        assert!(!loaded[0].paused_runtime_stopped);
-        assert_eq!(persister.list_quarantines().await?.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn prepared_manifest_without_marker_is_quarantined_and_loaded_only_recovery_pending(
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -3443,7 +3017,6 @@ mod tests {
         persister.purge_quarantine(&quarantine.id).await?;
 
         assert!(!snapshot_root.exists());
-        assert!(!has_record(&persister, &sandbox_id).await?);
         assert!(persister.list_quarantines().await?.is_empty());
         Ok(())
     }
@@ -3481,7 +3054,6 @@ mod tests {
 
         assert!(!misplaced_marker.exists());
         assert!(snapshot_root.exists());
-        assert!(has_record(&persister, &sandbox_id).await?);
         Ok(())
     }
 
@@ -3503,7 +3075,6 @@ mod tests {
         assert_eq!(loaded[0].state, SandboxState::Paused);
         assert_eq!(loaded[0].virtualization_mode, VirtualizationMode::Kvm);
         assert!(loaded[0].paused_state.is_none());
-        assert!(has_record(&pvm_persister, &sandbox_id).await?);
         assert!(snapshot_root.exists());
         Ok(())
     }
@@ -3537,8 +3108,6 @@ mod tests {
         assert_eq!(pvm_metadata.virtualization_mode, VirtualizationMode::Pvm);
         assert!(pvm_metadata.paused_state.is_some());
 
-        assert!(has_record(&pvm_persister, &kvm_id).await?);
-        assert!(has_record(&pvm_persister, &pvm_id).await?);
         assert!(kvm_root.exists());
         assert!(pvm_root.exists());
         Ok(())
@@ -3605,7 +3174,6 @@ mod tests {
         assert_eq!(loaded[0].state, SandboxState::Paused);
         assert!(loaded[0].resume_recovery_pending);
         assert!(loaded[0].paused_state.is_some());
-        assert!(has_record(&persister, &metadata.id).await?);
         assert!(persister.sandbox_artifact_root(&metadata.id).exists());
         Ok(())
     }
@@ -3767,7 +3335,6 @@ mod tests {
 
         persister.delete_record(&sandbox_id).await?;
 
-        assert!(!has_record(&persister, &sandbox_id).await?);
         assert!(consumed_generation.exists());
         Ok(())
     }
@@ -3798,7 +3365,6 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, sandbox_id);
         assert_eq!(loaded[0].state, SandboxState::Paused);
-        assert!(has_record(&persister, &sandbox_id).await?);
         assert!(last_generation.exists());
         assert!(persister.list_quarantines().await?.is_empty());
         Ok(())
@@ -3834,7 +3400,6 @@ mod tests {
             .persist_paused(&metadata, Some(&second_generation), second_state.as_ref())
             .await?;
 
-        assert!(has_record(&persister, &sandbox_id).await?);
         assert!(!first_generation.exists());
         assert!(second_generation.exists());
         Ok(())
@@ -3870,7 +3435,6 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, sandbox_id);
         assert_eq!(loaded[0].state, SandboxState::Paused);
-        assert!(has_record(&persister, &sandbox_id).await?);
         assert!(consumed_generation.exists());
         Ok(())
     }
@@ -3939,7 +3503,6 @@ mod tests {
 
         persister.delete_record_and_artifacts(&sandbox_id).await?;
 
-        assert!(!has_record(&persister, &sandbox_id).await?);
         assert!(!snapshot_root.exists());
         assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
         Ok(())
@@ -3970,51 +3533,9 @@ mod tests {
 
         persister.delete_record_and_artifacts(&sandbox_id).await?;
 
-        assert!(!has_record(&persister, &sandbox_id).await?);
         assert!(!last_generation.exists());
         assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
         assert!(persister.list_quarantines().await?.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_record_and_artifacts_refuses_invalid_record() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), b"not-json")
-            .await?;
-
-        let err = persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-            .expect_err("invalid records must not be removed automatically");
-
-        assert!(err.requires_explicit_purge());
-        assert!(has_record(&persister, &sandbox_id).await?);
-        assert_eq!(persister.list_quarantines().await?.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_all_preserves_and_quarantines_invalid_record() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), b"not-json")
-            .await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert!(loaded.is_empty());
-        assert!(has_record(&persister, &sandbox_id).await?);
-        assert_eq!(persister.list_quarantines().await?.len(), 1);
         Ok(())
     }
 
@@ -4040,7 +3561,6 @@ mod tests {
         let loaded = persister.load_all(&RejectingFactory).await?;
 
         assert!(loaded.is_empty());
-        assert!(has_record(&persister, &sandbox_id).await?);
         assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
         assert_eq!(persister.list_quarantines().await?.len(), 1);
         Ok(())

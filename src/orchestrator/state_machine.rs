@@ -35,6 +35,12 @@ pub(super) enum DeleteTransition {
 }
 
 #[derive(Debug)]
+pub(super) enum PausePreparation {
+    Owner,
+    Complete,
+}
+
+#[derive(Debug)]
 pub(super) enum ResumePreparation {
     Paused(SandboxMetadata),
     Complete(SandboxMetadata),

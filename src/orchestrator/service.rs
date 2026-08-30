@@ -34,7 +34,9 @@ use super::persistence::{
     FileBackedSandboxPersister, SandboxPersistenceError, SandboxPersister,
 };
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
-use super::state_machine::{DeleteTransition, FailedLaunchStage, ResumePreparation};
+use super::state_machine::{
+    DeleteTransition, FailedLaunchStage, PausePreparation, ResumePreparation,
+};
 use super::store::*;
 use super::types::{
     CreateSandboxIdempotency, CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent,
@@ -1736,7 +1738,10 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
-        self.transition_to_pausing(sandbox_id).await?;
+        match self.transition_to_pausing(sandbox_id).await? {
+            PausePreparation::Owner => {}
+            PausePreparation::Complete => return Ok(()),
+        }
         self.protect_pause_artifacts(sandbox_id).await?;
         let artifact_root = self.allocate_pause_artifact_root(sandbox_id).await?;
 
@@ -1791,15 +1796,18 @@ where
         Ok(())
     }
 
-    async fn transition_to_pausing(&self, sandbox_id: SandboxId) -> Result<()> {
+    async fn transition_to_pausing(&self, sandbox_id: SandboxId) -> Result<PausePreparation> {
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(PausePreparation::Owner),
             Err(StoreError::StateConflict { actual_state, .. }) => match actual_state {
-                SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
+                SandboxState::Pausing => {
+                    self.join_concurrent_pause(sandbox_id).await?;
+                    Ok(PausePreparation::Complete)
+                }
                 SandboxState::Paused => {
                     let metadata = self
                         .store
@@ -1807,7 +1815,8 @@ where
                         .await?
                         .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
                     Self::require_resume_recovery_resolved(&metadata)?;
-                    Self::require_paused_stop_proof(&metadata)
+                    Self::require_paused_stop_proof(&metadata)?;
+                    Ok(PausePreparation::Complete)
                 }
                 SandboxState::Killing => {
                     info!("sandbox is being deleted while pausing");

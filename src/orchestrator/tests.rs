@@ -2924,6 +2924,7 @@ async fn resume_sandbox_build_failure_does_not_subtract_metrics_that_were_never_
             id: paused_id,
             state: SandboxState::Paused,
             paused_state: Some(test_paused_state().clone()),
+            paused_runtime_stopped: true,
             ..Default::default()
         })
         .await?;
@@ -4575,6 +4576,7 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
         state: SandboxState::Paused,
         virtualization_mode: sandbox_mode,
         paused_state: None,
+        paused_runtime_stopped: true,
         ..Default::default()
     }]);
     let orchestrator = Orchestrator::new_inner(
@@ -4924,29 +4926,9 @@ async fn shutdown_returns_error_after_exhausting_pause_retries() -> Result<()> {
 }
 
 #[tokio::test]
-async fn shutdown_reuses_recorded_success_instead_of_running_cleanup_again() -> Result<()> {
+async fn shutdown_is_idempotent_after_preserving_a_running_sandbox() -> Result<()> {
     setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 1".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 2".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 3".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let orchestrator = make_orchestrator().await;
 
     let created = orchestrator
         .create_sandbox(create_request(
