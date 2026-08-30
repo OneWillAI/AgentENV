@@ -40,6 +40,13 @@ impl TemplateBuilder {
 
     /// Builds a template builder that applies the cluster CPU intersection to new templates.
     pub fn with_cpu_config(arc: Arc<RwLock<Option<String>>>) -> Self {
+        if !ConfigManager::global_config()
+            .template
+            .apply_cluster_cpu_config
+        {
+            info!("template builds will use the host CPU without the cluster CPU template");
+            return Self::new();
+        }
         Self {
             cpu_config_arc: Some(arc),
         }

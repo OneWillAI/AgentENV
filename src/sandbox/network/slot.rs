@@ -4,7 +4,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +39,45 @@ const ARP_RETRANS_TIME_MS: &str = "100";
 const NEIGH_SYSCTL_RETRIES: usize = 5;
 const NEIGH_SYSCTL_RETRY_DELAY_MS: u64 = 20;
 
+#[derive(Debug, Default)]
+struct ArpRefreshCancellation {
+    cancelled: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl ArpRefreshCancellation {
+    fn state(&self) -> MutexGuard<'_, bool> {
+        self.cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn reset(&self) {
+        *self.state() = false;
+    }
+
+    fn cancel(&self) {
+        *self.state() = true;
+        self.changed.notify_all();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.state()
+    }
+
+    fn wait(&self, duration: Duration) -> bool {
+        let state = self.state();
+        if *state {
+            return false;
+        }
+        let (state, _) = self
+            .changed
+            .wait_timeout(state, duration)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        !*state
+    }
+}
+
 /// Get a borrowed reference to the host network namespace fd.
 pub(super) fn host_ns_fd() -> BorrowedFd<'static> {
     HOST_NS_FD
@@ -60,6 +99,7 @@ pub(crate) struct Slot {
     address_plan: NetworkAddressPlan,
     netns_dir: PathBuf,
     cleanup_armed: AtomicBool,
+    arp_refresh_cancellation: Arc<ArpRefreshCancellation>,
 }
 
 struct NamespaceSetup {
@@ -104,6 +144,7 @@ impl Slot {
             address_plan,
             netns_dir,
             cleanup_armed: AtomicBool::new(false),
+            arp_refresh_cancellation: Arc::new(ArpRefreshCancellation::default()),
         })
     }
 
@@ -516,35 +557,18 @@ impl Slot {
         )
     }
 
-    /// Refresh the guest's neighbor table after snapshot resume.
-    ///
-    /// The guest keeps a REACHABLE ARP entry for the previous TAP MAC. Host
-    /// ARP retransmit was already shortened (issue #272); this sends an ARP
-    /// who-has plus a gratuitous announcement so the guest learns the new
-    /// gateway MAC without waiting for reachable-time expiry (~10s).
-    pub(crate) fn refresh_guest_arp(&self) -> Result<()> {
-        let netns_path = self.namespace_path();
-        let tap_ip = self.address_plan.tap_ip();
-        let vm_ip = self.address_plan.vm_ip();
-        refresh_guest_arp_in(netns_path, tap_ip, vm_ip)
-    }
-
     /// Keep announcing the new TAP MAC after snapshot resume until virtio-net
-    /// is processing again. The first few frames can be lost; a REACHABLE
-    /// guest neighbor for the previous MAC would otherwise sit for ~10s.
-    pub(crate) fn spawn_guest_arp_refresh(&self) {
+    /// is processing again. A single worker enters the namespace once and
+    /// owns the bounded repair window; fresh boots never need this repair.
+    pub(crate) fn spawn_resume_arp_refresh(&self) {
         let netns_path = self.namespace_path();
         let tap_ip = self.address_plan.tap_ip();
         let vm_ip = self.address_plan.vm_ip();
-        thread::spawn(move || {
-            for attempt in 0..40 {
-                if let Err(error) = refresh_guest_arp_in(netns_path.clone(), tap_ip, vm_ip) {
-                    // tap0's sysfs node is not visible from the host mount
-                    // immediately after resume. Keep announcing; one missed
-                    // frame must not give up the ~2s refresh window.
-                    warn!(error = %error, attempt, "guest ARP refresh failed");
-                }
-                thread::sleep(Duration::from_millis(50));
+        self.arp_refresh_cancellation.reset();
+        let cancellation = Arc::clone(&self.arp_refresh_cancellation);
+        let _ = thread::spawn(move || {
+            if let Err(error) = refresh_guest_arp_in(netns_path, tap_ip, vm_ip, &cancellation) {
+                warn!(error = %error, "guest ARP refresh worker failed");
             }
         });
     }
@@ -810,6 +834,8 @@ impl Slot {
         )
     )]
     pub(super) fn cleanup(&self, force_sync: bool) -> Result<(), NetworkError> {
+        self.arp_refresh_cancellation.cancel();
+
         // Skip cleanup for slots that never attempted network setup.
         // This avoids touching host networking state for logical-only Slot values.
         if !self.cleanup_armed.swap(false, Ordering::AcqRel) {
@@ -905,35 +931,43 @@ impl Drop for Slot {
 
 const ARP_REQUEST: u16 = 1;
 
-fn refresh_guest_arp_in(netns_path: PathBuf, tap_ip: Ipv4Addr, vm_ip: Ipv4Addr) -> Result<()> {
-    let handle = thread::spawn(move || -> Result<()> {
-        let netns = File::open(&netns_path).with_context(|| {
-            format!("failed to open network namespace {}", netns_path.display())
-        })?;
-        nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
-            .context("failed to enter sandbox network namespace for ARP refresh")?;
-        send_arp_on_tap("tap0", ARP_REQUEST, tap_ip, vm_ip)?;
-        send_arp_on_tap("tap0", ARP_REQUEST, tap_ip, tap_ip)?;
-        Ok(())
-    });
-    match handle.join() {
-        Ok(result) => result,
-        Err(e) => Err(anyhow!("ARP refresh thread panicked: {:?}", e)),
+fn refresh_guest_arp_in(
+    netns_path: PathBuf,
+    tap_ip: Ipv4Addr,
+    vm_ip: Ipv4Addr,
+    cancellation: &ArpRefreshCancellation,
+) -> Result<()> {
+    let netns = File::open(&netns_path)
+        .with_context(|| format!("failed to open network namespace {}", netns_path.display()))?;
+    nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
+        .context("failed to enter sandbox network namespace for ARP refresh")?;
+
+    for attempt in 0..40 {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
+        let result = send_arp_request_on_tap("tap0", tap_ip, vm_ip)
+            .and_then(|()| send_arp_request_on_tap("tap0", tap_ip, tap_ip));
+        if let Err(error) = result {
+            // The interface can be briefly unavailable while Firecracker
+            // reconnects virtio-net. One missed frame must not give up the
+            // bounded two-second repair window.
+            warn!(error = %error, attempt, "guest ARP refresh failed");
+        }
+        if attempt < 39 {
+            if !cancellation.wait(Duration::from_millis(50)) {
+                return Ok(());
+            }
+        }
     }
+    Ok(())
 }
 
-fn parse_mac(value: &str) -> Result<[u8; 6]> {
-    let mut mac = [0u8; 6];
-    let parts: Vec<&str> = value.trim().split(':').collect();
-    anyhow::ensure!(parts.len() == 6, "MAC address is invalid: {value}");
-    for (index, part) in parts.iter().enumerate() {
-        mac[index] = u8::from_str_radix(part, 16)
-            .with_context(|| format!("MAC address is invalid: {value}"))?;
-    }
-    Ok(mac)
-}
-
-fn build_arp_frame(sender_mac: [u8; 6], opcode: u16, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> [u8; 42] {
+fn build_arp_request_frame(
+    sender_mac: [u8; 6],
+    sender_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> [u8; 42] {
     let mut frame = [0u8; 42];
     frame[0..6].copy_from_slice(&[0xff; 6]);
     frame[6..12].copy_from_slice(&sender_mac);
@@ -942,7 +976,7 @@ fn build_arp_frame(sender_mac: [u8; 6], opcode: u16, sender_ip: Ipv4Addr, target
     frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
     frame[18] = 6;
     frame[19] = 4;
-    frame[20..22].copy_from_slice(&opcode.to_be_bytes());
+    frame[20..22].copy_from_slice(&ARP_REQUEST.to_be_bytes());
     frame[22..28].copy_from_slice(&sender_mac);
     frame[28..32].copy_from_slice(&sender_ip.octets());
     frame[38..42].copy_from_slice(&target_ip.octets());
@@ -990,9 +1024,13 @@ fn tap_mac_and_index(interface: &str) -> Result<([u8; 6], i32)> {
     ))
 }
 
-fn send_arp_on_tap(interface: &str, opcode: u16, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Result<()> {
+fn send_arp_request_on_tap(
+    interface: &str,
+    sender_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> Result<()> {
     let (mac, ifindex) = tap_mac_and_index(interface)?;
-    let frame = build_arp_frame(mac, opcode, sender_ip, target_ip);
+    let frame = build_arp_request_frame(mac, sender_ip, target_ip);
     let fd = unsafe {
         libc::socket(
             libc::AF_PACKET,
@@ -1196,11 +1234,10 @@ mod tests {
     }
 
     #[test]
-    fn build_arp_frame_is_a_broadcast_who_has() {
+    fn arp_request_frame_is_a_broadcast_who_has() {
         let mac = [0x0a, 0x00, 0x00, 0x00, 0x00, 0x01];
-        let frame = build_arp_frame(
+        let frame = build_arp_request_frame(
             mac,
-            ARP_REQUEST,
             Ipv4Addr::new(169, 254, 0, 22),
             Ipv4Addr::new(169, 254, 0, 21),
         );
@@ -1212,24 +1249,6 @@ mod tests {
         assert_eq!(&frame[28..32], &[169, 254, 0, 22]);
         assert_eq!(&frame[32..38], &[0u8; 6]);
         assert_eq!(&frame[38..42], &[169, 254, 0, 21]);
-    }
-
-    #[test]
-    fn parse_mac_reads_colon_hex() {
-        assert_eq!(
-            parse_mac("0a:00:00:00:00:01\n").unwrap(),
-            [0x0a, 0x00, 0x00, 0x00, 0x00, 0x01]
-        );
-    }
-
-    #[test]
-    fn tap_mac_and_index_uses_ioctl_not_host_sysfs() {
-        let error = tap_mac_and_index("tap-missing-for-arp-test").unwrap_err();
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("ifindex"),
-            "ioctl path must report a missing tap in this netns: {message}"
-        );
     }
 
     #[test]

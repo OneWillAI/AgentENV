@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self as stdfs, File};
-use std::io::Write;
+use std::ffi::OsString;
+use std::fs as stdfs;
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -13,6 +12,19 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::codecs::{
+    decode_record, decode_stored_paused_entry, sha256_hex, ManifestEntry, PersistedPausedIndex,
+    PersistedPausedRecord, StoredPausedEntry, LEGACY_RECORD_VERSION, PAUSED_INDEX_VERSION,
+    PAUSED_MANIFEST_FILE, PAUSED_MANIFEST_VERSION, PAUSED_RECOVERY_MARKER_FILE, QUARANTINE_VERSION,
+};
+use super::paused_transactions::{
+    PersistedPausedCommitState, PersistedPausedLifecycle, StopProofReconciliation,
+};
+use super::recovery::{
+    ManifestReconciliation, PausedRecoveryBlocks, PausedSandboxQuarantine,
+    PausedSandboxRecoveryReport, PersistedRecordLoad, PurgeableArtifactTarget,
+    QuarantinePurgeAction, StoredPausedSandboxQuarantine,
+};
 use super::{
     CreateIdempotencyRecord, PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
@@ -25,407 +37,9 @@ use crate::virtualization::VirtualizationMode;
 /// Version one records live directly in RocksDB.  They remain readable so
 /// existing paused sandboxes survive the upgrade, but every new write uses a
 /// manifest and a small RocksDB index entry instead.
-const LEGACY_RECORD_VERSION: u32 = 1;
-const PAUSED_MANIFEST_VERSION: u32 = 2;
-const PAUSED_INDEX_VERSION: u32 = 2;
 const RECORD_DB_DIR: &str = "records.db";
 const QUARANTINE_DB_DIR: &str = "quarantine.db";
-const PAUSED_MANIFEST_FILE: &str = "paused-record.v2.json";
-const PAUSED_RECOVERY_MARKER_FILE: &str = ".paused-record.v2.recovery-pending";
-const QUARANTINE_VERSION: u32 = 1;
-const CREATE_IDEMPOTENCY_RECORD_VERSION: u32 = 1;
 const CREATE_IDEMPOTENCY_DB_DIR: &str = "create-idempotency.db";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PersistedPausedLifecycle {
-    Paused,
-    /// The resumed VM has not yet reached the durable-success point. Keep
-    /// this record and its artifacts across restart: a process crash here may
-    /// have left the previous Firecracker child alive.
-    Resuming,
-    /// The resumed VM was published as Running. The last memory generation
-    /// stays on disk; startup seeing this marker restores it as Paused.
-    Resumed,
-}
-
-/// A manifest is first published as `Prepared`.  It is only promoted to
-/// `Committed` after the synchronous index write has completed.  Any crash or
-/// write error between those points restores the sandbox as recovery-pending,
-/// rather than guessing that a snapshot is safe to resume or remove.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PersistedPausedCommitState {
-    Prepared,
-    Committed,
-}
-
-fn default_commit_state() -> PersistedPausedCommitState {
-    PersistedPausedCommitState::Committed
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistedPausedRecord {
-    version: u32,
-    #[serde(default = "default_commit_state")]
-    commit_state: PersistedPausedCommitState,
-    lifecycle: PersistedPausedLifecycle,
-    /// Linux boot identity captured before a resume can launch a new VM.
-    /// Absent legacy records fail closed during startup recovery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resuming_boot_id: Option<String>,
-    metadata: SandboxMetadata,
-    artifact_root: PathBuf,
-    state: Value,
-}
-
-/// RocksDB is deliberately just an index for v2 records.  The full record is
-/// atomically stored with its snapshot artifacts, so a missing or damaged
-/// index can be rebuilt without inventing state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistedPausedIndex {
-    index_version: u32,
-    sandbox_id: SandboxId,
-    manifest_path: PathBuf,
-    manifest_sha256: String,
-}
-
-#[derive(Clone, Debug)]
-struct ManifestEntry {
-    path: PathBuf,
-    bytes: Vec<u8>,
-    record: PersistedPausedRecord,
-    /// This is deliberately outside the manifest fingerprint: the adjacent
-    /// marker is the durable acknowledgement fence for an otherwise
-    /// ambiguous metadata write.
-    recovery_marker_present: bool,
-}
-
-#[derive(Default)]
-struct PausedRecoveryBlocks {
-    sandbox_ids: HashSet<SandboxId>,
-    artifact_roots: HashSet<PathBuf>,
-    manifest_paths: HashSet<PathBuf>,
-}
-
-impl PausedRecoveryBlocks {
-    fn contains_manifest(&self, entry: &ManifestEntry) -> bool {
-        self.sandbox_ids.contains(&entry.sandbox_id())
-            || self.artifact_roots.contains(&entry.record.artifact_root)
-            || self.manifest_paths.contains(&entry.path)
-    }
-
-    fn contains_sandbox(&self, sandbox_id: &SandboxId) -> bool {
-        self.sandbox_ids.contains(sandbox_id)
-    }
-
-    fn contains_record(&self, sandbox_id: &SandboxId, artifact_root: &Path) -> bool {
-        self.contains_sandbox(sandbox_id) || self.artifact_roots.contains(artifact_root)
-    }
-}
-
-impl ManifestEntry {
-    fn sandbox_id(&self) -> SandboxId {
-        self.record.metadata.id
-    }
-
-    fn fingerprint(&self) -> String {
-        sha256_hex(&self.bytes)
-    }
-
-    fn matches_index(&self, index: &PersistedPausedIndex) -> bool {
-        index.sandbox_id == self.sandbox_id()
-            && index.manifest_path == self.path
-            && index.manifest_sha256 == self.fingerprint()
-    }
-}
-
-#[derive(Clone, Debug)]
-enum StoredPausedEntry {
-    Legacy(PersistedPausedRecord),
-    Index(PersistedPausedIndex),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredPausedSandboxQuarantine {
-    version: u32,
-    id: String,
-    reason: String,
-    /// When true, normal startup must not load or delete a record matching
-    /// this item. It has to be reviewed/reconciled by the host-local tool.
-    #[serde(default = "default_true")]
-    requires_manual_recovery: bool,
-    /// Only ambiguous commits are eligible for an explicit `reconcile`
-    /// promotion after their manifest and index can be proven coherent.
-    #[serde(default)]
-    reconcile_if_coherent: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    record_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    record_key_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    record_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    record_bytes_base64: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    artifact_root: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    manifest_path: Option<PathBuf>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// A host-local recovery item.  It is intentionally unavailable through the
-/// HTTP API: an operator must run the recovery binary on the worker that owns
-/// the persisted state.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PausedSandboxQuarantine {
-    pub id: String,
-    pub reason: String,
-    pub requires_manual_recovery: bool,
-    pub record_key: Option<String>,
-    pub artifact_root: Option<PathBuf>,
-    pub manifest_path: Option<PathBuf>,
-}
-
-impl From<StoredPausedSandboxQuarantine> for PausedSandboxQuarantine {
-    fn from(value: StoredPausedSandboxQuarantine) -> Self {
-        Self {
-            id: value.id,
-            reason: value.reason,
-            requires_manual_recovery: value.requires_manual_recovery,
-            record_key: value.record_key,
-            artifact_root: value.artifact_root,
-            manifest_path: value.manifest_path,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PausedSandboxRecoveryReport {
-    pub indexed_manifests: usize,
-    pub quarantined_items: usize,
-    pub reconciled_quarantines: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistedCreateIdempotencyRecord {
-    version: u32,
-    record: CreateIdempotencyRecord,
-}
-
-impl PersistedPausedRecord {
-    fn into_metadata<F>(mut self, factory: &F) -> PersistenceResult<SandboxMetadata>
-    where
-        F: SandboxBackendFactory,
-    {
-        ensure_supported_record_version(self.version)?;
-
-        let paused_state = factory
-            .decode_paused_state(self.artifact_root, self.state)
-            .map_err(|source| SandboxPersistenceError::InvalidRecord {
-                reason: "failed to decode paused sandbox state".to_string(),
-                source: Some(source),
-            })?;
-        self.metadata.state = SandboxState::Paused;
-        self.metadata.paused_state = Some(paused_state);
-
-        Ok(self.metadata)
-    }
-
-    fn into_metadata_without_runtime_state(mut self) -> SandboxMetadata {
-        self.metadata.state = SandboxState::Paused;
-        self.metadata.paused_state = None;
-        self.metadata
-    }
-
-    fn into_recovery_pending_metadata<F>(self, factory: &F) -> PersistenceResult<SandboxMetadata>
-    where
-        F: SandboxBackendFactory,
-    {
-        let mut metadata = self.into_metadata(factory)?;
-        metadata.paused_runtime_stopped = false;
-        metadata.resume_recovery_pending = true;
-        Ok(metadata)
-    }
-}
-
-fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
-    let record: PersistedPausedRecord =
-        serde_json::from_slice(bytes).map_err(|source| SandboxPersistenceError::InvalidRecord {
-            reason: "failed to deserialize record".to_string(),
-            source: Some(source.into()),
-        })?;
-    ensure_supported_record_version(record.version)?;
-    Ok(record)
-}
-
-fn ensure_supported_record_version(version: u32) -> PersistenceResult<()> {
-    if matches!(version, LEGACY_RECORD_VERSION | PAUSED_MANIFEST_VERSION) {
-        Ok(())
-    } else {
-        Err(SandboxPersistenceError::InvalidRecord {
-            reason: format!("unsupported record version {version}"),
-            source: None,
-        })
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn decode_stored_paused_entry(bytes: &[u8]) -> PersistenceResult<StoredPausedEntry> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|source| SandboxPersistenceError::InvalidRecord {
-            reason: "failed to deserialize paused sandbox record or index".to_string(),
-            source: Some(source.into()),
-        })?;
-    if value.get("indexVersion").is_some() {
-        let index: PersistedPausedIndex = serde_json::from_value(value).map_err(|source| {
-            SandboxPersistenceError::InvalidRecord {
-                reason: "failed to deserialize paused sandbox index".to_string(),
-                source: Some(source.into()),
-            }
-        })?;
-        if index.index_version != PAUSED_INDEX_VERSION {
-            return Err(SandboxPersistenceError::InvalidRecord {
-                reason: format!(
-                    "unsupported paused sandbox index version {}",
-                    index.index_version
-                ),
-                source: None,
-            });
-        }
-        return Ok(StoredPausedEntry::Index(index));
-    }
-
-    let record = decode_record(bytes)?;
-    if record.version != LEGACY_RECORD_VERSION {
-        return Err(SandboxPersistenceError::InvalidRecord {
-            reason: format!(
-                "paused sandbox record version {} must be stored in a v2 manifest",
-                record.version
-            ),
-            source: None,
-        });
-    }
-    Ok(StoredPausedEntry::Legacy(record))
-}
-
-fn sync_regular_file(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(target_os = "linux")]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-// APFS does not support fsync on directories.  The runtime data-safety
-// contract is enforced on Linux workers; this lets host-side unit tests run on
-// development Macs without silently weakening the production path.
-#[cfg(not(target_os = "linux"))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-fn sync_tree_bottom_up(path: &Path) -> std::io::Result<()> {
-    let metadata = stdfs::symlink_metadata(path)?;
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        // The snapshot producer may deliberately use links to immutable image
-        // cache layers.  Do not follow arbitrary links while syncing a
-        // recovery tree; their target is not owned by this persistence record.
-        return Ok(());
-    }
-    if file_type.is_file() {
-        return sync_regular_file(path);
-    }
-    if !file_type.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "unsupported paused snapshot artifact type at {}",
-                path.display()
-            ),
-        ));
-    }
-    for entry in stdfs::read_dir(path)? {
-        sync_tree_bottom_up(&entry?.path())?;
-    }
-    sync_directory(path)
-}
-
-fn sync_directory_chain(start: &Path, root: &Path) -> std::io::Result<()> {
-    let mut current = Some(start);
-    while let Some(directory) = current {
-        sync_directory(directory)?;
-        if directory == root {
-            break;
-        }
-        current = directory.parent();
-    }
-    Ok(())
-}
-
-fn sync_artifact_tree_and_parents(artifact_root: &Path, root: &Path) -> std::io::Result<()> {
-    sync_tree_bottom_up(artifact_root)?;
-    let parent = artifact_root.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "paused snapshot artifact root {} has no parent",
-                artifact_root.display()
-            ),
-        )
-    })?;
-    sync_directory_chain(parent, root)
-}
-
-fn write_file_atomically_and_sync(path: &Path, bytes: &[u8], root: &Path) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "paused sandbox manifest path {} has no parent",
-                path.display()
-            ),
-        )
-    })?;
-    stdfs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    sync_directory_chain(parent, root)
-}
-
-fn remove_file_and_sync(path: &Path, root: &Path) -> std::io::Result<()> {
-    match stdfs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    }
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "paused sandbox recovery marker path {} has no parent",
-                path.display()
-            ),
-        )
-    })?;
-    sync_directory_chain(parent, root)
-}
 
 /// A changed Linux boot ID proves any Firecracker child from an interrupted
 /// prior AgentENV process cannot still be alive. Missing boot IDs deliberately
@@ -444,30 +58,6 @@ fn current_host_boot_id() -> Option<String> {
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot_id = boot_id.trim();
     (!boot_id.is_empty()).then(|| boot_id.to_owned())
-}
-
-fn decode_create_idempotency_record(bytes: &[u8]) -> PersistenceResult<CreateIdempotencyRecord> {
-    let persisted: PersistedCreateIdempotencyRecord =
-        serde_json::from_slice(bytes).map_err(|source| SandboxPersistenceError::InvalidRecord {
-            reason: "failed to deserialize create idempotency record".to_string(),
-            source: Some(source.into()),
-        })?;
-    if persisted.version != CREATE_IDEMPOTENCY_RECORD_VERSION {
-        return Err(SandboxPersistenceError::InvalidRecord {
-            reason: format!(
-                "unsupported create idempotency record version {}",
-                persisted.version
-            ),
-            source: None,
-        });
-    }
-    if persisted.record.key.is_empty() || persisted.record.request_fingerprint.is_empty() {
-        return Err(SandboxPersistenceError::InvalidRecord {
-            reason: "create idempotency record has an empty key or fingerprint".to_string(),
-            source: None,
-        });
-    }
-    Ok(persisted.record)
 }
 
 pub struct FileBackedSandboxPersister {
@@ -570,46 +160,13 @@ impl FileBackedSandboxPersister {
     }
 
     fn validated_managed_artifact_path(&self, path: &Path) -> Option<PathBuf> {
-        // Canonicalization and component-by-component symlink rejection are
-        // both required: a syntactically rooted path such as
-        // `<store>/artifacts/../../other`, or an artifact-tree symlink, must
-        // never become eligible for read-through recovery or purge.
-        let relative = path.strip_prefix(&self.root).ok()?;
-        let mut components = relative.components();
-        if !matches!(components.next(), Some(Component::Normal(name)) if name == "artifacts") {
-            return None;
-        }
-        let mut probe = self.root.clone();
-        probe.push("artifacts");
-        if matches!(stdfs::symlink_metadata(&probe), Ok(metadata) if metadata.file_type().is_symlink())
-        {
-            return None;
-        }
-        for component in components {
-            let Component::Normal(component) = component else {
-                return None;
-            };
-            probe.push(component);
-            if matches!(stdfs::symlink_metadata(&probe), Ok(metadata) if metadata.file_type().is_symlink())
-            {
-                return None;
-            }
-        }
-        let root = stdfs::canonicalize(&self.root).ok()?;
-        let candidate = stdfs::canonicalize(path).ok()?;
-        if candidate == root || !candidate.starts_with(&root) {
-            return None;
-        }
-
-        let avoids_databases = [
-            self.records_db_path(),
-            self.quarantine_db_path(),
-            self.create_idempotency_db_path(),
-        ]
-        .into_iter()
-        .filter_map(|database_path| stdfs::canonicalize(database_path).ok())
-        .all(|database_path| !candidate.starts_with(database_path));
-        avoids_databases.then_some(candidate)
+        super::managed_paths::validated_artifact_path(
+            &self.root,
+            &self.records_db_path(),
+            &self.quarantine_db_path(),
+            &self.create_idempotency_db_path(),
+            path,
+        )
     }
 
     fn path_is_managed_artifact(&self, path: &Path) -> bool {
@@ -621,20 +178,7 @@ impl FileBackedSandboxPersister {
         sandbox_id: &SandboxId,
         path: &Path,
     ) -> Option<PathBuf> {
-        let relative = path.strip_prefix(self.artifacts_root()).ok()?;
-        let mut components = relative.components();
-        let Some(Component::Normal(found_sandbox_id)) = components.next() else {
-            return None;
-        };
-        if found_sandbox_id.to_string_lossy() != sandbox_id.to_string() {
-            return None;
-        }
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            return None;
-        }
-        let canonical = self.validated_purgeable_artifact_path(path)?;
-        matches!(stdfs::symlink_metadata(&canonical), Ok(metadata) if metadata.file_type().is_dir())
-            .then_some(canonical)
+        super::managed_paths::validated_generation_path(&self.root, sandbox_id, path)
     }
 
     fn path_is_managed_generation(&self, sandbox_id: &SandboxId, path: &Path) -> bool {
@@ -650,19 +194,7 @@ impl FileBackedSandboxPersister {
         sandbox_id: &SandboxId,
         path: &Path,
     ) -> Option<PathBuf> {
-        let relative = path.strip_prefix(self.artifacts_root()).ok()?;
-        let mut components = relative.components();
-        let Some(Component::Normal(found_sandbox_id)) = components.next() else {
-            return None;
-        };
-        if found_sandbox_id.to_string_lossy() != sandbox_id.to_string()
-            || components.next().is_some()
-        {
-            return None;
-        }
-        let canonical = self.validated_managed_artifact_path(path)?;
-        matches!(stdfs::symlink_metadata(&canonical), Ok(metadata) if metadata.file_type().is_dir())
-            .then_some(canonical)
+        super::managed_paths::validated_sandbox_root_path(&self.root, sandbox_id, path)
     }
 
     /// Version-one records were created by the same allocator used today:
@@ -729,6 +261,27 @@ impl FileBackedSandboxPersister {
     }
 
     fn validated_purgeable_artifact_path(&self, path: &Path) -> Option<PathBuf> {
+        let target = self.parse_purgeable_artifact_target(path)?;
+        let canonical_artifacts = self.canonical_artifacts_root_for_purge()?;
+        let sandbox_path = self.artifacts_root().join(&target.sandbox_id);
+        let canonical_sandbox = Self::canonical_child_for_purge(
+            &sandbox_path,
+            &canonical_artifacts,
+            &target.sandbox_id,
+        )?;
+        let canonical_parent = if let Some(generation) = target.generation.as_deref() {
+            Self::canonical_child_for_purge(
+                &sandbox_path.join(generation),
+                &canonical_sandbox,
+                generation,
+            )?
+        } else {
+            canonical_sandbox
+        };
+        Self::canonical_child_for_purge(path, &canonical_parent, &target.name)
+    }
+
+    fn parse_purgeable_artifact_target(&self, path: &Path) -> Option<PurgeableArtifactTarget> {
         let relative = path.strip_prefix(self.artifacts_root()).ok()?;
         let mut components = relative.components();
         let Some(Component::Normal(sandbox_id)) = components.next() else {
@@ -747,69 +300,55 @@ impl FileBackedSandboxPersister {
         // marker or bad raw index must not erase valid sibling generations.
         // A purge target is either one exact generation, or one of the two
         // metadata files at a known generation/sandbox location.
-        let (target_name, target_parent_suffix) = match target_components.as_slice() {
+        let (name, generation) = match target_components.as_slice() {
             [] => return None,
             [name] if name == PAUSED_MANIFEST_FILE || name == PAUSED_RECOVERY_MARKER_FILE => {
-                (name.clone(), Vec::new())
+                (name.clone(), None)
             }
-            [generation] => (generation.clone(), Vec::new()),
+            [generation] => (generation.clone(), None),
             [generation, name]
                 if name == PAUSED_MANIFEST_FILE || name == PAUSED_RECOVERY_MARKER_FILE =>
             {
-                (name.clone(), vec![generation.clone()])
+                (name.clone(), Some(generation.clone()))
             }
             _ => return None,
         };
+
+        Some(PurgeableArtifactTarget {
+            sandbox_id: sandbox_id.to_os_string(),
+            generation,
+            name,
+        })
+    }
+
+    fn canonical_artifacts_root_for_purge(&self) -> Option<PathBuf> {
         let artifacts_root = self.artifacts_root();
-        let canonical_artifacts = match stdfs::symlink_metadata(&artifacts_root) {
+        match stdfs::symlink_metadata(&artifacts_root) {
             Ok(metadata) if metadata.file_type().is_symlink() => return None,
             Ok(_) => self.validated_managed_artifact_path(&artifacts_root)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 stdfs::canonicalize(&self.root).ok()?.join("artifacts")
             }
             Err(_) => return None,
-        };
-        let sandbox_path = self.artifacts_root().join(sandbox_id);
-        let canonical_sandbox = match stdfs::symlink_metadata(&sandbox_path) {
+        }
+        .into()
+    }
+
+    fn canonical_child_for_purge(
+        path: &Path,
+        canonical_parent: &Path,
+        child_name: &std::ffi::OsStr,
+    ) -> Option<PathBuf> {
+        match stdfs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => return None,
             Ok(_) => {
-                let canonical_sandbox = stdfs::canonicalize(&sandbox_path).ok()?;
-                (canonical_sandbox.parent() == Some(canonical_artifacts.as_path()))
-                    .then_some(canonical_sandbox)?
+                let canonical_child = stdfs::canonicalize(path).ok()?;
+                (canonical_child.parent() == Some(canonical_parent)).then_some(canonical_child)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                canonical_artifacts.join(sandbox_id)
+                Some(canonical_parent.join(child_name))
             }
             Err(_) => return None,
-        };
-        let canonical_parent = if let Some(generation) = target_parent_suffix.first() {
-            let generation_path = sandbox_path.join(generation);
-            match stdfs::symlink_metadata(&generation_path) {
-                Ok(metadata) if metadata.file_type().is_symlink() => return None,
-                Ok(_) => {
-                    let canonical_generation = stdfs::canonicalize(&generation_path).ok()?;
-                    (canonical_generation.parent() == Some(canonical_sandbox.as_path()))
-                        .then_some(canonical_generation)?
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    canonical_sandbox.join(generation)
-                }
-                Err(_) => return None,
-            }
-        } else {
-            canonical_sandbox
-        };
-        match stdfs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => None,
-            Ok(_) => {
-                let canonical_target = stdfs::canonicalize(path).ok()?;
-                (canonical_target.parent() == Some(canonical_parent.as_path()))
-                    .then_some(canonical_target)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(canonical_parent.join(target_name))
-            }
-            Err(_) => None,
         }
     }
 
@@ -1086,6 +625,16 @@ impl FileBackedSandboxPersister {
             quarantines.push(entry);
         }
         Ok(quarantines)
+    }
+
+    async fn delete_quarantine(&self, quarantine_id: &str) -> PersistenceResult<()> {
+        self.quarantine_db()
+            .await?
+            .delete(quarantine_id.as_bytes().to_vec())
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::store("delete paused sandbox quarantine", source)
+            })
     }
 
     async fn recovery_blocks(&self) -> PersistenceResult<PausedRecoveryBlocks> {
@@ -1406,7 +955,11 @@ impl FileBackedSandboxPersister {
         let manifest_path_for_write = manifest_path.clone();
         let bytes_for_write = bytes.clone();
         tokio::task::spawn_blocking(move || {
-            write_file_atomically_and_sync(&manifest_path_for_write, &bytes_for_write, &root)
+            super::durable_storage::write_file_atomically_and_sync(
+                &manifest_path_for_write,
+                &bytes_for_write,
+                &root,
+            )
         })
         .await
         .map_err(|source| SandboxPersistenceError::InvalidRecord {
@@ -1441,7 +994,11 @@ impl FileBackedSandboxPersister {
         let root = self.root.clone();
         let marker_path_for_write = marker_path.clone();
         tokio::task::spawn_blocking(move || {
-            write_file_atomically_and_sync(&marker_path_for_write, &bytes, &root)
+            super::durable_storage::write_file_atomically_and_sync(
+                &marker_path_for_write,
+                &bytes,
+                &root,
+            )
         })
         .await
         .map_err(|source| SandboxPersistenceError::InvalidRecord {
@@ -1461,19 +1018,21 @@ impl FileBackedSandboxPersister {
         let marker_path = Self::recovery_marker_path(artifact_root);
         let root = self.root.clone();
         let marker_path_for_remove = marker_path.clone();
-        tokio::task::spawn_blocking(move || remove_file_and_sync(&marker_path_for_remove, &root))
-            .await
-            .map_err(|source| SandboxPersistenceError::InvalidRecord {
-                reason: "join paused sandbox recovery marker removal task".to_string(),
-                source: Some(source.into()),
-            })?
-            .map_err(|source| {
-                SandboxPersistenceError::io(
-                    "remove paused sandbox recovery marker",
-                    &marker_path,
-                    source,
-                )
-            })
+        tokio::task::spawn_blocking(move || {
+            super::durable_storage::remove_file_and_sync(&marker_path_for_remove, &root)
+        })
+        .await
+        .map_err(|source| SandboxPersistenceError::InvalidRecord {
+            reason: "join paused sandbox recovery marker removal task".to_string(),
+            source: Some(source.into()),
+        })?
+        .map_err(|source| {
+            SandboxPersistenceError::io(
+                "remove paused sandbox recovery marker",
+                &marker_path,
+                source,
+            )
+        })
     }
 
     async fn write_index(&self, entry: &ManifestEntry) -> PersistenceResult<()> {
@@ -1595,6 +1154,34 @@ impl FileBackedSandboxPersister {
         Ok(())
     }
 
+    /// Preserve legacy v1 storage while adding the boot observation used for
+    /// safe stop-proof migration. Older binaries continue to see the same v1
+    /// record shape; v2 records keep their manifest/index transaction.
+    async fn persist_reconciled_record(
+        &self,
+        record: &PersistedPausedRecord,
+    ) -> PersistenceResult<()> {
+        if record.version != LEGACY_RECORD_VERSION {
+            return self.put_record(record).await;
+        }
+        let bytes = serde_json::to_vec(record).map_err(|source| {
+            SandboxPersistenceError::InvalidRecord {
+                reason: "failed to serialize reconciled legacy paused sandbox record".to_string(),
+                source: Some(source.into()),
+            }
+        })?;
+        self.db()
+            .await?
+            .put(record.metadata.id.to_string(), bytes)
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::store(
+                    "persist reconciled legacy paused sandbox record",
+                    source,
+                )
+            })
+    }
+
     async fn remove_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         self.db()
             .await?
@@ -1610,7 +1197,7 @@ impl FileBackedSandboxPersister {
         let sync_artifact_root = artifact_root.clone();
         let sync_root = self.root.clone();
         tokio::task::spawn_blocking(move || {
-            sync_artifact_tree_and_parents(&sync_artifact_root, &sync_root)
+            super::durable_storage::sync_artifact_tree_and_parents(&sync_artifact_root, &sync_root)
         })
         .await
         .map_err(|source| SandboxPersistenceError::InvalidRecord {
@@ -1623,21 +1210,7 @@ impl FileBackedSandboxPersister {
     }
 
     async fn remove_artifact_root(path: &Path) -> PersistenceResult<()> {
-        match fs::symlink_metadata(path).await {
-            Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path).await,
-            Ok(_) => fs::remove_file(path).await,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(SandboxPersistenceError::io(
-                    "inspect paused sandbox artifacts",
-                    path,
-                    source,
-                ));
-            }
-        }
-        .map_err(|source| {
-            SandboxPersistenceError::io("remove paused sandbox artifacts", path, source)
-        })
+        super::artifact_cleanup::remove_root(path).await
     }
 
     /// Drop every managed generation except `keep`. The next incremental pause
@@ -1949,6 +1522,355 @@ impl FileBackedSandboxPersister {
         Ok(())
     }
 
+    fn indexed_manifests(
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> HashMap<SandboxId, PersistedPausedIndex> {
+        entries
+            .iter()
+            .filter_map(|(key, bytes)| {
+                let key_id = std::str::from_utf8(key)
+                    .ok()
+                    .and_then(|value| SandboxId::parse_str(value).ok())?;
+                let StoredPausedEntry::Index(index) = decode_stored_paused_entry(bytes).ok()?
+                else {
+                    return None;
+                };
+                (index.sandbox_id == key_id).then_some((key_id, index))
+            })
+            .collect()
+    }
+
+    fn manifest_needs_recovery(entry: &ManifestEntry) -> bool {
+        entry.recovery_marker_present
+            || entry.record.commit_state != PersistedPausedCommitState::Committed
+            || entry.record.metadata.resume_recovery_pending
+    }
+
+    async fn select_manifest_candidates(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        manifests: Vec<ManifestEntry>,
+    ) -> PersistenceResult<ManifestReconciliation> {
+        let indexed_manifests = Self::indexed_manifests(entries);
+        let mut grouped = HashMap::<SandboxId, Vec<ManifestEntry>>::new();
+        for entry in manifests {
+            grouped.entry(entry.sandbox_id()).or_default().push(entry);
+        }
+
+        let mut selection = ManifestReconciliation::default();
+        for (sandbox_id, mut group) in grouped {
+            if group.len() == 1 {
+                selection
+                    .candidates
+                    .insert(sandbox_id, group.pop().expect("one manifest candidate"));
+                continue;
+            }
+
+            let selected_position = indexed_manifests.get(&sandbox_id).and_then(|index| {
+                let matches = group
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, entry)| entry.matches_index(index).then_some(position))
+                    .collect::<Vec<_>>();
+                (matches.len() == 1).then_some(matches[0])
+            });
+            if let Some(position) = selected_position {
+                let selected = group.swap_remove(position);
+                // A coherent current index disambiguates clean generations
+                // left behind after an acknowledged replacement. An
+                // uncommitted sibling could instead be a newer ambiguous
+                // operation, so that case remains fail-closed.
+                if group
+                    .iter()
+                    .all(|entry| !Self::manifest_needs_recovery(entry))
+                {
+                    if selected.record.lifecycle == PersistedPausedLifecycle::Paused
+                        && selected.record.metadata.paused_runtime_stopped
+                        && !Self::manifest_needs_recovery(&selected)
+                    {
+                        selection.retire_after_selection.insert(
+                            sandbox_id,
+                            group
+                                .iter()
+                                .map(|entry| entry.record.artifact_root.clone())
+                                .collect(),
+                        );
+                    }
+                    selection.candidates.insert(sandbox_id, selected);
+                    continue;
+                }
+                group.push(selected);
+            }
+
+            selection.blocked.insert(sandbox_id);
+            for entry in group {
+                self.quarantine(
+                    "multiple paused sandbox manifests cannot be safely ordered",
+                    None,
+                    None,
+                    Some(&entry.record.artifact_root),
+                    Some(&entry.path),
+                )
+                .await?;
+                selection.quarantined_items += 1;
+            }
+        }
+        Ok(selection)
+    }
+
+    async fn retire_reconciled_generations(
+        &self,
+        sandbox_id: &SandboxId,
+        artifact_roots: &[PathBuf],
+    ) -> PersistenceResult<()> {
+        for artifact_root in artifact_roots {
+            let Some(path) = self.validated_managed_generation_path(sandbox_id, artifact_root)
+            else {
+                return Err(SandboxPersistenceError::InvalidRecord {
+                    reason: format!(
+                        "refusing to retire reconciled generation outside sandbox {sandbox_id}"
+                    ),
+                    source: None,
+                });
+            };
+            Self::remove_artifact_root(&path).await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_legacy_index_entry(
+        &self,
+        key_id: Option<SandboxId>,
+        key: &[u8],
+        bytes: &[u8],
+        record: PersistedPausedRecord,
+        candidates: &HashMap<SandboxId, ManifestEntry>,
+        recovery_blocks: &PausedRecoveryBlocks,
+        legacy: &mut Vec<PersistedPausedRecord>,
+        blocked: &mut HashSet<SandboxId>,
+        report: &mut PausedSandboxRecoveryReport,
+    ) -> PersistenceResult<()> {
+        let sandbox_id = record.metadata.id;
+        if key_id != Some(sandbox_id) {
+            self.quarantine(
+                "legacy paused sandbox record key does not match metadata",
+                Some(key),
+                Some(bytes),
+                None,
+                None,
+            )
+            .await?;
+            report.quarantined_items += 1;
+        } else if let Some(candidate) = candidates.get(&sandbox_id) {
+            self.quarantine(
+                "legacy paused sandbox record conflicts with a v2 manifest",
+                Some(key),
+                Some(bytes),
+                Some(&record.artifact_root),
+                None,
+            )
+            .await?;
+            self.quarantine(
+                "v2 paused sandbox manifest conflicts with a legacy record",
+                None,
+                None,
+                Some(&candidate.record.artifact_root),
+                Some(&candidate.path),
+            )
+            .await?;
+            report.quarantined_items += 2;
+            blocked.insert(sandbox_id);
+        } else if !self.path_is_valid_legacy_artifact_root(&sandbox_id, &record.artifact_root) {
+            self.quarantine(
+                "legacy paused sandbox record references an unsafe artifact path",
+                Some(key),
+                Some(bytes),
+                Some(&record.artifact_root),
+                None,
+            )
+            .await?;
+            report.quarantined_items += 1;
+            blocked.insert(sandbox_id);
+        } else if recovery_blocks.contains_record(&sandbox_id, &record.artifact_root) {
+            blocked.insert(sandbox_id);
+        } else {
+            legacy.push(record);
+        }
+        Ok(())
+    }
+
+    async fn reconcile_v2_index_entry(
+        &self,
+        key_id: Option<SandboxId>,
+        key: &[u8],
+        bytes: &[u8],
+        index: PersistedPausedIndex,
+        candidates: &HashMap<SandboxId, ManifestEntry>,
+        recovery_blocks: &PausedRecoveryBlocks,
+        selected_v2: &mut HashMap<SandboxId, PersistedPausedRecord>,
+        blocked: &mut HashSet<SandboxId>,
+        report: &mut PausedSandboxRecoveryReport,
+    ) -> PersistenceResult<()> {
+        let Some(sandbox_id) = key_id else {
+            self.quarantine(
+                "paused sandbox index has a non-sandbox record key",
+                Some(key),
+                Some(bytes),
+                None,
+                Some(&index.manifest_path),
+            )
+            .await?;
+            report.quarantined_items += 1;
+            return Ok(());
+        };
+        if blocked.contains(&sandbox_id) || recovery_blocks.contains_sandbox(&sandbox_id) {
+            blocked.insert(sandbox_id);
+            return Ok(());
+        }
+
+        let candidate = candidates.get(&sandbox_id);
+        if !self.index_matches_candidate(&index, sandbox_id, candidate) {
+            self.quarantine(
+                "paused sandbox index and manifest identity disagree",
+                Some(key),
+                Some(bytes),
+                candidate.map(|entry| entry.record.artifact_root.as_path()),
+                Some(&index.manifest_path),
+            )
+            .await?;
+            report.quarantined_items += 1;
+            blocked.insert(sandbox_id);
+            return Ok(());
+        }
+
+        match self.resolve_index(&sandbox_id, &index).await {
+            Ok(record) => {
+                selected_v2.insert(sandbox_id, record);
+            }
+            Err(error) => {
+                self.quarantine(
+                    format!("paused sandbox index/manifest mismatch: {error}"),
+                    Some(key),
+                    Some(bytes),
+                    candidate.map(|entry| entry.record.artifact_root.as_path()),
+                    Some(&index.manifest_path),
+                )
+                .await?;
+                report.quarantined_items += 1;
+                blocked.insert(sandbox_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn index_matches_candidate(
+        &self,
+        index: &PersistedPausedIndex,
+        sandbox_id: SandboxId,
+        candidate: Option<&ManifestEntry>,
+    ) -> bool {
+        index.index_version == PAUSED_INDEX_VERSION
+            && index.sandbox_id == sandbox_id
+            && self.path_is_managed_artifact(&index.manifest_path)
+            && candidate.is_none_or(|entry| entry.matches_index(index))
+    }
+
+    async fn reconcile_invalid_index_entry(
+        &self,
+        key_id: Option<SandboxId>,
+        key: &[u8],
+        bytes: &[u8],
+        error: &SandboxPersistenceError,
+        candidates: &HashMap<SandboxId, ManifestEntry>,
+        blocked: &mut HashSet<SandboxId>,
+        report: &mut PausedSandboxRecoveryReport,
+    ) -> PersistenceResult<()> {
+        let repairable_candidate = key_id.and_then(|sandbox_id| {
+            candidates.get(&sandbox_id).filter(|candidate| {
+                Self::raw_index_can_be_rebuilt_from_manifest(bytes, &sandbox_id, candidate)
+            })
+        });
+        if let Some(candidate) = repairable_candidate {
+            self.quarantine_repairable_index(
+                format!(
+                    "malformed paused sandbox index rebuilt from coherent v2 manifest: {error}"
+                ),
+                Some(key),
+                Some(bytes),
+                Some(&candidate.record.artifact_root),
+                Some(&candidate.path),
+            )
+            .await?;
+            report.quarantined_items += 1;
+            return Ok(());
+        }
+
+        self.quarantine(
+            format!("invalid or unsupported paused sandbox record: {error}"),
+            Some(key),
+            Some(bytes),
+            None,
+            None,
+        )
+        .await?;
+        report.quarantined_items += 1;
+        if let Some(sandbox_id) = key_id {
+            blocked.insert(sandbox_id);
+        }
+        Ok(())
+    }
+
+    async fn rebuild_missing_manifest_indexes(
+        &self,
+        candidates: HashMap<SandboxId, ManifestEntry>,
+        recovery_blocks: &PausedRecoveryBlocks,
+        selected_v2: &mut HashMap<SandboxId, PersistedPausedRecord>,
+        blocked: &HashSet<SandboxId>,
+        report: &mut PausedSandboxRecoveryReport,
+    ) -> PersistenceResult<()> {
+        for (sandbox_id, candidate) in candidates {
+            if selected_v2.contains_key(&sandbox_id)
+                || blocked.contains(&sandbox_id)
+                || recovery_blocks.contains_manifest(&candidate)
+            {
+                continue;
+            }
+            self.index_manifest_or_quarantine(&candidate, report)
+                .await?;
+            selected_v2.insert(sandbox_id, candidate.record);
+        }
+        Ok(())
+    }
+
+    async fn retire_selected_generations(
+        &self,
+        retire_after_selection: HashMap<SandboxId, Vec<PathBuf>>,
+        recovery_blocks: &PausedRecoveryBlocks,
+        selected_v2: &HashMap<SandboxId, PersistedPausedRecord>,
+        blocked: &HashSet<SandboxId>,
+    ) {
+        for (sandbox_id, artifact_roots) in retire_after_selection {
+            if !selected_v2.contains_key(&sandbox_id)
+                || blocked.contains(&sandbox_id)
+                || artifact_roots
+                    .iter()
+                    .any(|path| recovery_blocks.contains_record(&sandbox_id, path))
+            {
+                continue;
+            }
+            if let Err(error) = self
+                .retire_reconciled_generations(&sandbox_id, &artifact_roots)
+                .await
+            {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %error,
+                    "failed to retire superseded paused generations after index reconciliation"
+                );
+            }
+        }
+    }
+
     async fn reconcile_manifest_index(
         &self,
         allow_manual_recovery: bool,
@@ -1981,41 +1903,15 @@ impl FileBackedSandboxPersister {
             })
             .collect::<HashSet<_>>();
         let (manifests, mut quarantined) = self.scan_manifests(&legacy_artifact_roots).await?;
+        let manifest_selection = self.select_manifest_candidates(&entries, manifests).await?;
+        quarantined += manifest_selection.quarantined_items;
         let mut report = PausedSandboxRecoveryReport {
             indexed_manifests: 0,
             quarantined_items: quarantined,
             reconciled_quarantines: 0,
         };
-
-        let mut candidates = HashMap::new();
-        let mut duplicate_ids = HashSet::new();
-        for entry in manifests {
-            let sandbox_id = entry.sandbox_id();
-            if let Some(previous) = candidates.insert(sandbox_id, entry.clone()) {
-                duplicate_ids.insert(sandbox_id);
-                self.quarantine(
-                    "multiple paused sandbox manifests claim the same sandbox ID",
-                    None,
-                    None,
-                    Some(&previous.record.artifact_root),
-                    Some(&previous.path),
-                )
-                .await?;
-                self.quarantine(
-                    "multiple paused sandbox manifests claim the same sandbox ID",
-                    None,
-                    None,
-                    Some(&entry.record.artifact_root),
-                    Some(&entry.path),
-                )
-                .await?;
-                quarantined += 2;
-            }
-        }
-        for sandbox_id in &duplicate_ids {
-            candidates.remove(sandbox_id);
-        }
-        report.quarantined_items = quarantined;
+        let candidates = manifest_selection.candidates;
+        let retire_after_selection = manifest_selection.retire_after_selection;
 
         let recovery_blocks = if allow_manual_recovery {
             PausedRecoveryBlocks::default()
@@ -2024,7 +1920,7 @@ impl FileBackedSandboxPersister {
         };
         let mut selected_v2 = HashMap::new();
         let mut legacy = Vec::new();
-        let mut blocked = duplicate_ids;
+        let mut blocked = manifest_selection.blocked;
         for (sandbox_id, candidate) in &candidates {
             if recovery_blocks.contains_manifest(candidate) {
                 blocked.insert(*sandbox_id);
@@ -2037,176 +1933,63 @@ impl FileBackedSandboxPersister {
                 .and_then(|value| SandboxId::parse_str(value).ok());
             match decode_stored_paused_entry(&bytes) {
                 Ok(StoredPausedEntry::Legacy(record)) => {
-                    let sandbox_id = record.metadata.id;
-                    if key_id != Some(sandbox_id) {
-                        self.quarantine(
-                            "legacy paused sandbox record key does not match metadata",
-                            Some(&key),
-                            Some(&bytes),
-                            // Neither a foreign key nor declared metadata
-                            // identity can authorize deleting this path.
-                            // Preserve the record bytes for recovery, but do
-                            // not retain a purgeable artifact target.
-                            None,
-                            None,
-                        )
-                        .await?;
-                        report.quarantined_items += 1;
-                    } else if candidates.contains_key(&sandbox_id) {
-                        self.quarantine(
-                            "legacy paused sandbox record conflicts with a v2 manifest",
-                            Some(&key),
-                            Some(&bytes),
-                            Some(&record.artifact_root),
-                            None,
-                        )
-                        .await?;
-                        if let Some(candidate) = candidates.get(&sandbox_id) {
-                            self.quarantine(
-                                "v2 paused sandbox manifest conflicts with a legacy record",
-                                None,
-                                None,
-                                Some(&candidate.record.artifact_root),
-                                Some(&candidate.path),
-                            )
-                            .await?;
-                        }
-                        report.quarantined_items += 2;
-                        blocked.insert(sandbox_id);
-                    } else if !self
-                        .path_is_valid_legacy_artifact_root(&sandbox_id, &record.artifact_root)
-                    {
-                        self.quarantine(
-                            "legacy paused sandbox record references an unsafe artifact path",
-                            Some(&key),
-                            Some(&bytes),
-                            Some(&record.artifact_root),
-                            None,
-                        )
-                        .await?;
-                        report.quarantined_items += 1;
-                        blocked.insert(sandbox_id);
-                    } else if recovery_blocks.contains_record(&sandbox_id, &record.artifact_root) {
-                        blocked.insert(sandbox_id);
-                    } else {
-                        legacy.push(record);
-                    }
+                    self.reconcile_legacy_index_entry(
+                        key_id,
+                        &key,
+                        &bytes,
+                        record,
+                        &candidates,
+                        &recovery_blocks,
+                        &mut legacy,
+                        &mut blocked,
+                        &mut report,
+                    )
+                    .await?;
                 }
                 Ok(StoredPausedEntry::Index(index)) => {
-                    let Some(sandbox_id) = key_id else {
-                        self.quarantine(
-                            "paused sandbox index has a non-sandbox record key",
-                            Some(&key),
-                            Some(&bytes),
-                            None,
-                            Some(&index.manifest_path),
-                        )
-                        .await?;
-                        report.quarantined_items += 1;
-                        continue;
-                    };
-                    if blocked.contains(&sandbox_id)
-                        || recovery_blocks.contains_sandbox(&sandbox_id)
-                    {
-                        blocked.insert(sandbox_id);
-                        continue;
-                    }
-
-                    let candidate = candidates.get(&sandbox_id);
-                    let explicit_mismatch = index.index_version != PAUSED_INDEX_VERSION
-                        || index.sandbox_id != sandbox_id
-                        || !self.path_is_managed_artifact(&index.manifest_path)
-                        || candidate.is_some_and(|entry| !entry.matches_index(&index));
-                    if explicit_mismatch {
-                        self.quarantine(
-                            "paused sandbox index and manifest identity disagree",
-                            Some(&key),
-                            Some(&bytes),
-                            candidate.map(|entry| entry.record.artifact_root.as_path()),
-                            Some(&index.manifest_path),
-                        )
-                        .await?;
-                        report.quarantined_items += 1;
-                        blocked.insert(sandbox_id);
-                        continue;
-                    }
-
-                    match self.resolve_index(&sandbox_id, &index).await {
-                        Ok(record) => {
-                            selected_v2.insert(sandbox_id, record);
-                        }
-                        Err(error) => {
-                            // A decoded index that cannot resolve its declared
-                            // manifest is a mismatch, not a repair candidate.
-                            self.quarantine(
-                                format!("paused sandbox index/manifest mismatch: {error}"),
-                                Some(&key),
-                                Some(&bytes),
-                                candidate.map(|entry| entry.record.artifact_root.as_path()),
-                                Some(&index.manifest_path),
-                            )
-                            .await?;
-                            report.quarantined_items += 1;
-                            blocked.insert(sandbox_id);
-                        }
-                    }
+                    self.reconcile_v2_index_entry(
+                        key_id,
+                        &key,
+                        &bytes,
+                        index,
+                        &candidates,
+                        &recovery_blocks,
+                        &mut selected_v2,
+                        &mut blocked,
+                        &mut report,
+                    )
+                    .await?;
                 }
                 Err(error) => {
-                    let repairable_candidate = key_id.and_then(|sandbox_id| {
-                        candidates.get(&sandbox_id).filter(|candidate| {
-                            Self::raw_index_can_be_rebuilt_from_manifest(
-                                &bytes,
-                                &sandbox_id,
-                                candidate,
-                            )
-                        })
-                    });
-                    if let Some(candidate) = repairable_candidate {
-                        // Retain the exact damaged index bytes in a
-                        // nonblocking quarantine record. The manifest is a
-                        // valid same-ID durable source, so rebuilding its
-                        // index is safe and preserves availability across a
-                        // second startup.
-                        self.quarantine_repairable_index(
-                            format!(
-                                "malformed paused sandbox index rebuilt from coherent v2 manifest: {error}"
-                            ),
-                            Some(&key),
-                            Some(&bytes),
-                            Some(&candidate.record.artifact_root),
-                            Some(&candidate.path),
-                        )
-                        .await?;
-                        report.quarantined_items += 1;
-                    } else {
-                        self.quarantine(
-                            format!("invalid or unsupported paused sandbox record: {error}"),
-                            Some(&key),
-                            Some(&bytes),
-                            None,
-                            None,
-                        )
-                        .await?;
-                        report.quarantined_items += 1;
-                        if let Some(sandbox_id) = key_id {
-                            blocked.insert(sandbox_id);
-                        }
-                    }
+                    self.reconcile_invalid_index_entry(
+                        key_id,
+                        &key,
+                        &bytes,
+                        &error,
+                        &candidates,
+                        &mut blocked,
+                        &mut report,
+                    )
+                    .await?;
                 }
             }
         }
 
-        for (sandbox_id, candidate) in candidates {
-            if selected_v2.contains_key(&sandbox_id)
-                || blocked.contains(&sandbox_id)
-                || recovery_blocks.contains_manifest(&candidate)
-            {
-                continue;
-            }
-            self.index_manifest_or_quarantine(&candidate, &mut report)
-                .await?;
-            selected_v2.insert(sandbox_id, candidate.record);
-        }
+        self.rebuild_missing_manifest_indexes(
+            candidates,
+            &recovery_blocks,
+            &mut selected_v2,
+            &blocked,
+            &mut report,
+        )
+        .await?;
+        self.retire_selected_generations(
+            retire_after_selection,
+            &recovery_blocks,
+            &selected_v2,
+            &blocked,
+        )
+        .await;
 
         Ok((selected_v2.into_values().collect(), legacy, report))
     }
@@ -2237,14 +2020,49 @@ impl FileBackedSandboxPersister {
     /// mismatch remains quarantined for explicit operator review.
     pub async fn reconcile_quarantines(&self) -> PersistenceResult<PausedSandboxRecoveryReport> {
         let (_v2, _legacy, mut report) = self.reconcile_manifest_index(true).await?;
-        report.reconciled_quarantines = self.reconcile_uncertain_quarantines().await?;
+        report.reconciled_quarantines += self.reconcile_uncertain_quarantines().await?;
         Ok(report)
     }
 
-    /// Explicit destructive recovery action.  It never follows paths outside
-    /// this persister's artifacts directory, and it never deletes a newer
-    /// index entry that differs from the quarantined original bytes.
-    pub async fn purge_quarantine(&self, quarantine_id: &str) -> PersistenceResult<()> {
+    async fn nonblocking_quarantine_was_superseded(
+        &self,
+        entry: &StoredPausedSandboxQuarantine,
+        current_record: &[u8],
+    ) -> PersistenceResult<bool> {
+        if entry.requires_manual_recovery {
+            return Ok(false);
+        }
+        let Some(sandbox_id) = entry
+            .record_key
+            .as_deref()
+            .and_then(|record_key| SandboxId::parse_str(record_key).ok())
+        else {
+            return Ok(false);
+        };
+        let Ok(StoredPausedEntry::Index(index)) = decode_stored_paused_entry(current_record) else {
+            return Ok(false);
+        };
+        if index.sandbox_id != sandbox_id
+            || entry
+                .manifest_path
+                .as_ref()
+                .is_some_and(|path| path != &index.manifest_path)
+        {
+            return Ok(false);
+        }
+        let Ok(record) = self.resolve_index(&sandbox_id, &index).await else {
+            return Ok(false);
+        };
+        Ok(entry
+            .artifact_root
+            .as_ref()
+            .is_none_or(|artifact_root| artifact_root == &record.artifact_root))
+    }
+
+    async fn load_quarantine_for_purge(
+        &self,
+        quarantine_id: &str,
+    ) -> PersistenceResult<StoredPausedSandboxQuarantine> {
         let bytes = self
             .quarantine_db()
             .await?
@@ -2273,58 +2091,84 @@ impl FileBackedSandboxPersister {
                 source: None,
             });
         }
+        Ok(entry)
+    }
 
+    async fn quarantine_purge_action(
+        &self,
+        quarantine_id: &str,
+        entry: &StoredPausedSandboxQuarantine,
+    ) -> PersistenceResult<QuarantinePurgeAction> {
+        let Some(record_key) = entry.record_key.as_deref() else {
+            return Ok(QuarantinePurgeAction::PurgeState { record_key: None });
+        };
+        let current = self
+            .db()
+            .await?
+            .get(record_key.as_bytes().to_vec())
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::store("read paused sandbox index before purge", source)
+            })?;
+        if let Some(current) = current.as_deref() {
+            let replaced = entry
+                .record_sha256
+                .as_deref()
+                .is_some_and(|expected_hash| sha256_hex(current) != expected_hash)
+                && self
+                    .nonblocking_quarantine_was_superseded(entry, current)
+                    .await?;
+            if replaced {
+                return Ok(QuarantinePurgeAction::QuarantineOnly);
+            }
+        }
+        match (current, entry.record_sha256.as_deref()) {
+            (Some(current), Some(expected_hash)) if sha256_hex(&current) == expected_hash => {
+                Ok(QuarantinePurgeAction::PurgeState {
+                    record_key: Some(record_key.to_owned()),
+                })
+            }
+            (Some(_), _) => Err(SandboxPersistenceError::InvalidRecord {
+                reason: format!(
+                    "refusing to purge paused sandbox quarantine {quarantine_id}: its record key now points at newer or unknown state"
+                ),
+                source: None,
+            }),
+            (None, _) => Ok(QuarantinePurgeAction::PurgeState { record_key: None }),
+        }
+    }
+
+    fn quarantine_artifact_path_for_purge(
+        &self,
+        quarantine_id: &str,
+        entry: &StoredPausedSandboxQuarantine,
+        path: &Path,
+    ) -> PersistenceResult<PathBuf> {
         let expected_sandbox_id = entry
             .record_key
             .as_deref()
             .and_then(|record_key| SandboxId::parse_str(record_key).ok());
+        let valid_path = match expected_sandbox_id {
+            Some(sandbox_id) => self
+                .validated_managed_generation_path(&sandbox_id, path)
+                .or_else(|| self.validated_managed_sandbox_root_path(&sandbox_id, path)),
+            None => self.validated_purgeable_artifact_path(path),
+        };
+        valid_path.ok_or_else(|| SandboxPersistenceError::InvalidRecord {
+            reason: match expected_sandbox_id {
+                Some(sandbox_id) => format!(
+                    "refusing to purge paused sandbox quarantine {quarantine_id}: artifact path is not an exact managed generation for sandbox {sandbox_id}"
+                ),
+                None => format!(
+                    "refusing to purge paused sandbox quarantine {quarantine_id}: artifact path is not an exact managed generation or metadata file"
+                ),
+            },
+            source: None,
+        })
+    }
 
-        let mut remove_record = None;
-        if let Some(record_key) = entry.record_key.as_deref() {
-            let current = self
-                .db()
-                .await?
-                .get(record_key.as_bytes().to_vec())
-                .await
-                .map_err(|source| {
-                    SandboxPersistenceError::store("read paused sandbox index before purge", source)
-                })?;
-            match (current, entry.record_sha256.as_deref()) {
-                (Some(current), Some(expected_hash)) if sha256_hex(&current) == expected_hash => {
-                    remove_record = Some(record_key.to_owned());
-                }
-                (Some(_), _) => {
-                    return Err(SandboxPersistenceError::InvalidRecord {
-                        reason: format!(
-                            "refusing to purge paused sandbox quarantine {quarantine_id}: its record key now points at newer or unknown state"
-                        ),
-                        source: None,
-                    });
-                }
-                (None, _) => {}
-            }
-        }
-        if let Some(path) = entry.artifact_root.as_deref() {
-            let canonical_artifact_path = match expected_sandbox_id {
-                Some(sandbox_id) => self
-                    .validated_managed_generation_path(&sandbox_id, path)
-                    .or_else(|| self.validated_managed_sandbox_root_path(&sandbox_id, path)),
-                None => self.validated_purgeable_artifact_path(path),
-            }
-            .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
-                reason: match expected_sandbox_id {
-                    Some(sandbox_id) => format!(
-                        "refusing to purge paused sandbox quarantine {quarantine_id}: artifact path is not an exact managed generation for sandbox {sandbox_id}"
-                    ),
-                    None => format!(
-                        "refusing to purge paused sandbox quarantine {quarantine_id}: artifact path is not an exact managed generation or metadata file"
-                    ),
-                },
-                source: None,
-            })?;
-            Self::remove_artifact_root(&canonical_artifact_path).await?;
-        }
-        if let Some(record_key) = remove_record {
+    async fn delete_purged_record(&self, record_key: Option<String>) -> PersistenceResult<()> {
+        if let Some(record_key) = record_key {
             self.db()
                 .await?
                 .delete(record_key.as_bytes().to_vec())
@@ -2333,13 +2177,196 @@ impl FileBackedSandboxPersister {
                     SandboxPersistenceError::store("purge paused sandbox index", source)
                 })?;
         }
-        self.quarantine_db()
-            .await?
-            .delete(quarantine_id.as_bytes().to_vec())
-            .await
-            .map_err(|source| {
-                SandboxPersistenceError::store("delete paused sandbox quarantine", source)
-            })
+        Ok(())
+    }
+
+    /// Explicit destructive recovery action.  It never follows paths outside
+    /// this persister's artifacts directory, and it never deletes a newer
+    /// index entry that differs from the quarantined original bytes.
+    pub async fn purge_quarantine(&self, quarantine_id: &str) -> PersistenceResult<()> {
+        let entry = self.load_quarantine_for_purge(quarantine_id).await?;
+        let remove_record = match self.quarantine_purge_action(quarantine_id, &entry).await? {
+            QuarantinePurgeAction::QuarantineOnly => {
+                return self.delete_quarantine(quarantine_id).await;
+            }
+            QuarantinePurgeAction::PurgeState { record_key } => record_key,
+        };
+        if let Some(path) = entry.artifact_root.as_deref() {
+            let canonical_artifact_path =
+                self.quarantine_artifact_path_for_purge(quarantine_id, &entry, path)?;
+            Self::remove_artifact_root(&canonical_artifact_path).await?;
+        }
+        self.delete_purged_record(remove_record).await?;
+        self.delete_quarantine(quarantine_id).await
+    }
+
+    async fn reconcile_record_lifecycle<F>(
+        &self,
+        mut record: PersistedPausedRecord,
+        factory: &F,
+    ) -> PersistenceResult<PersistedRecordLoad>
+    where
+        F: SandboxBackendFactory,
+    {
+        if record.commit_state == PersistedPausedCommitState::Prepared
+            || record.metadata.resume_recovery_pending
+        {
+            warn!(sandbox_id = %record.metadata.id, "retaining paused sandbox whose persistence commit is recovery-pending");
+            return self.load_recovery_pending_record(record, factory).await;
+        }
+        if record.lifecycle == PersistedPausedLifecycle::Resumed {
+            info!(sandbox_id = %record.metadata.id, "restoring last paused snapshot after a committed resume; the live VM cannot still be running");
+            record.lifecycle = PersistedPausedLifecycle::Paused;
+            record.resuming_boot_id = None;
+            record.unproven_stop_boot_id = None;
+            record.metadata.paused_runtime_stopped = true;
+            self.put_record(&record).await?;
+        }
+        if record.lifecycle == PersistedPausedLifecycle::Resuming {
+            return self.reconcile_interrupted_resume(record, factory).await;
+        }
+        Ok(PersistedRecordLoad::Continue(record))
+    }
+
+    async fn load_recovery_pending_record<F>(
+        &self,
+        mut record: PersistedPausedRecord,
+        factory: &F,
+    ) -> PersistenceResult<PersistedRecordLoad>
+    where
+        F: SandboxBackendFactory,
+    {
+        let artifact_root = record.artifact_root.clone();
+        let manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
+            .then(|| Self::manifest_path(&artifact_root));
+        record.metadata.resume_recovery_pending = true;
+        record.metadata.paused_runtime_stopped = false;
+        if record.metadata.virtualization_mode != self.virtualization_mode {
+            return Ok(PersistedRecordLoad::Complete(Some(
+                super::codecs::paused_metadata_without_runtime_state(record),
+            )));
+        }
+        let metadata = match super::codecs::decode_recovery_pending_state(record, factory) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                self.quarantine(
+                    format!("recovery-pending paused sandbox could not be decoded: {error}"),
+                    None,
+                    None,
+                    Some(&artifact_root),
+                    manifest_path.as_deref(),
+                )
+                .await?;
+                None
+            }
+        };
+        Ok(PersistedRecordLoad::Complete(metadata))
+    }
+
+    async fn reconcile_interrupted_resume<F>(
+        &self,
+        mut record: PersistedPausedRecord,
+        factory: &F,
+    ) -> PersistenceResult<PersistedRecordLoad>
+    where
+        F: SandboxBackendFactory,
+    {
+        let sandbox_id = record.metadata.id;
+        if host_reboot_proves_runtime_absent(
+            record.resuming_boot_id.as_deref(),
+            current_host_boot_id().as_deref(),
+        ) {
+            info!(sandbox_id = %sandbox_id, "host reboot proved interrupted resumed runtime absent; restoring paused record");
+            record.lifecycle = PersistedPausedLifecycle::Paused;
+            record.resuming_boot_id = None;
+            record.unproven_stop_boot_id = None;
+            record.metadata.paused_runtime_stopped = true;
+            self.put_record(&record).await?;
+            return Ok(PersistedRecordLoad::Continue(record));
+        }
+
+        warn!(sandbox_id = %sandbox_id, "retaining paused sandbox record left in resuming state until a later host boot proves runtime absence");
+        if record.metadata.virtualization_mode != self.virtualization_mode {
+            let mut metadata = super::codecs::paused_metadata_without_runtime_state(record);
+            metadata.paused_runtime_stopped = false;
+            metadata.resume_recovery_pending = true;
+            return Ok(PersistedRecordLoad::Complete(Some(metadata)));
+        }
+        let artifact_root = record.artifact_root.clone();
+        let manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
+            .then(|| Self::manifest_path(&artifact_root));
+        let metadata = match super::codecs::decode_recovery_pending_state(record, factory) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                warn!(sandbox_id = %sandbox_id, error = %error, "quarantining interrupted resume whose paused state could not be decoded");
+                self.quarantine(
+                    format!(
+                        "interrupted resume paused sandbox state could not be decoded: {error}"
+                    ),
+                    None,
+                    None,
+                    Some(&artifact_root),
+                    manifest_path.as_deref(),
+                )
+                .await?;
+                None
+            }
+        };
+        Ok(PersistedRecordLoad::Complete(metadata))
+    }
+
+    async fn load_reconciled_record<F>(
+        &self,
+        mut record: PersistedPausedRecord,
+        factory: &F,
+    ) -> PersistenceResult<Option<SandboxMetadata>>
+    where
+        F: SandboxBackendFactory,
+    {
+        let sandbox_id = record.metadata.id;
+        if let Some(boot_id) = current_host_boot_id() {
+            match record.reconcile_stop_proof_for_boot(&boot_id) {
+                StopProofReconciliation::Unchanged => {}
+                StopProofReconciliation::ObservationRecorded => {
+                    info!(sandbox_id = %sandbox_id, "recorded host boot for paused sandbox with legacy or unacknowledged stop proof");
+                    self.persist_reconciled_record(&record).await?;
+                }
+                StopProofReconciliation::RuntimeAbsent => {
+                    info!(sandbox_id = %sandbox_id, "later host boot proved paused runtime absent; restored stop proof");
+                    self.persist_reconciled_record(&record).await?;
+                }
+            }
+        }
+        if record.metadata.virtualization_mode != self.virtualization_mode {
+            warn!(
+                sandbox_id = %sandbox_id,
+                record_mode = %record.metadata.virtualization_mode,
+                node_mode = %self.virtualization_mode,
+                "loading paused sandbox metadata without resumable runtime state because its virtualization mode is incompatible"
+            );
+            return Ok(Some(super::codecs::paused_metadata_without_runtime_state(
+                record,
+            )));
+        }
+
+        let artifact_root = record.artifact_root.clone();
+        let manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
+            .then(|| Self::manifest_path(&artifact_root));
+        match super::codecs::decode_paused_state(record, factory) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) => {
+                warn!(sandbox_id = %sandbox_id, error = %error, "quarantining unusable paused sandbox record without deleting artifacts");
+                self.quarantine(
+                    format!("paused sandbox state could not be decoded: {error}"),
+                    None,
+                    None,
+                    Some(&artifact_root),
+                    manifest_path.as_deref(),
+                )
+                .await?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -2356,7 +2383,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let mut sandboxes = Vec::new();
         let mut seen_sandbox_ids = HashSet::new();
 
-        for mut record in v2_records {
+        for record in v2_records {
             let sandbox_id = record.metadata.id;
             let record_artifact_root = record.artifact_root.clone();
             let record_manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
@@ -2373,106 +2400,13 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 continue;
             }
 
-            if record.commit_state == PersistedPausedCommitState::Prepared
-                || record.metadata.resume_recovery_pending
-            {
-                warn!(sandbox_id = %sandbox_id, "retaining paused sandbox whose persistence commit is recovery-pending");
-                record.metadata.resume_recovery_pending = true;
-                record.metadata.paused_runtime_stopped = false;
-                if record.metadata.virtualization_mode != self.virtualization_mode {
-                    sandboxes.push(record.into_metadata_without_runtime_state());
-                } else {
-                    match record.into_recovery_pending_metadata(factory) {
-                        Ok(metadata) => sandboxes.push(metadata),
-                        Err(error) => {
-                            self.quarantine(
-                                format!(
-                                    "recovery-pending paused sandbox could not be decoded: {error}"
-                                ),
-                                None,
-                                None,
-                                Some(&record_artifact_root),
-                                record_manifest_path.as_deref(),
-                            )
-                            .await?;
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if record.lifecycle == PersistedPausedLifecycle::Resumed {
-                info!(sandbox_id = %sandbox_id, "restoring last paused snapshot after a committed resume; the live VM cannot still be running");
-                record.lifecycle = PersistedPausedLifecycle::Paused;
-                record.resuming_boot_id = None;
-                record.metadata.paused_runtime_stopped = true;
-                self.put_record(&record).await?;
-            }
-
-            if record.lifecycle == PersistedPausedLifecycle::Resuming {
-                if host_reboot_proves_runtime_absent(
-                    record.resuming_boot_id.as_deref(),
-                    current_host_boot_id().as_deref(),
-                ) {
-                    info!(sandbox_id = %sandbox_id, "host reboot proved interrupted resumed runtime absent; restoring paused record");
-                    record.lifecycle = PersistedPausedLifecycle::Paused;
-                    record.resuming_boot_id = None;
-                    record.metadata.paused_runtime_stopped = true;
-                    self.put_record(&record).await?;
-                } else {
-                    warn!(sandbox_id = %sandbox_id, "retaining paused sandbox record left in resuming state until a later host boot proves runtime absence");
-                    if record.metadata.virtualization_mode != self.virtualization_mode {
-                        let mut metadata = record.into_metadata_without_runtime_state();
-                        metadata.paused_runtime_stopped = false;
-                        metadata.resume_recovery_pending = true;
+            match self.reconcile_record_lifecycle(record, factory).await? {
+                PersistedRecordLoad::Complete(Some(metadata)) => sandboxes.push(metadata),
+                PersistedRecordLoad::Complete(None) => {}
+                PersistedRecordLoad::Continue(record) => {
+                    if let Some(metadata) = self.load_reconciled_record(record, factory).await? {
                         sandboxes.push(metadata);
-                    } else {
-                        match record.into_recovery_pending_metadata(factory) {
-                            Ok(metadata) => sandboxes.push(metadata),
-                            Err(err) => {
-                                warn!(sandbox_id = %sandbox_id, error = %err, "quarantining interrupted resume whose paused state could not be decoded");
-                                self.quarantine(
-                                    format!(
-                                        "interrupted resume paused sandbox state could not be decoded: {err}"
-                                    ),
-                                    None,
-                                    None,
-                                    Some(&record_artifact_root),
-                                    record_manifest_path.as_deref(),
-                                )
-                                .await?;
-                            }
-                        }
                     }
-                    continue;
-                }
-            }
-
-            if record.metadata.virtualization_mode != self.virtualization_mode {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    record_mode = %record.metadata.virtualization_mode,
-                    node_mode = %self.virtualization_mode,
-                    "loading paused sandbox metadata without resumable runtime state because its virtualization mode is incompatible"
-                );
-                sandboxes.push(record.into_metadata_without_runtime_state());
-                continue;
-            }
-
-            match record.into_metadata(factory) {
-                Ok(metadata) => {
-                    sandboxes.push(metadata);
-                }
-                Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "quarantining unusable paused sandbox record without deleting artifacts");
-                    self.quarantine(
-                        format!("paused sandbox state could not be decoded: {err}"),
-                        None,
-                        None,
-                        Some(&record_artifact_root),
-                        record_manifest_path.as_deref(),
-                    )
-                    .await?;
                 }
             }
         }
@@ -2568,6 +2502,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
+            unproven_stop_boot_id: None,
             metadata: metadata.clone(),
             artifact_root: artifact_root.to_path_buf(),
             state,
@@ -2599,6 +2534,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             });
         }
         record.metadata.paused_runtime_stopped = true;
+        record.unproven_stop_boot_id = None;
         self.put_record(&record).await
     }
 
@@ -2734,72 +2670,21 @@ impl SandboxPersister for FileBackedSandboxPersister {
     async fn load_create_idempotency_records(
         &self,
     ) -> PersistenceResult<Vec<CreateIdempotencyRecord>> {
-        let entries = self
-            .create_idempotency_db()
-            .await?
-            .entries()
-            .await
-            .map_err(|source| {
-                SandboxPersistenceError::store("scan create idempotency records", source)
-            })?;
-        let mut records = Vec::with_capacity(entries.len());
-        for (key, bytes) in entries {
-            let stored_key = String::from_utf8(key).map_err(|source| {
-                SandboxPersistenceError::InvalidRecord {
-                    reason: "create idempotency record key is not UTF-8".to_string(),
-                    source: Some(source.into()),
-                }
-            })?;
-            let record = decode_create_idempotency_record(&bytes)?;
-            if record.key != stored_key {
-                return Err(SandboxPersistenceError::InvalidRecord {
-                    reason: format!(
-                        "create idempotency record key mismatch: database key '{stored_key}' contains '{}'",
-                        record.key
-                    ),
-                    source: None,
-                });
-            }
-            records.push(record);
-        }
-        Ok(records)
+        let journal = self.create_idempotency_db().await?;
+        super::operation_journal::load(&journal).await
     }
 
     async fn persist_create_idempotency_record(
         &self,
         record: &CreateIdempotencyRecord,
     ) -> PersistenceResult<()> {
-        if record.key.is_empty() || record.request_fingerprint.is_empty() {
-            return Err(SandboxPersistenceError::InvalidRecord {
-                reason: "create idempotency record has an empty key or fingerprint".to_string(),
-                source: None,
-            });
-        }
-        let bytes = serde_json::to_vec(&PersistedCreateIdempotencyRecord {
-            version: CREATE_IDEMPOTENCY_RECORD_VERSION,
-            record: record.clone(),
-        })
-        .map_err(|source| SandboxPersistenceError::InvalidRecord {
-            reason: "failed to serialize create idempotency record".to_string(),
-            source: Some(source.into()),
-        })?;
-        self.create_idempotency_db()
-            .await?
-            .put(record.key.as_bytes().to_vec(), bytes)
-            .await
-            .map_err(|source| {
-                SandboxPersistenceError::store("persist create idempotency record", source)
-            })
+        let journal = self.create_idempotency_db().await?;
+        super::operation_journal::put(&journal, record).await
     }
 
     async fn delete_create_idempotency_record(&self, key: &str) -> PersistenceResult<()> {
-        self.create_idempotency_db()
-            .await?
-            .delete(key.as_bytes().to_vec())
-            .await
-            .map_err(|source| {
-                SandboxPersistenceError::store("delete create idempotency record", source)
-            })
+        let journal = self.create_idempotency_db().await?;
+        super::operation_journal::delete(&journal, key).await
     }
 }
 
@@ -3162,6 +3047,7 @@ mod tests {
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
+            unproven_stop_boot_id: None,
             metadata: SandboxMetadata {
                 id: sandbox_id,
                 paused_state: Some(Arc::clone(&paused_state)),
@@ -3182,6 +3068,22 @@ mod tests {
         assert_eq!(loaded[0].id, sandbox_id);
         assert!(has_record(&persister, &sandbox_id).await?);
         assert!(persister.list_quarantines().await?.is_empty());
+        let stored = persister
+            .db()
+            .await?
+            .get(sandbox_id.to_string())
+            .await?
+            .expect("legacy record should remain present");
+        let StoredPausedEntry::Legacy(stored) = decode_stored_paused_entry(&stored)? else {
+            anyhow::bail!("boot observation must preserve the v1 record format");
+        };
+        assert!(!stored.metadata.paused_runtime_stopped);
+        if let Some(boot_id) = current_host_boot_id() {
+            assert_eq!(
+                stored.unproven_stop_boot_id.as_deref(),
+                Some(boot_id.as_str())
+            );
+        }
         Ok(())
     }
 
@@ -3199,6 +3101,7 @@ mod tests {
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
+            unproven_stop_boot_id: None,
             metadata: SandboxMetadata {
                 id: sandbox_id,
                 paused_state: Some(Arc::clone(&paused_state)),
@@ -3252,6 +3155,7 @@ mod tests {
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
+            unproven_stop_boot_id: None,
             metadata: SandboxMetadata {
                 id: sandbox_a,
                 paused_state: Some(Arc::clone(&paused_state)),
@@ -3310,6 +3214,7 @@ mod tests {
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
+            unproven_stop_boot_id: None,
             metadata: SandboxMetadata {
                 id: declared_sandbox,
                 paused_state: Some(Arc::clone(&paused_state)),
@@ -3417,6 +3322,7 @@ mod tests {
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
+            unproven_stop_boot_id: None,
             metadata: SandboxMetadata {
                 id: sandbox_id,
                 paused_state: Some(Arc::clone(&paused_state)),
@@ -3498,6 +3404,7 @@ mod tests {
             commit_state: PersistedPausedCommitState::Prepared,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
+            unproven_stop_boot_id: None,
             metadata,
             artifact_root: snapshot_root.clone(),
             state: paused_state.encode()?,

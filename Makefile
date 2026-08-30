@@ -52,7 +52,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
 	build-ublk install-ublk \
-	fmt clippy \
+	fmt clippy test-static \
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
@@ -101,6 +101,10 @@ uninstall-aenv:
 fmt:
 	$(CARGO) fmt --all -- --check
 
+test-static:
+	python3 scripts/tests/check-owned-complexity.py
+	uv run scripts/tests/check-owned-fixed-waits.py
+
 clippy:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -120,7 +124,9 @@ test-unit:
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
-	bash scripts/tests/verify-paused-recovery-packaging.sh
+	$(CARGO) build -p agentenv --bin aenv-paused-recovery
+	AENV_PAUSED_RECOVERY_BINARY="$(DEBUG_PROFILE_DIR)/aenv-paused-recovery" \
+		bash scripts/tests/verify-paused-recovery-boundary.sh
 
 test-integration: test-agent-integration test-envd test-ublk
 

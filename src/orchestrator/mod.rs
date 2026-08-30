@@ -3,6 +3,7 @@ mod metrics;
 mod persistence;
 mod proxy;
 mod service;
+mod state_machine;
 mod store;
 mod types;
 

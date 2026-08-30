@@ -216,6 +216,53 @@ impl From<SandboxMetadata> for models::SandboxDetail {
     }
 }
 
+enum CreatePreflight {
+    Start(Option<CreateSandboxIdempotency>),
+    Replay(SandboxMetadata),
+}
+
+enum CreateRequestError {
+    BadRequest(models::Error),
+    ServerError(models::Error),
+}
+
+impl CreateRequestError {
+    fn from_model(error: models::Error) -> Self {
+        if error.code == 400 {
+            Self::BadRequest(error)
+        } else {
+            Self::ServerError(error)
+        }
+    }
+
+    fn from_orchestrator(error: OrchestratorError) -> Self {
+        match error {
+            error @ (OrchestratorError::CreateIdempotencyConflict { .. }
+            | OrchestratorError::CreateIdempotencyResultUnavailable { .. }) => {
+                Self::BadRequest(error.into())
+            }
+            error => Self::ServerError(ApiImpl::internal_error(&error)),
+        }
+    }
+
+    fn from_cold_orchestrator(error: OrchestratorError) -> Self {
+        let invalid_request = match &error {
+            OrchestratorError::SandboxOperationFailed { source, .. } => {
+                source.chain().find_map(|cause| {
+                    cause
+                        .downcast_ref::<uvm_ublk_daemon::InvalidRequestError>()
+                        .map(ToString::to_string)
+                })
+            }
+            _ => None,
+        };
+        invalid_request.map_or_else(
+            || Self::from_orchestrator(error),
+            |message| Self::BadRequest(ApiImpl::error(400, message)),
+        )
+    }
+}
+
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
         let envd_access_token = self
@@ -243,6 +290,24 @@ impl ApiImpl {
             .first()
             .map(|domain| Nullable::Present(domain.clone()));
         sandbox
+    }
+
+    async fn prepare_create<T: serde::Serialize>(
+        &self,
+        route: &'static str,
+        key: Option<&str>,
+        body: &T,
+    ) -> Result<CreatePreflight, CreateRequestError> {
+        let idempotency =
+            create_idempotency(route, key, body).map_err(CreateRequestError::from_model)?;
+        let Some(create) = idempotency.as_ref() else {
+            return Ok(CreatePreflight::Start(None));
+        };
+        match self.orchestrator.replay_create_if_present(create).await {
+            Ok(Some(metadata)) => Ok(CreatePreflight::Replay(metadata)),
+            Ok(None) => Ok(CreatePreflight::Start(idempotency)),
+            Err(error) => Err(CreateRequestError::from_orchestrator(error)),
+        }
     }
 }
 
@@ -479,82 +544,30 @@ fn network_policy_from_update(
     ))
 }
 
-#[async_trait]
-impl Sandboxes<()> for ApiImpl {
-    type Claims = super::Claims;
-
-    async fn sandboxes_cold_post(
+impl ApiImpl {
+    async fn prepare_cold_create_request(
         &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-        _claims: &Self::Claims,
         body: &models::NewColdSandbox,
-    ) -> Result<SandboxesColdPostResponse, ()> {
-        let idempotency =
-            match create_idempotency("/sandboxes-cold", body.idempotency_key.as_deref(), body) {
-                Ok(idempotency) => idempotency,
-                Err(err) if err.code == 400 => {
-                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(err));
-                }
-                Err(err) => return Ok(SandboxesColdPostResponse::Status500_ServerError(err)),
-            };
-        if let Some(idempotency) = idempotency.as_ref() {
-            match self
-                .orchestrator
-                .replay_create_if_present(idempotency)
-                .await
-            {
-                Ok(Some(metadata)) => {
-                    let sandbox_id = metadata.id.to_string();
-                    return Ok(
-                        SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                            body: self.sandbox_model(metadata),
-                            x_agentenv_sandbox_id: Some(sandbox_id),
-                        },
-                    );
-                }
-                Ok(None) => {}
-                Err(
-                    err @ (OrchestratorError::CreateIdempotencyConflict { .. }
-                    | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
-                ) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err.into())),
-                Err(err) => {
-                    return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
-                    ));
-                }
-            }
-        }
+        idempotency: Option<CreateSandboxIdempotency>,
+        timer: &SandboxStageTimer,
+    ) -> Result<CreateSandboxRequest, CreateRequestError> {
         let image_resolver = self.image_resolver();
-        let timer = SandboxStageTimer::new("create_cold");
-        // TODO: Move cold-start image resolution into an async create operation
-        // once the API supports 202 Accepted + status polling.
-        let resolved_rootfs = match timer
+        let resolved_rootfs = timer
             .time("resolve_rootfs", image_resolver.resolve(&body.image))
             .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) if err.is_user_error() => {
-                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                    Self::error(400, err.to_string()),
-                ));
-            }
-            Err(err) => {
-                warn!(error = %format_args!("{err:#}"), image = %body.image, "failed to resolve sandbox rootfs image");
-                return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                    Self::error(
+            .map_err(|error| {
+                if error.is_user_error() {
+                    CreateRequestError::BadRequest(Self::error(400, error.to_string()))
+                } else {
+                    warn!(error = %format_args!("{error:#}"), image = %body.image, "failed to resolve sandbox rootfs image");
+                    CreateRequestError::ServerError(Self::error(
                         500,
-                        format!("resolve sandbox rootfs image '{}': {err:#}", body.image),
-                    ),
-                ));
-            }
-        };
-        let resources = match cold_start_resources(body) {
-            Ok(resources) => resources,
-            Err(err) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err)),
-        };
-        let resolved_attached = match timer
+                        format!("resolve sandbox rootfs image '{}': {error:#}", body.image),
+                    ))
+                }
+            })?;
+        let resources = cold_start_resources(body).map_err(CreateRequestError::BadRequest)?;
+        let resolved_attached = timer
             .time(
                 "resolve_attached_drives",
                 resolve_attached_drives(
@@ -563,43 +576,28 @@ impl Sandboxes<()> for ApiImpl {
                 ),
             )
             .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                warn!(error = %err.message, "failed to resolve attached drives");
-                return Ok(Self::client_or_server_response(
-                    err,
-                    SandboxesColdPostResponse::Status400_BadRequest,
-                    SandboxesColdPostResponse::Status500_ServerError,
-                ));
-            }
-        };
-
+            .map_err(|error| {
+                warn!(error = %error.message, "failed to resolve attached drives");
+                CreateRequestError::from_model(error)
+            })?;
         let network_policy =
-            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
-                Ok(network) => network,
-                Err(err) => {
-                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                        Self::error(400, err.to_string()),
-                    ));
-                }
-            };
-
-        let custom_params = body
+            network_policy_from_create(body.allow_internet_access, body.network.as_ref()).map_err(
+                |error| CreateRequestError::BadRequest(Self::error(400, error.to_string())),
+            )?;
+        let custom_extension_params = body
             .custom_extension_params
             .as_ref()
             .map(params_model_to_map);
-        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
-            return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                Self::error(400, err.to_string()),
-            ));
-        }
+        validate_custom_extension_params(custom_extension_params.as_ref())
+            .map_err(|error| CreateRequestError::BadRequest(Self::error(400, error.to_string())))?;
 
         let image_configs = build_image_configs(&resolved_rootfs, &resolved_attached);
-        let extra_drives = resolved_attached.into_iter().map(|r| r.drive).collect();
-
+        let extra_drives = resolved_attached
+            .into_iter()
+            .map(|resolved| resolved.drive)
+            .collect();
         let base = resolved_rootfs.base_context;
-        let request = CreateSandboxRequest {
+        Ok(CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
@@ -618,20 +616,140 @@ impl Sandboxes<()> for ApiImpl {
                 image_configs: Box::new(image_configs),
             },
             timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
-            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
+            timeout_action: create_timeout_action(body.auto_pause),
+            auto_resume: create_auto_resume(body.auto_resume.as_ref()),
             user_metadata: body.metadata.clone(),
-            env_vars: body
-                .env_vars
-                .clone()
-                .filter(|env_vars| !env_vars.is_empty()),
+            env_vars: nonempty_env_vars(body.env_vars.clone()),
             network_policy,
             secure: body.secure == Some(true),
-            custom_extension_params: custom_params,
+            custom_extension_params,
             idempotency,
+        })
+    }
+
+    async fn prepare_warm_create_request(
+        &self,
+        body: &models::NewSandbox,
+        idempotency: Option<CreateSandboxIdempotency>,
+        timer: &SandboxStageTimer,
+    ) -> Result<CreateSandboxRequest, CreateRequestError> {
+        let snapshot = match timer
+            .time(
+                "load_snapshot",
+                self.snapshot_manager.load_runnable(&body.template_id),
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return Err(CreateRequestError::BadRequest(Self::error(
+                    400,
+                    format!("template {} not found", body.template_id),
+                )));
+            }
+            Err(error) => {
+                warn!(error = ?error, template_id = %body.template_id, "failed to load runnable snapshot");
+                return Err(CreateRequestError::ServerError(
+                    Self::snapshot_manager_error(&error),
+                ));
+            }
+        };
+        let network_policy =
+            network_policy_from_create(body.allow_internet_access, body.network.as_ref()).map_err(
+                |error| CreateRequestError::BadRequest(Self::error(400, error.to_string())),
+            )?;
+        let custom_extension_params = body
+            .custom_extension_params
+            .as_ref()
+            .map(params_model_to_map);
+        validate_custom_extension_params(custom_extension_params.as_ref())
+            .map_err(|error| CreateRequestError::BadRequest(Self::error(400, error.to_string())))?;
+
+        Ok(CreateSandboxRequest {
+            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+            timeout: duration_from_secs(body.timeout),
+            timeout_action: create_timeout_action(body.auto_pause),
+            auto_resume: create_auto_resume(body.auto_resume.as_ref()),
+            user_metadata: body.metadata.clone(),
+            env_vars: nonempty_env_vars(body.env_vars.clone()),
+            network_policy,
+            secure: body.secure == Some(true),
+            custom_extension_params,
+            idempotency,
+        })
+    }
+}
+
+fn create_timeout_action(auto_pause: Option<bool>) -> SandboxTimeoutAction {
+    match auto_pause {
+        Some(false) => SandboxTimeoutAction::Delete,
+        _ => SandboxTimeoutAction::Pause,
+    }
+}
+
+fn create_auto_resume(config: Option<&models::SandboxAutoResumeConfig>) -> bool {
+    config.is_some_and(|config| config.enabled)
+}
+
+fn nonempty_env_vars(env_vars: Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
+    env_vars.filter(|env_vars| !env_vars.is_empty())
+}
+
+fn cold_create_error_response(error: CreateRequestError) -> SandboxesColdPostResponse {
+    match error {
+        CreateRequestError::BadRequest(error) => {
+            SandboxesColdPostResponse::Status400_BadRequest(error)
+        }
+        CreateRequestError::ServerError(error) => {
+            SandboxesColdPostResponse::Status500_ServerError(error)
+        }
+    }
+}
+
+fn warm_create_error_response(error: CreateRequestError) -> SandboxesPostResponse {
+    match error {
+        CreateRequestError::BadRequest(error) => SandboxesPostResponse::Status400_BadRequest(error),
+        CreateRequestError::ServerError(error) => {
+            SandboxesPostResponse::Status500_ServerError(error)
+        }
+    }
+}
+
+#[async_trait]
+impl Sandboxes<()> for ApiImpl {
+    type Claims = super::Claims;
+
+    async fn sandboxes_cold_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::NewColdSandbox,
+    ) -> Result<SandboxesColdPostResponse, ()> {
+        let idempotency = match self
+            .prepare_create("/sandboxes-cold", body.idempotency_key.as_deref(), body)
+            .await
+        {
+            Ok(CreatePreflight::Start(idempotency)) => idempotency,
+            Ok(CreatePreflight::Replay(metadata)) => {
+                let sandbox_id = metadata.id.to_string();
+                return Ok(
+                    SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                );
+            }
+            Err(error) => return Ok(cold_create_error_response(error)),
+        };
+        let timer = SandboxStageTimer::new("create_cold");
+        let request = match self
+            .prepare_cold_create_request(body, idempotency, &timer)
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return Ok(cold_create_error_response(error)),
         };
 
         match timer
@@ -647,30 +765,9 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
-            Err(
-                err @ (OrchestratorError::CreateIdempotencyConflict { .. }
-                | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
-            ) => Ok(SandboxesColdPostResponse::Status400_BadRequest(err.into())),
-            Err(err) => {
-                let invalid_request = match &err {
-                    OrchestratorError::SandboxOperationFailed { source, .. } => {
-                        source.chain().find_map(|cause| {
-                            cause
-                                .downcast_ref::<uvm_ublk_daemon::InvalidRequestError>()
-                                .map(ToString::to_string)
-                        })
-                    }
-                    _ => None,
-                };
-                match invalid_request {
-                    Some(message) => Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                        Self::error(400, message),
-                    )),
-                    None => Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
-                    )),
-                }
-            }
+            Err(error) => Ok(cold_create_error_response(
+                CreateRequestError::from_cold_orchestrator(error),
+            )),
         }
     }
 
@@ -708,103 +805,29 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
-        let idempotency =
-            match create_idempotency("/sandboxes", body.idempotency_key.as_deref(), body) {
-                Ok(idempotency) => idempotency,
-                Err(err) if err.code == 400 => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(err));
-                }
-                Err(err) => return Ok(SandboxesPostResponse::Status500_ServerError(err)),
-            };
-        if let Some(idempotency) = idempotency.as_ref() {
-            match self
-                .orchestrator
-                .replay_create_if_present(idempotency)
-                .await
-            {
-                Ok(Some(metadata)) => {
-                    let sandbox_id = metadata.id.to_string();
-                    return Ok(
-                        SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                            body: self.sandbox_model(metadata),
-                            x_agentenv_sandbox_id: Some(sandbox_id),
-                        },
-                    );
-                }
-                Ok(None) => {}
-                Err(
-                    err @ (OrchestratorError::CreateIdempotencyConflict { .. }
-                    | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
-                ) => return Ok(SandboxesPostResponse::Status400_BadRequest(err.into())),
-                Err(err) => {
-                    return Ok(SandboxesPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
-                    ));
-                }
-            }
-        }
-        let timer = SandboxStageTimer::new("create_warm");
-        let snapshot = match timer
-            .time(
-                "load_snapshot",
-                self.snapshot_manager.load_runnable(&body.template_id),
-            )
+        let idempotency = match self
+            .prepare_create("/sandboxes", body.idempotency_key.as_deref(), body)
             .await
         {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    format!("template {} not found", body.template_id),
-                )));
+            Ok(CreatePreflight::Start(idempotency)) => idempotency,
+            Ok(CreatePreflight::Replay(metadata)) => {
+                let sandbox_id = metadata.id.to_string();
+                return Ok(
+                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                );
             }
-            Err(err) => {
-                warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                return Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
-            }
+            Err(error) => return Ok(warm_create_error_response(error)),
         };
-
-        let network_policy =
-            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
-                Ok(network) => network,
-                Err(err) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        err.to_string(),
-                    )));
-                }
-            };
-
-        let custom_params = body
-            .custom_extension_params
-            .as_ref()
-            .map(params_model_to_map);
-        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                400,
-                err.to_string(),
-            )));
-        }
-
-        let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-            timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
-            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
-            user_metadata: body.metadata.clone(),
-            env_vars: body
-                .env_vars
-                .clone()
-                .filter(|env_vars| !env_vars.is_empty()),
-            network_policy,
-            secure: body.secure == Some(true),
-            custom_extension_params: custom_params,
-            idempotency,
+        let timer = SandboxStageTimer::new("create_warm");
+        let request = match self
+            .prepare_warm_create_request(body, idempotency, &timer)
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return Ok(warm_create_error_response(error)),
         };
 
         match timer
@@ -820,12 +843,8 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
-            Err(
-                err @ (OrchestratorError::CreateIdempotencyConflict { .. }
-                | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
-            ) => Ok(SandboxesPostResponse::Status400_BadRequest(err.into())),
-            Err(err) => Ok(SandboxesPostResponse::Status500_ServerError(
-                Self::internal_error(&err),
+            Err(error) => Ok(warm_create_error_response(
+                CreateRequestError::from_orchestrator(error),
             )),
         }
     }
@@ -1548,113 +1567,6 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn canonical_json_sorts_nested_object_keys() {
-        let mut value = serde_json::json!({
-            "z": { "second": 2, "first": 1 },
-            "a": [{ "right": true, "left": false }],
-        });
-        canonicalize_json(&mut value);
-        assert_eq!(
-            serde_json::to_string(&value).unwrap(),
-            r#"{"a":[{"left":false,"right":true}],"z":{"first":1,"second":2}}"#
-        );
-    }
-
-    #[test]
-    fn create_idempotency_fingerprints_the_route_and_request() {
-        let mut body = models::NewSandbox::new("base-template".to_string());
-        body.idempotency_key = Some("create-operation-1".to_string());
-        let mut metadata = HashMap::new();
-        metadata.insert("first".to_string(), "1".to_string());
-        metadata.insert("second".to_string(), "2".to_string());
-        body.metadata = Some(metadata);
-        let first = create_idempotency("/sandboxes", body.idempotency_key.as_deref(), &body)
-            .unwrap()
-            .unwrap();
-        let mut replay_body = body.clone();
-        let mut reversed_metadata = HashMap::new();
-        reversed_metadata.insert("second".to_string(), "2".to_string());
-        reversed_metadata.insert("first".to_string(), "1".to_string());
-        replay_body.metadata = Some(reversed_metadata);
-        let replay = create_idempotency(
-            "/sandboxes",
-            replay_body.idempotency_key.as_deref(),
-            &replay_body,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(first, replay);
-
-        body.timeout = Some(60);
-        let changed = create_idempotency("/sandboxes", body.idempotency_key.as_deref(), &body)
-            .unwrap()
-            .unwrap();
-        assert_ne!(first.request_fingerprint(), changed.request_fingerprint());
-
-        let other_route = create_idempotency(
-            "/sandboxes-cold",
-            replay_body.idempotency_key.as_deref(),
-            &replay_body,
-        )
-        .unwrap()
-        .unwrap();
-        assert_ne!(
-            first.request_fingerprint(),
-            other_route.request_fingerprint()
-        );
-    }
-
-    #[test]
-    fn create_idempotency_normalizes_static_effective_defaults() {
-        let mut omitted = models::NewSandbox::new("base-template".to_string());
-        omitted.idempotency_key = Some("create-operation-defaults".to_string());
-        omitted.auto_pause = None;
-        omitted.auto_resume = None;
-        omitted.secure = None;
-        omitted.env_vars = None;
-
-        let mut explicit = omitted.clone();
-        explicit.auto_pause = Some(true);
-        explicit.auto_resume = Some(models::SandboxAutoResumeConfig::new());
-        explicit.secure = Some(false);
-        explicit.env_vars = Some(HashMap::new());
-
-        let omitted =
-            create_idempotency("/sandboxes", omitted.idempotency_key.as_deref(), &omitted)
-                .unwrap()
-                .unwrap();
-        let explicit =
-            create_idempotency("/sandboxes", explicit.idempotency_key.as_deref(), &explicit)
-                .unwrap()
-                .unwrap();
-        assert_eq!(omitted, explicit);
-    }
-
-    #[test]
-    fn create_idempotency_rejects_an_empty_key() {
-        let mut body = models::NewSandbox::new("base-template".to_string());
-        body.idempotency_key = Some(String::new());
-        let err = create_idempotency("/sandboxes", body.idempotency_key.as_deref(), &body)
-            .expect_err("empty key should be rejected");
-        assert_eq!(err.code, 400);
-    }
-
-    #[test]
-    fn create_idempotency_replay_errors_are_bad_requests() {
-        for err in [
-            OrchestratorError::CreateIdempotencyConflict {
-                key: "create-operation-1".to_string(),
-            },
-            OrchestratorError::CreateIdempotencyResultUnavailable {
-                key: "create-operation-2".to_string(),
-            },
-        ] {
-            let err: models::Error = err.into();
-            assert_eq!(err.code, 400);
-        }
-    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

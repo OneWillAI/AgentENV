@@ -15,22 +15,18 @@ readonly PROXY_HEALTH_PORT=49983
 
 wait_for_global_sandboxes_quiesced() {
   local timeout="${1:-20}"
-  local attempt
-  local count
-
-  for ((attempt = 0; attempt < timeout * 2; attempt++)); do
-    api_get "/v2/sandboxes?limit=1"
-    if [[ "${HTTP_STATUS}" == "200" ]]; then
-      count="$(echo "${HTTP_BODY}" | jq 'length' 2>/dev/null || echo -1)"
-      if [[ "${count}" == "0" ]]; then
-        return 0
-      fi
-    fi
-    sleep 0.5
-  done
+  wait_until "${timeout}" _global_sandboxes_are_quiesced && return 0
 
   warn "Timed out waiting for /v2/sandboxes to become empty before baseline capture"
   return 1
+}
+
+_global_sandboxes_are_quiesced() {
+  local count
+  api_get "/v2/sandboxes?limit=1"
+  [[ "${HTTP_STATUS}" == "200" ]] || return 1
+  count="$(echo "${HTTP_BODY}" | jq 'length' 2>/dev/null || echo -1)"
+  [[ "${count}" == "0" ]]
 }
 
 cleanup_lingering_sandboxes() {
@@ -52,37 +48,31 @@ cleanup_lingering_sandboxes() {
 
 wait_for_node_runtime_allocations_quiesced() {
   local timeout="${1:-20}"
-  local attempt
-
-  for ((attempt = 0; attempt < timeout * 2; attempt++)); do
-    api_admin_get "/nodes"
-    if [[ "${HTTP_STATUS}" == "200" ]] &&
-      echo "${HTTP_BODY}" | jq -e 'all(.[]; (.sandboxCount == 0 and .metrics.allocatedCPU == 0 and .metrics.allocatedMemoryBytes == 0))' >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.5
-  done
+  wait_until "${timeout}" _node_runtime_allocations_are_quiesced && return 0
 
   warn "Timed out waiting for /nodes runtime allocations to settle before baseline capture"
   return 1
 }
 
+_node_runtime_allocations_are_quiesced() {
+  api_admin_get "/nodes"
+  [[ "${HTTP_STATUS}" == "200" ]] &&
+    echo "${HTTP_BODY}" | jq -e 'all(.[]; (.sandboxCount == 0 and .metrics.allocatedCPU == 0 and .metrics.allocatedMemoryBytes == 0))' >/dev/null 2>&1
+}
+
 wait_for_scheduler_binding_cleanup() {
   local sandbox_id="$1"
   local timeout="${2:-${SCHEDULER_BINDING_CLEANUP_TIMEOUT_SECONDS}}"
-  local attempt
-
-  for ((attempt = 0; attempt < timeout * 2; attempt++)); do
-    proxy_get_with_sandbox "${sandbox_id}" "${PROXY_HEALTH_PATH}" "${PROXY_HEALTH_PORT}"
-    if [[ "${HTTP_STATUS}" == "404" ]] &&
-      [[ "${HTTP_BODY}" == *"sandbox assignment not found"* ]]; then
-      return 0
-    fi
-    sleep 0.5
-  done
+  wait_until "${timeout}" _scheduler_binding_is_removed "${sandbox_id}" && return 0
 
   warn "Timed out waiting for scheduler binding cleanup for sandbox ${sandbox_id}"
   return 1
+}
+
+_scheduler_binding_is_removed() {
+  proxy_get_with_sandbox "$1" "${PROXY_HEALTH_PATH}" "${PROXY_HEALTH_PORT}"
+  [[ "${HTTP_STATUS}" == "404" ]] &&
+    [[ "${HTTP_BODY}" == *"sandbox assignment not found"* ]]
 }
 
 quiesce_runtime_state_before_baseline() {
@@ -106,21 +96,17 @@ wait_for_admin_nodes_count() {
   local base_url="$1"
   local min_count="$2"
   local timeout="${3:-45}"
-  local attempt
-  local count
-
-  for ((attempt = 0; attempt < timeout * 2; attempt++)); do
-    if fetch_admin_nodes "${base_url}" >/dev/null; then
-      count="$(echo "${HTTP_BODY}" | jq 'length' 2>/dev/null || echo 0)"
-      if [[ "${count}" -ge "${min_count}" ]]; then
-        return 0
-      fi
-    fi
-    sleep 0.5
-  done
+  wait_until "${timeout}" _admin_nodes_count_is_at_least "${base_url}" "${min_count}" && return 0
 
   warn "Timed out waiting for ${base_url}/nodes to expose at least ${min_count} nodes"
   return 1
+}
+
+_admin_nodes_count_is_at_least() {
+  local base_url="$1" min_count="$2" count
+  fetch_admin_nodes "${base_url}" >/dev/null || return 1
+  count="$(echo "${HTTP_BODY}" | jq 'length' 2>/dev/null || echo 0)"
+  [[ "${count}" -ge "${min_count}" ]]
 }
 
 wait_for_node_snapshot() {
@@ -130,35 +116,40 @@ wait_for_node_snapshot() {
   local expected_allocated_memory="$4"
   local expected_create_successes_min="$5"
   local timeout="${6:-45}"
-  local attempt
+
+  wait_until "${timeout}" _node_snapshot_matches \
+    "${node_id}" "${expected_sandbox_count}" "${expected_allocated_cpu}" \
+    "${expected_allocated_memory}" "${expected_create_successes_min}" && return 0
+
+  warn "Timed out waiting for node ${node_id} snapshot to reach expected values"
+  return 1
+}
+
+_node_snapshot_matches() {
+  local node_id="$1"
+  local expected_sandbox_count="$2"
+  local expected_allocated_cpu="$3"
+  local expected_allocated_memory="$4"
+  local expected_create_successes_min="$5"
   local body
   local sandbox_count
   local allocated_cpu
   local allocated_memory
   local create_successes
 
-  for ((attempt = 0; attempt < timeout * 2; attempt++)); do
-    api_admin_get "/nodes"
-    if [[ "${HTTP_STATUS}" == "200" ]]; then
-      body="${HTTP_BODY}"
-      sandbox_count="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .sandboxCount // empty' 2>/dev/null || true)"
-      allocated_cpu="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .metrics.allocatedCPU // empty' 2>/dev/null || true)"
-      allocated_memory="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .metrics.allocatedMemoryBytes // empty' 2>/dev/null || true)"
-      create_successes="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .createSuccesses // empty' 2>/dev/null || true)"
-      if [[ "${sandbox_count}" == "${expected_sandbox_count}" &&
-            "${allocated_cpu}" == "${expected_allocated_cpu}" &&
-            "${allocated_memory}" == "${expected_allocated_memory}" &&
-            -n "${create_successes}" &&
-            "${create_successes}" =~ ^[0-9]+$ &&
-            "${create_successes}" -ge "${expected_create_successes_min}" ]]; then
-        return 0
-      fi
-    fi
-    sleep 0.5
-  done
-
-  warn "Timed out waiting for node ${node_id} snapshot to reach expected values"
-  return 1
+  api_admin_get "/nodes"
+  [[ "${HTTP_STATUS}" == "200" ]] || return 1
+  body="${HTTP_BODY}"
+  sandbox_count="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .sandboxCount // empty' 2>/dev/null || true)"
+  allocated_cpu="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .metrics.allocatedCPU // empty' 2>/dev/null || true)"
+  allocated_memory="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .metrics.allocatedMemoryBytes // empty' 2>/dev/null || true)"
+  create_successes="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .createSuccesses // empty' 2>/dev/null || true)"
+  [[ "${sandbox_count}" == "${expected_sandbox_count}" &&
+        "${allocated_cpu}" == "${expected_allocated_cpu}" &&
+        "${allocated_memory}" == "${expected_allocated_memory}" &&
+        -n "${create_successes}" &&
+        "${create_successes}" =~ ^[0-9]+$ &&
+        "${create_successes}" -ge "${expected_create_successes_min}" ]]
 }
 
 node_detail_sandbox_count() {

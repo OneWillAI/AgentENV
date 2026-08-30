@@ -5,6 +5,15 @@ on:
   pull_request:
     paths:
       - "**.rs"
+      - "**.go"
+      - "**.js"
+      - "**.jsx"
+      - "**.ts"
+      - "**.tsx"
+      - "**.mjs"
+      - "**.cjs"
+      - "**.mts"
+      - "**.cts"
       - "Makefile"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -14,13 +23,27 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
-      - "scripts/tests/verify-paused-recovery-packaging.sh"
+      - "scripts/tests/verify-paused-recovery-boundary.sh"
+      - "scripts/tests/check-owned-complexity.py"
+      - "scripts/tests/check-owned-fixed-waits.py"
+      - "scripts/tests/lib/wait.sh"
+      - "scripts/tests/e2e/**"
+      - "scripts/tests/test_envd.sh"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
   push:
     paths:
       - "**.rs"
+      - "**.go"
+      - "**.js"
+      - "**.jsx"
+      - "**.ts"
+      - "**.tsx"
+      - "**.mjs"
+      - "**.cjs"
+      - "**.mts"
+      - "**.cts"
       - "Makefile"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -30,12 +53,44 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
-      - "scripts/tests/verify-paused-recovery-packaging.sh"
+      - "scripts/tests/verify-paused-recovery-boundary.sh"
+      - "scripts/tests/check-owned-complexity.py"
+      - "scripts/tests/check-owned-fixed-waits.py"
+      - "scripts/tests/lib/wait.sh"
+      - "scripts/tests/e2e/**"
+      - "scripts/tests/test_envd.sh"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
 
 jobs:
+  complexity:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect Go AST requirement
+        id: go-complexity
+        shell: bash
+        run: |
+          required=false
+          if ! git diff --quiet --no-ext-diff origin/main -- "*.go"; then
+            required=true
+          fi
+          echo "required=${required}" >> "${GITHUB_OUTPUT}"
+      - uses: actions/setup-go@v6
+        if: steps.go-complexity.outputs.required == 'true'
+        with:
+          go-version-file: services/go.mod
+          cache-dependency-path: services/go.sum
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.28"
+      - name: Branch-owned complexity
+        run: make test-static
+
   fmt:
     runs-on: ubuntu-22.04
     steps:

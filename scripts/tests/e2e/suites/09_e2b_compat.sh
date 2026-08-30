@@ -74,10 +74,8 @@ if [[ "$cli_available" == "1" ]]; then
     exec_output=""
     exec_succeeded=0
     exec_attempts=10
-    exec_retry_delay_secs=1
 
     # The API can return before envd is ready to accept the first Connect RPC.
-    sleep 3
     for ((attempt = 1; attempt <= exec_attempts; attempt++)); do
       log "Running: e2b sandbox exec ${sandbox_id} -- echo hello (attempt ${attempt}/${exec_attempts})"
       if exec_output=$(e2b sandbox exec "$sandbox_id" -- echo hello 2>&1); then
@@ -87,7 +85,7 @@ if [[ "$cli_available" == "1" ]]; then
 
       log "exec attempt ${attempt} failed: ${exec_output:0:200}"
       if (( attempt < exec_attempts )); then
-        sleep "${exec_retry_delay_secs}"
+        adaptive_poll_sleep "$((attempt - 1))"
       fi
     done
 

@@ -949,7 +949,7 @@ async fn restored_paused_idempotent_delete_retains_the_key_and_durable_record() 
 }
 
 #[tokio::test]
-async fn idempotent_pause_stop_proof_allows_same_process_delete() -> Result<()> {
+async fn pause_stop_proof_allows_same_process_delete() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
     let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
@@ -982,7 +982,7 @@ async fn idempotent_pause_stop_proof_allows_same_process_delete() -> Result<()> 
 }
 
 #[tokio::test]
-async fn failed_pause_stop_remains_unproven_after_restart_and_rejects_resume() -> Result<()> {
+async fn non_idempotent_failed_pause_stop_remains_unproven_after_restart() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
     let behavior = Arc::new(MockBehavior::new());
@@ -997,16 +997,14 @@ async fn failed_pause_stop_remains_unproven_after_restart_and_rejects_resume() -
         MockBackendFactory::with_behavior(behavior),
         persister.clone(),
     );
-    let key = "pause-stop-failure";
-    let fingerprint = "sha256:pause-stop-failure";
     let created = orchestrator
-        .create_sandbox(idempotent_create_request(key, fingerprint))
+        .create_sandbox(create_request(Some(60), &[("team", "pause-stop-failure")]))
         .await?;
 
     let err = orchestrator
         .pause_sandbox(created.id)
         .await
-        .expect_err("idempotent pause must surface an uncertain stop");
+        .expect_err("every pause must surface an uncertain stop");
     assert!(matches!(
         err,
         OrchestratorError::SandboxOperationFailed {
@@ -1041,15 +1039,14 @@ async fn failed_pause_stop_remains_unproven_after_restart_and_rejects_resume() -
         .resume_sandbox(created.id, NewTimeout::UseExisting)
         .await
         .expect_err("resume must reject missing durable stop proof");
-    restarted
+    let delete_error = restarted
         .delete_sandbox(created.id)
         .await
-        .expect_err("delete must retain the key without durable stop proof");
+        .expect_err("delete must retain the sandbox without durable stop proof");
+    assert!(delete_error
+        .to_string()
+        .contains("runtime handle is missing"));
     assert!(!persister.calls().contains(&RecordingCall::MarkResuming));
-    let records = persister.create_idempotency_records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].key, key);
-    assert_eq!(records[0].state, CreateIdempotencyRecordState::Succeeded);
     Ok(())
 }
 
@@ -2368,7 +2365,7 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 }
 
 #[tokio::test]
-async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot() -> Result<()> {
+async fn pause_stop_failure_is_reported_and_keeps_stop_proof_unset() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -2383,17 +2380,28 @@ async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
 
-    orchestrator.pause_sandbox(created.id).await?;
+    let error = orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("pause must not report success without positive stop proof");
+    assert!(matches!(
+        error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::Stop,
+            ..
+        }
+    ));
 
     let paused = orchestrator
         .get_sandbox(&created.id)
         .await?
         .expect("sandbox should still exist after pause");
     assert_eq!(paused.state, SandboxState::Paused);
+    assert!(!paused.paused_runtime_stopped);
 
-    // Resource metrics are derived from the current metadata state, so a
-    // sandbox that is logically Paused no longer counts toward allocated
-    // CPU/memory regardless of whether the backing VM `stop()` succeeded.
+    // Resource metrics are derived from metadata state. The sandbox stays
+    // visibly Paused but lifecycle operations remain fail-closed until stop
+    // absence can be proven.
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
@@ -4812,25 +4820,13 @@ async fn shutdown_waits_for_multiple_slow_serial_pauses() -> Result<()> {
 }
 
 #[tokio::test]
-async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
+async fn shutdown_reports_unproven_stop_after_pause() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
         MockOperation::Stop,
         MockAction::Fail {
             message: "shutdown stop failure 1".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown stop failure 2".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown stop failure 3".to_string(),
         },
     );
     let orchestrator =
@@ -4844,15 +4840,17 @@ async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
         .await?;
     let sandbox_id = created.id;
 
-    orchestrator.shutdown().await?;
+    orchestrator
+        .shutdown()
+        .await
+        .expect_err("shutdown must report a paused runtime whose stop is unproven");
 
     let metadata = orchestrator
         .get_sandbox(&sandbox_id)
         .await?
         .expect("paused sandbox metadata should remain after shutdown");
     assert_eq!(metadata.state, SandboxState::Paused);
-
-    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(!metadata.paused_runtime_stopped);
     Ok(())
 }
 

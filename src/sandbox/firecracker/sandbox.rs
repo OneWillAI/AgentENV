@@ -595,12 +595,6 @@ impl FirecrackerSandbox {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
-        if let Some(slot) = self.network_slot.as_ref() {
-            if let Err(error) = slot.refresh_guest_arp() {
-                warn!(error = %error, "failed to refresh guest ARP before envd health");
-            }
-            slot.spawn_guest_arp_refresh();
-        }
         let health_started = Instant::now();
         envd_instance
             .wait_for_ready(
@@ -1610,7 +1604,7 @@ impl FirecrackerSandbox {
 
         self.fc_instance.resume().await?;
         if let Some(slot) = self.network_slot.as_ref() {
-            slot.spawn_guest_arp_refresh();
+            slot.spawn_resume_arp_refresh();
         }
 
         debug!("sandbox restored from snapshot config");

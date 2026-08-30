@@ -4,6 +4,10 @@
 if [[ -z "${E2E_SERVER_SH_LOADED:-}" ]]; then
   E2E_SERVER_SH_LOADED=1
 
+  E2E_SERVER_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=/dev/null
+  source "${E2E_SERVER_LIB_DIR}/../../lib/wait.sh"
+
   : "${AENV_PORT:=18080}"
   : "${AENV_URL:=http://127.0.0.1:${AENV_PORT}}"
   : "${AENV_API_KEY:=e2e-test-key}"
@@ -33,8 +37,6 @@ if [[ -z "${E2E_SERVER_SH_LOADED:-}" ]]; then
     "${run_cmd[@]}" env "${env_vars[@]}" "$binary" &
     _SERVER_PID=$!
 
-    # Give the process a moment to fail fast (bad binary, port conflict, etc.)
-    sleep 1
     if ! kill -0 "$_SERVER_PID" 2>/dev/null; then
       die "Server process exited immediately (PID ${_SERVER_PID})"
     fi
@@ -45,21 +47,27 @@ if [[ -z "${E2E_SERVER_SH_LOADED:-}" ]]; then
   wait_for_server() {
     local timeout="${1:-$SERVER_START_TIMEOUT}"
     log "Waiting for server at ${AENV_URL}/health (timeout ${timeout}s) ..."
-    for ((i = 1; i <= timeout; i++)); do
-      if curl -sf "${AENV_URL}/health" >/dev/null 2>&1; then
-        log "Server is ready."
-        return 0
-      fi
-      sleep 1
-    done
+    if wait_until "${timeout}" _server_is_ready; then
+      log "Server is ready."
+      return 0
+    fi
     die "Server failed to become ready within ${timeout}s"
+  }
+
+  _server_is_ready() {
+    kill -0 "${_SERVER_PID}" 2>/dev/null || return 2
+    curl -sf "${AENV_URL}/health" >/dev/null 2>&1
+  }
+
+  _server_port_is_free() {
+    ! fuser "${AENV_PORT}/tcp" >/dev/null 2>&1
   }
 
   # Kill whatever is listening on AENV_PORT.
   _kill_port_holder() {
     if command -v fuser >/dev/null 2>&1; then
       sudo fuser -k "${AENV_PORT}/tcp" 2>/dev/null || true
-      sleep 0.2
+      wait_until 5 _server_port_is_free || true
     fi
   }
 

@@ -109,6 +109,12 @@ high_watermark_ratio = 0.95
 # Evict down to this fraction of capacity_gb (0.70 = 70%).
 low_watermark_ratio = 0.70
 
+[template]
+# Apply the scheduler's cluster CPU intersection to temporary template-build
+# VMs. Dedicated builders with an incompatible KVM CPU-template interface can
+# disable this without renaming binaries or restarting around every build.
+apply_cluster_cpu_config = true
+
 # EXPERIMENTAL: P2P has not been tested in production. Keep it disabled in
 # production unless the deployment accepts that operational risk.
 [p2p]
