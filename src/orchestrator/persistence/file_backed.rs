@@ -2859,7 +2859,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let (sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
+        let (_sandbox_id, snapshot_root, _paused_state) = persist_test_record(&persister).await?;
         let manifest_path = FileBackedSandboxPersister::manifest_path(&snapshot_root);
         let mut value: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
         value
