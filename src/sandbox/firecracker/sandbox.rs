@@ -597,7 +597,7 @@ impl FirecrackerSandbox {
         };
         if let Some(slot) = self.network_slot.as_ref() {
             if let Err(error) = slot.refresh_guest_arp_once() {
-                warn!(error = %error, "failed to announce guest ARP before envd health");
+                warn!(error = %format_args!("{error:#}"), "failed to announce guest ARP before envd health");
             }
             slot.spawn_readiness_arp_refresh();
         }

@@ -962,19 +962,27 @@ fn refresh_guest_arp_in(
     vm_ip: Ipv4Addr,
     cancellation: &ArpRefreshCancellation,
 ) -> Result<()> {
-    let _netns = enter_network_namespace(&netns_path)?;
-
     for attempt in 0..40 {
         if cancellation.is_cancelled() {
             return Ok(());
         }
-        let result = send_arp_request_on_tap("tap0", tap_ip, vm_ip)
-            .and_then(|()| send_arp_request_on_tap("tap0", tap_ip, tap_ip));
+        // setns is per-thread. Use a fresh thread for each attempt, as the
+        // original implementation did, so the caller's namespace and its
+        // capability state are never changed by a long-lived worker.
+        let attempt_netns = netns_path.clone();
+        let result = thread::spawn(move || -> Result<()> {
+            let _netns = enter_network_namespace(&attempt_netns)?;
+            send_arp_request_on_tap("tap0", tap_ip, vm_ip)
+                .and_then(|()| send_arp_request_on_tap("tap0", tap_ip, tap_ip))
+        })
+        .join()
+        .map_err(|error| anyhow!("ARP refresh attempt panicked: {error:?}"))
+        .and_then(|result| result);
         if let Err(error) = result {
             // The interface can be briefly unavailable while Firecracker
             // reconnects virtio-net. One missed frame must not give up the
             // bounded two-second repair window.
-            warn!(error = %error, attempt, "guest ARP refresh failed");
+            warn!(error = %format_args!("{error:#}"), attempt, "guest ARP refresh failed");
         }
         if attempt < 39 {
             if !cancellation.wait(Duration::from_millis(50)) {
