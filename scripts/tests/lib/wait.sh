@@ -22,7 +22,7 @@ if [[ -z "${AENV_TEST_WAIT_SH_LOADED:-}" ]]; then
   }
 
   # Run a predicate until it succeeds or timeout seconds elapse. A predicate
-  # status of 1 means "retry"; status 2 means "stop immediately".
+  # status of 1 means "retry"; every other non-zero status is terminal.
   wait_until() {
     local timeout="${1:?usage: wait_until <timeout-seconds> <predicate> [args...]}"
     shift
@@ -37,7 +37,7 @@ if [[ -z "${AENV_TEST_WAIT_SH_LOADED:-}" ]]; then
         status=$?
       fi
 
-      [[ "${status}" -eq 2 ]] && return 2
+      [[ "${status}" -eq 1 ]] || return "${status}"
       ((SECONDS >= deadline)) && return 1
       adaptive_poll_sleep "${attempt}"
       ((attempt += 1))

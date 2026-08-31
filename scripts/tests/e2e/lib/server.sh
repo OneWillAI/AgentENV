@@ -56,7 +56,8 @@ if [[ -z "${E2E_SERVER_SH_LOADED:-}" ]]; then
 
   _server_is_ready() {
     kill -0 "${_SERVER_PID}" 2>/dev/null || return 2
-    curl -sf "${AENV_URL}/health" >/dev/null 2>&1
+    curl -sf "${AENV_URL}/health" >/dev/null 2>&1 && return 0
+    return 1
   }
 
   _server_port_is_free() {

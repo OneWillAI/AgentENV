@@ -212,7 +212,8 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   }
 
   _health_url_is_ready() {
-    curl -sf "${1}/health" >/dev/null 2>&1
+    curl -sf "${1}/health" >/dev/null 2>&1 && return 0
+    return 1
   }
 
   _runtime_node_count() {
@@ -334,7 +335,8 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   _port_forward_is_ready() {
     local pid="$1" local_port="$2"
     kill -0 "${pid}" 2>/dev/null || return 2
-    bash -c "exec 3<>/dev/tcp/127.0.0.1/${local_port}" >/dev/null 2>&1
+    bash -c "exec 3<>/dev/tcp/127.0.0.1/${local_port}" >/dev/null 2>&1 && return 0
+    return 1
   }
 
   _export_k8s_node_endpoints() {
