@@ -729,6 +729,7 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
             secret_access_key: oss.access_key_secret.as_deref(),
             security_token: oss.security_token.as_deref(),
             credential_process: oss.credential_process.as_deref(),
+            google_service_account: oss.google_service_account,
         },
         CredentialSourceOptions {
             scope: "backend.oss",
@@ -763,6 +764,14 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
             config["secretAccessKey"] = "".into();
             config["securityToken"] = "".into();
             config["credentialProcess"] = command.into();
+            config["googleServiceAccount"] = false.into();
+        }
+        CredentialSource::GoogleServiceAccount => {
+            config["accessKeyId"] = "".into();
+            config["secretAccessKey"] = "".into();
+            config["securityToken"] = "".into();
+            config["credentialProcess"] = "".into();
+            config["googleServiceAccount"] = true.into();
         }
         CredentialSource::Anonymous => {
             bail!("backend.oss requires non-anonymous credentials");
@@ -806,6 +815,7 @@ mod tests {
             bucket: " demo-bucket ".to_string(),
             prefix: Some(" snapshots ".to_string()),
             credential_process: None,
+            google_service_account: false,
             access_key_id: Some(" ak ".to_string()),
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
@@ -876,6 +886,20 @@ mod tests {
         let config = overlaybd_runtime_oss_config(&oss).expect("derive overlaybd oss config");
         assert_eq!(config["accessKeyId"], "");
         assert_eq!(config["credentialProcess"], "echo creds");
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_uses_google_service_account() {
+        let mut oss = sample_oss_config();
+        oss.access_key_id = None;
+        oss.access_key_secret = None;
+        oss.security_token = None;
+        oss.google_service_account = true;
+
+        let config = overlaybd_runtime_oss_config(&oss).expect("derive Google OAuth config");
+        assert_eq!(config["accessKeyId"], "");
+        assert_eq!(config["credentialProcess"], "");
+        assert_eq!(config["googleServiceAccount"], true);
     }
 
     #[test]
