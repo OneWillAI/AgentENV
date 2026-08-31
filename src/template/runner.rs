@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -244,10 +245,17 @@ impl TemplateBuildRunner {
                     }
                     .await;
 
+                    let diagnostics = run_result.as_ref().err().map(|error| {
+                        firecracker_diagnostics(&sandbox)
+                            .map(|logs| format!("{error:#}; firecracker logs:\n{logs}"))
+                            .unwrap_or_else(|_| format!("{error:#}"))
+                    });
                     let stop_result = sandbox.stop().await;
                     match (run_result, stop_result) {
                         (Ok(result), Ok(())) => Ok(result),
-                        (Err(run_err), Ok(())) => Err(run_err),
+                        (Err(run_err), Ok(())) => Err(anyhow!(
+                            diagnostics.unwrap_or_else(|| format!("{run_err:#}"))
+                        )),
                         (Ok(_), Err(stop_err)) => Err(stop_err),
                         (Err(run_err), Err(stop_err)) => Err(anyhow!(
                             "{}; additionally failed to stop sandbox: {}",
@@ -262,6 +270,28 @@ impl TemplateBuildRunner {
             Err(_) => bail!("snapshot build worker thread panicked"),
         }
     }
+}
+
+const FIRECRACKER_LOG_TAIL_BYTES: u64 = 16 * 1024;
+
+fn firecracker_diagnostics(sandbox: &FirecrackerSandbox) -> Result<String> {
+    let mut output = String::new();
+    for (label, path) in [
+        ("stdout", sandbox.firecracker_stdout_path()),
+        ("stderr", sandbox.firecracker_stderr_path()),
+        ("log", sandbox.firecracker_log_path()),
+    ] {
+        let bytes = fs::read(&path).with_context(|| format!("read firecracker {label} log"))?;
+        let start = bytes
+            .len()
+            .saturating_sub(FIRECRACKER_LOG_TAIL_BYTES as usize);
+        output.push_str(&format!(
+            "[{label} {}]\n{}\n",
+            path.display(),
+            String::from_utf8_lossy(&bytes[start..])
+        ));
+    }
+    Ok(output)
 }
 
 /// Provision the template's default user when the image does not have it.
