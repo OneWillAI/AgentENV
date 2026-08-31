@@ -55,7 +55,6 @@
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)
-- [Guest Kernel EROFS](./internals/guest-kernel-erofs.md)
 - [Proxy Design](./internals/proxy-design.md)
 - [Distributed Control Plane](./internals/services.md)
 - [P2P Artifact Transport](./internals/p2p-design.md)

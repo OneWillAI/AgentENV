@@ -120,7 +120,9 @@ test-unit:
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
-	bash scripts/tests/verify-paused-recovery-packaging.sh
+	$(CARGO) build -p agentenv --bin aenv-paused-recovery
+	AENV_PAUSED_RECOVERY_BINARY="$(DEBUG_PROFILE_DIR)/aenv-paused-recovery" \
+		bash scripts/tests/verify-paused-recovery-boundary.sh
 
 test-integration: test-agent-integration test-envd test-ublk
 

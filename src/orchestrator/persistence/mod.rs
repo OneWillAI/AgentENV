@@ -1,6 +1,13 @@
+mod artifact_cleanup;
+mod codecs;
+mod durable_storage;
 mod file_backed;
+mod managed_paths;
 #[cfg(test)]
 mod mock;
+mod operation_journal;
+mod paused_transactions;
+mod recovery;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,11 +17,10 @@ use crate::orchestrator::store::SandboxMetadata;
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 
-pub use file_backed::{
-    FileBackedSandboxPersister, PausedSandboxQuarantine, PausedSandboxRecoveryReport,
-};
+pub use file_backed::FileBackedSandboxPersister;
 #[cfg(test)]
 pub(crate) use mock::{RecordingCall, RecordingPersister};
+pub use recovery::{PausedSandboxQuarantine, PausedSandboxRecoveryReport};
 
 pub type PersistenceResult<T> = std::result::Result<T, SandboxPersistenceError>;
 

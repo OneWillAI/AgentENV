@@ -96,11 +96,15 @@ impl EnvdInstance {
             "waiting for envd"
         );
         let start = std::time::Instant::now();
+        let mut last_probe = String::from("no probe completed");
 
         loop {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
-                return Err(anyhow!("timed out waiting for envd"));
+                return Err(anyhow!(
+                    "timed out waiting for envd at {} (last probe: {last_probe})",
+                    self.config.base_path
+                ));
             }
 
             let remaining = timeout - elapsed;
@@ -115,9 +119,14 @@ impl EnvdInstance {
                     return Ok(());
                 }
                 Ok(Err(error)) => {
+                    last_probe = format!("health error: {error}");
                     trace!(%error, "envd health probe failed");
                 }
                 Err(_) => {
+                    last_probe = format!(
+                        "health probe timeout after {} ms",
+                        probe_timeout.as_millis()
+                    );
                     trace!(
                         timeout_ms = probe_timeout.as_millis(),
                         "envd health probe timed out"
@@ -127,7 +136,10 @@ impl EnvdInstance {
 
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                return Err(anyhow!("timed out waiting for envd"));
+                return Err(anyhow!(
+                    "timed out waiting for envd at {} (last probe: {last_probe})",
+                    self.config.base_path
+                ));
             }
             sleep(std::cmp::min(retry_interval, remaining)).await;
         }

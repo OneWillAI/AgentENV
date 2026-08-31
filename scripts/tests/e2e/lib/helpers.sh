@@ -4,6 +4,10 @@
 if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   E2E_HELPERS_SH_LOADED=1
 
+  E2E_HELPERS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=/dev/null
+  source "${E2E_HELPERS_LIB_DIR}/../../lib/wait.sh"
+
   : "${AENV_URL:?AENV_URL must be set}"
   : "${AENV_API_KEY:=e2e-test-key}"
   : "${AENV_ADMIN_TOKEN:=e2e-admin-token}"
@@ -368,26 +372,22 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
 
   wait_for_sandbox_state() {
     local id="$1" target_state="$2" timeout="${3:-30}"
-    for ((i = 0; i < timeout * 2; i++)); do
-      local state
-      state=$(get_sandbox_state "$id")
-      [[ "$state" == "$target_state" ]] && return 0
-      sleep 0.5
-    done
+    wait_until "${timeout}" _sandbox_has_state_at "${AENV_URL}" "${id}" "${target_state}" && return 0
     warn "Timed out waiting for sandbox $id to reach state '$target_state'"
     return 1
   }
 
   wait_for_sandbox_state_at() {
     local base_url="$1" id="$2" target_state="$3" timeout="${4:-30}"
-    for ((i = 0; i < timeout * 2; i++)); do
-      local state
-      state=$(get_sandbox_state_at "$base_url" "$id")
-      [[ "$state" == "$target_state" ]] && return 0
-      sleep 0.5
-    done
+    wait_until "${timeout}" _sandbox_has_state_at "${base_url}" "${id}" "${target_state}" && return 0
     warn "Timed out waiting for sandbox $id at ${base_url} to reach state '$target_state'"
     return 1
+  }
+
+  _sandbox_has_state_at() {
+    local base_url="$1" id="$2" target_state="$3"
+    api_get_at "${base_url}" "/sandboxes/${id}"
+    [[ "$(echo "${HTTP_BODY}" | jq -r '.state // empty' 2>/dev/null)" == "${target_state}" ]]
   }
 
   # Poll until a template build reaches "ready" or "error".
@@ -452,19 +452,14 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
 
   wait_for_template_build() {
     local template_id="$1" timeout="${2:-120}" build_id="${3:-}"
-    local build_status=""
-    for ((i = 0; i < timeout; i++)); do
-      api_get "/templates/${template_id}"
-      build_status="$(_template_build_status_field "$HTTP_BODY")"
-      case "$build_status" in
-        ready) return 0 ;;
-        error)
-          _log_template_build_failure "$AENV_URL" "$template_id" "Template build" "$HTTP_BODY" "$build_id"
-          return 1
-          ;;
-      esac
-      sleep 1
-    done
+    local wait_status
+    if wait_until "${timeout}" _template_build_is_ready_at \
+      "${AENV_URL}" "${template_id}" "${build_id}" "Template build"; then
+      return 0
+    else
+      wait_status=$?
+    fi
+    [[ "${wait_status}" -eq 2 ]] && return 1
     warn "Template build timed out after ${timeout}s"
     _log_template_build_failure "$AENV_URL" "$template_id" "Template build" "$HTTP_BODY" "$build_id"
     return 1
@@ -472,22 +467,32 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
 
   wait_for_template_build_at() {
     local base_url="$1" template_id="$2" timeout="${3:-120}" build_id="${4:-}"
-    local build_status=""
-    for ((i = 0; i < timeout; i++)); do
-      api_get_at "$base_url" "/templates/${template_id}"
-      build_status="$(_template_build_status_field "$HTTP_BODY")"
-      case "$build_status" in
-        ready) return 0 ;;
-        error)
-          _log_template_build_failure "$base_url" "$template_id" "Template build at ${base_url}" "$HTTP_BODY" "$build_id"
-          return 1
-          ;;
-      esac
-      sleep 1
-    done
+    local wait_status
+    if wait_until "${timeout}" _template_build_is_ready_at \
+      "${base_url}" "${template_id}" "${build_id}" "Template build at ${base_url}"; then
+      return 0
+    else
+      wait_status=$?
+    fi
+    [[ "${wait_status}" -eq 2 ]] && return 1
     warn "Template build timed out after ${timeout}s at ${base_url}"
     _log_template_build_failure "$base_url" "$template_id" "Template build at ${base_url}" "$HTTP_BODY" "$build_id"
     return 1
+  }
+
+  _template_build_is_ready_at() {
+    local base_url="$1" template_id="$2" build_id="$3" label="$4"
+    local build_status=""
+    api_get_at "${base_url}" "/templates/${template_id}"
+    build_status="$(_template_build_status_field "$HTTP_BODY")"
+    case "${build_status}" in
+      ready) return 0 ;;
+      error)
+        _log_template_build_failure "${base_url}" "${template_id}" "${label}" "${HTTP_BODY}" "${build_id}"
+        return 2
+        ;;
+      *) return 1 ;;
+    esac
   }
 
   candidate_node_urls() {
