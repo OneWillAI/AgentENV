@@ -214,7 +214,7 @@ impl TemplateBuildRunner {
                     .context("create tokio runtime")?;
                 rt.block_on(async move {
                     let mut sandbox = create_sandbox()?;
-                    let run_result = async {
+                    let run_result: Result<TemplateBuildExecution> = async {
                         debug!(
                             cpu_count = resources.cpu_count,
                             memory_mib = resources.memory_mib,
@@ -302,7 +302,7 @@ fn firecracker_diagnostics(sandbox: &FirecrackerSandbox) -> String {
             String::from_utf8_lossy(&bytes[start..])
         ));
     }
-    Ok(output)
+    output
 }
 
 /// Provision the template's default user when the image does not have it.
