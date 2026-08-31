@@ -168,9 +168,29 @@ impl TemplateBuilder {
                     .map(|failure| failure.reason.clone())
             })
             .unwrap_or_else(|| {
-                TemplateBuildErrorReason::new(
-                    "template build failed while running the build sandbox",
-                )
+                // Preserve the useful part of an unexpected error chain in the
+                // persisted build record.  The old generic fallback made a
+                // failed build impossible to diagnose without server logs.
+                // Keep this bounded and single-line because the reason is also
+                // returned through the public template status API.
+                let message = error
+                    .chain()
+                    .map(ToString::to_string)
+                    .filter(|cause| !cause.trim().is_empty())
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let message = message
+                    .replace(['\r', '\n'], " ")
+                    .chars()
+                    .take(768)
+                    .collect::<String>();
+                let message = if message.is_empty() {
+                    "template build failed while running the build sandbox".to_string()
+                } else {
+                    format!("template build failed while running the build sandbox: {message}")
+                };
+                TemplateBuildErrorReason::with_step(message, "build sandbox")
             })
     }
 
