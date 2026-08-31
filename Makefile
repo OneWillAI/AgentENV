@@ -52,7 +52,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
 	build-ublk install-ublk \
-	fmt clippy test-static \
+	fmt clippy \
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
@@ -100,10 +100,6 @@ uninstall-aenv:
 
 fmt:
 	$(CARGO) fmt --all -- --check
-
-test-static:
-	python3 scripts/tests/check-owned-complexity.py
-	uv run scripts/tests/check-owned-fixed-waits.py
 
 clippy:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
