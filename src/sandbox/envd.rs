@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::sandbox::EnvdAccessToken;
 use envd::filesystem::FilesystemClient;
@@ -15,7 +15,7 @@ use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
 use envd::reqwest::Client;
 
-const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 
 // Bootstrap addresses can be reused across sandbox runtime generations. Do not
 // retain connections that may belong to the previous VM assigned the same IP.
@@ -107,7 +107,11 @@ impl EnvdInstance {
             let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
-                    debug!(base_path = %self.config.base_path, "envd started successfully");
+                    info!(
+                        base_path = %self.config.base_path,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "envd health ready"
+                    );
                     return Ok(());
                 }
                 Ok(Err(error)) => {
@@ -150,7 +154,7 @@ impl EnvdInstance {
             ..Default::default()
         };
         default_api::init_post(&self.config, Some(init_post_request)).await?;
-        debug!("envd initialized");
+        info!("envd initialized");
         Ok(())
     }
 }

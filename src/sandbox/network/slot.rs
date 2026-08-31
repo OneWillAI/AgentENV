@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -516,6 +516,39 @@ impl Slot {
         )
     }
 
+    /// Refresh the guest's neighbor table after snapshot resume.
+    ///
+    /// The guest keeps a REACHABLE ARP entry for the previous TAP MAC. Host
+    /// ARP retransmit was already shortened (issue #272); this sends an ARP
+    /// who-has plus a gratuitous announcement so the guest learns the new
+    /// gateway MAC without waiting for reachable-time expiry (~10s).
+    pub(crate) fn refresh_guest_arp(&self) -> Result<()> {
+        let netns_path = self.namespace_path();
+        let tap_ip = self.address_plan.tap_ip();
+        let vm_ip = self.address_plan.vm_ip();
+        refresh_guest_arp_in(netns_path, tap_ip, vm_ip)
+    }
+
+    /// Keep announcing the new TAP MAC after snapshot resume until virtio-net
+    /// is processing again. The first few frames can be lost; a REACHABLE
+    /// guest neighbor for the previous MAC would otherwise sit for ~10s.
+    pub(crate) fn spawn_guest_arp_refresh(&self) {
+        let netns_path = self.namespace_path();
+        let tap_ip = self.address_plan.tap_ip();
+        let vm_ip = self.address_plan.vm_ip();
+        thread::spawn(move || {
+            for attempt in 0..40 {
+                if let Err(error) = refresh_guest_arp_in(netns_path.clone(), tap_ip, vm_ip) {
+                    // tap0's sysfs node is not visible from the host mount
+                    // immediately after resume. Keep announcing; one missed
+                    // frame must not give up the ~2s refresh window.
+                    warn!(error = %error, attempt, "guest ARP refresh failed");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+
     fn tune_neigh_retrans_time_ms(interface: &str) {
         let retrans_path = format!("/proc/sys/net/ipv4/neigh/{interface}/retrans_time_ms");
 
@@ -870,6 +903,129 @@ impl Drop for Slot {
     }
 }
 
+const ARP_REQUEST: u16 = 1;
+
+fn refresh_guest_arp_in(netns_path: PathBuf, tap_ip: Ipv4Addr, vm_ip: Ipv4Addr) -> Result<()> {
+    let handle = thread::spawn(move || -> Result<()> {
+        let netns = File::open(&netns_path).with_context(|| {
+            format!("failed to open network namespace {}", netns_path.display())
+        })?;
+        nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
+            .context("failed to enter sandbox network namespace for ARP refresh")?;
+        send_arp_on_tap("tap0", ARP_REQUEST, tap_ip, vm_ip)?;
+        send_arp_on_tap("tap0", ARP_REQUEST, tap_ip, tap_ip)?;
+        Ok(())
+    });
+    match handle.join() {
+        Ok(result) => result,
+        Err(e) => Err(anyhow!("ARP refresh thread panicked: {:?}", e)),
+    }
+}
+
+fn parse_mac(value: &str) -> Result<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let parts: Vec<&str> = value.trim().split(':').collect();
+    anyhow::ensure!(parts.len() == 6, "MAC address is invalid: {value}");
+    for (index, part) in parts.iter().enumerate() {
+        mac[index] = u8::from_str_radix(part, 16)
+            .with_context(|| format!("MAC address is invalid: {value}"))?;
+    }
+    Ok(mac)
+}
+
+fn build_arp_frame(sender_mac: [u8; 6], opcode: u16, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> [u8; 42] {
+    let mut frame = [0u8; 42];
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    frame[6..12].copy_from_slice(&sender_mac);
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    frame[14..16].copy_from_slice(&1u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&opcode.to_be_bytes());
+    frame[22..28].copy_from_slice(&sender_mac);
+    frame[28..32].copy_from_slice(&sender_ip.octets());
+    frame[38..42].copy_from_slice(&target_ip.octets());
+    frame
+}
+
+fn tap_mac_and_index(interface: &str) -> Result<([u8; 6], i32)> {
+    // ioctl after setns sees tap0 in this netns. Host /sys/class/net has no
+    // tap0, so reading sysfs here is ENOENT and the refresh never runs.
+    anyhow::ensure!(
+        !interface.is_empty() && interface.len() < libc::IFNAMSIZ,
+        "interface name is invalid: {interface}"
+    );
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open ioctl socket for tap identity");
+    }
+    let _owned = unsafe { File::from_raw_fd(fd) };
+    let c_name = std::ffi::CString::new(interface)
+        .with_context(|| format!("interface name is invalid: {interface}"))?;
+    let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if ifindex == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("resolve {interface} ifindex"));
+    }
+    let mut req = unsafe { std::mem::zeroed::<libc::ifreq>() };
+    for (index, byte) in interface.as_bytes().iter().enumerate() {
+        req.ifr_name[index] = *byte as libc::c_char;
+    }
+    if unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR, &mut req) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("resolve {interface} MAC"));
+    }
+    let data = unsafe { req.ifr_ifru.ifru_hwaddr.sa_data };
+    Ok((
+        [
+            data[0] as u8,
+            data[1] as u8,
+            data[2] as u8,
+            data[3] as u8,
+            data[4] as u8,
+            data[5] as u8,
+        ],
+        ifindex as i32,
+    ))
+}
+
+fn send_arp_on_tap(interface: &str, opcode: u16, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Result<()> {
+    let (mac, ifindex) = tap_mac_and_index(interface)?;
+    let frame = build_arp_frame(mac, opcode, sender_ip, target_ip);
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            (libc::ETH_P_ARP as u16).to_be() as libc::c_int,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open AF_PACKET socket");
+    }
+    let _owned = unsafe { File::from_raw_fd(fd) };
+    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_ll>() };
+    addr.sll_family = libc::AF_PACKET as libc::c_ushort;
+    addr.sll_protocol = (libc::ETH_P_ARP as u16).to_be();
+    addr.sll_ifindex = ifindex;
+    addr.sll_halen = 6;
+    addr.sll_addr[..6].copy_from_slice(&mac);
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            frame.as_ptr().cast(),
+            frame.len(),
+            0,
+            std::ptr::addr_of!(addr).cast(),
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        )
+    };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error()).context("send ARP on tap0");
+    }
+    Ok(())
+}
+
 fn resolve_guest_dns_server() -> Ipv4Addr {
     for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
         if let Ok(contents) = fs::read_to_string(path) {
@@ -1037,6 +1193,43 @@ mod tests {
             search example.com
         "#;
         assert_eq!(parse_nameserver_ipv4(conf), None);
+    }
+
+    #[test]
+    fn build_arp_frame_is_a_broadcast_who_has() {
+        let mac = [0x0a, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let frame = build_arp_frame(
+            mac,
+            ARP_REQUEST,
+            Ipv4Addr::new(169, 254, 0, 22),
+            Ipv4Addr::new(169, 254, 0, 21),
+        );
+        assert_eq!(&frame[0..6], &[0xff; 6]);
+        assert_eq!(&frame[6..12], &mac);
+        assert_eq!(&frame[12..14], &[0x08, 0x06]);
+        assert_eq!(&frame[20..22], &[0x00, 0x01]);
+        assert_eq!(&frame[22..28], &mac);
+        assert_eq!(&frame[28..32], &[169, 254, 0, 22]);
+        assert_eq!(&frame[32..38], &[0u8; 6]);
+        assert_eq!(&frame[38..42], &[169, 254, 0, 21]);
+    }
+
+    #[test]
+    fn parse_mac_reads_colon_hex() {
+        assert_eq!(
+            parse_mac("0a:00:00:00:00:01\n").unwrap(),
+            [0x0a, 0x00, 0x00, 0x00, 0x00, 0x01]
+        );
+    }
+
+    #[test]
+    fn tap_mac_and_index_uses_ioctl_not_host_sysfs() {
+        let error = tap_mac_and_index("tap-missing-for-arp-test").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ifindex"),
+            "ioctl path must report a missing tap in this netns: {message}"
+        );
     }
 
     #[test]

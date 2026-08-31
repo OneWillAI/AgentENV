@@ -12,7 +12,8 @@ use crate::virtualization::VirtualizationMode;
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
     CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister,
-    FileBackedSandboxPersister, PersistenceResult, SandboxPersistenceError, SandboxPersister,
+    FileBackedSandboxPersister, PausedSandboxQuarantine, PausedSandboxRecoveryReport,
+    PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
@@ -67,6 +68,11 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         state: SandboxState,
     },
+
+    #[error(
+        "sandbox {sandbox_id} has an interrupted resume from the current host boot; reboot this worker before retrying"
+    )]
+    SandboxRecoveryRequired { sandbox_id: SandboxId },
 
     #[error("sandbox {sandbox_id} operation {operation:?} failed: {source}")]
     SandboxOperationFailed {

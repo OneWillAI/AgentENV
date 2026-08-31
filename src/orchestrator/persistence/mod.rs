@@ -10,7 +10,9 @@ use crate::orchestrator::store::SandboxMetadata;
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 
-pub use file_backed::FileBackedSandboxPersister;
+pub use file_backed::{
+    FileBackedSandboxPersister, PausedSandboxQuarantine, PausedSandboxRecoveryReport,
+};
 #[cfg(test)]
 pub(crate) use mock::{RecordingCall, RecordingPersister};
 
@@ -63,6 +65,26 @@ pub enum SandboxPersistenceError {
         #[source]
         source: anyhow::Error,
     },
+    /// A durable write may have reached storage even though the caller saw an
+    /// error.  Callers must leave the snapshot in place and route the sandbox
+    /// through recovery rather than attempting a resume or cleanup.
+    #[error("paused sandbox persistence commit is uncertain for {sandbox_id}: {reason}")]
+    UncertainCommit {
+        sandbox_id: SandboxId,
+        reason: String,
+        #[source]
+        source: Option<anyhow::Error>,
+    },
+    /// The paused tree is preserved in the host-local quarantine. Automatic
+    /// delete/startup cleanup must not erase it, and startup must not treat
+    /// this as a reason to refuse to boot the worker.
+    #[error("paused sandbox {sandbox_id} requires host-local recovery: {reason}")]
+    ManualRecoveryRequired {
+        sandbox_id: SandboxId,
+        reason: String,
+        #[source]
+        source: Option<anyhow::Error>,
+    },
 }
 
 impl SandboxPersistenceError {
@@ -80,6 +102,26 @@ impl SandboxPersistenceError {
 
     pub(super) fn store(operation: &'static str, source: anyhow::Error) -> Self {
         Self::Store { operation, source }
+    }
+
+    pub fn is_uncertain_commit(&self) -> bool {
+        matches!(self, Self::UncertainCommit { .. })
+    }
+
+    pub fn requires_explicit_purge(&self) -> bool {
+        matches!(self, Self::ManualRecoveryRequired { .. })
+    }
+
+    pub(super) fn manual_recovery(
+        sandbox_id: SandboxId,
+        reason: impl Into<String>,
+        source: Option<anyhow::Error>,
+    ) -> Self {
+        Self::ManualRecoveryRequired {
+            sandbox_id,
+            reason: reason.into(),
+            source,
+        }
     }
 }
 

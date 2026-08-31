@@ -413,13 +413,38 @@ where
                 CreateIdempotencyRecordState::Deleting => {
                     // `Deleting` is written only after runtime stop succeeds.
                     // Completing both durable removals proves absence before the
-                    // key can be released.
-                    persister
+                    // key can be released. Leftover files that cannot be proven
+                    // safe to erase stay in host-local quarantine; that is an
+                    // operator recovery item, not a reason to refuse boot.
+                    match persister
                         .delete_record_and_artifacts(&record.sandbox_id)
-                        .await?;
-                    persister.delete_create_idempotency_record(key).await?;
-                    deleting_keys.insert(key.clone());
-                    deleting_sandboxes.insert(record.sandbox_id);
+                        .await
+                    {
+                        Ok(()) => {
+                            persister.delete_create_idempotency_record(key).await?;
+                            deleting_keys.insert(key.clone());
+                            deleting_sandboxes.insert(record.sandbox_id);
+                        }
+                        Err(error) if error.requires_explicit_purge() => {
+                            warn!(
+                                sandbox_id = %record.sandbox_id,
+                                error = %error,
+                                "paused sandbox delete at startup left artifacts in host-local quarantine; releasing the create key"
+                            );
+                            persister.delete_create_idempotency_record(key).await?;
+                            deleting_keys.insert(key.clone());
+                            deleting_sandboxes.insert(record.sandbox_id);
+                        }
+                        Err(error) => {
+                            warn!(
+                                sandbox_id = %record.sandbox_id,
+                                error = %error,
+                                "paused sandbox delete at startup could not finish; retaining a failed create-key tombstone"
+                            );
+                            record.state = CreateIdempotencyRecordState::Failed;
+                            persister.persist_create_idempotency_record(record).await?;
+                        }
+                    }
                 }
                 CreateIdempotencyRecordState::Creating => {
                     // No paused sandbox corroborated this interrupted create.
@@ -1348,15 +1373,21 @@ where
         // failed while removing durable state. Its metadata is intentionally
         // gone, but the in-memory Deleting tombstone allows an exact retry to
         // finish cleanup without releasing the key early.
-        if self.store.get(&sandbox_id).await?.is_none() {
-            if let Some((key, entry)) = self.deleting_create_for_sandbox(sandbox_id).await {
-                self.finish_durable_sandbox_delete(&key, &entry).await?;
-                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-                    .await;
-                info!("sandbox delete cleanup completed");
-                return Ok(());
+        match self.store.get(&sandbox_id).await? {
+            Some(metadata) if metadata.resume_recovery_pending => {
+                return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
             }
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+            Some(_) => {}
+            None => {
+                if let Some((key, entry)) = self.deleting_create_for_sandbox(sandbox_id).await {
+                    self.finish_durable_sandbox_delete(&key, &entry).await?;
+                    self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                        .await;
+                    info!("sandbox delete cleanup completed");
+                    return Ok(());
+                }
+                return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+            }
         }
 
         // Attempt to transition to Killing, retrying after waiting whenever we
@@ -1673,6 +1704,7 @@ where
                             .get(&sandbox_id)
                             .await?
                             .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                        Self::require_resume_recovery_resolved(&metadata)?;
                         Self::require_idempotent_paused_stop_proof(&metadata)
                     }
                     SandboxState::Killing => {
@@ -1817,6 +1849,27 @@ where
             .await
         {
             warn!(error = ?err, "failed to persist paused sandbox state");
+            if err.is_uncertain_commit() {
+                // A durable manifest may exist even though the RocksDB index
+                // write reported an error.  Do not resume the paused VM (or
+                // delete its snapshot): retain the artifacts and expose the
+                // existing recovery-pending guard until startup/admin
+                // reconciliation can prove the record is coherent.
+                let mut recovery_metadata = persisted_metadata.clone();
+                recovery_metadata.resume_recovery_pending = true;
+                recovery_metadata.paused_runtime_stopped = false;
+                if let Err(store_error) = self.store.update(recovery_metadata).await {
+                    warn!(error = ?store_error, "failed to mark uncertain paused sandbox recovery-pending");
+                }
+                let stop_result = {
+                    let mut sandbox = handle.lock().await;
+                    sandbox.stop().await
+                };
+                if let Err(stop_error) = stop_result {
+                    warn!(error = ?stop_error, "failed to stop sandbox after uncertain paused-state commit");
+                }
+                return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+            }
             let resume_result = {
                 let mut sandbox = handle.lock().await;
                 sandbox.resume().await
@@ -1863,9 +1916,26 @@ where
         };
         match stop_result {
             Ok(()) => {
-                self.persister
+                if let Err(err) = self
+                    .persister
                     .mark_paused_runtime_stopped(&sandbox_id)
-                    .await?;
+                    .await
+                {
+                    if err.is_uncertain_commit() {
+                        if let Err(store_error) = self
+                            .store
+                            .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
+                                metadata.paused_runtime_stopped = false;
+                                metadata.resume_recovery_pending = true;
+                            })
+                            .await
+                        {
+                            warn!(error = ?store_error, "failed to mark paused sandbox recovery-pending after uncertain stop proof");
+                        }
+                        return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+                    }
+                    return Err(OrchestratorError::from(err));
+                }
                 self.store
                     .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
                         metadata.paused_runtime_stopped = true;
@@ -1895,6 +1965,15 @@ where
                 "cannot use paused sandbox {}: durable runtime stop proof is unavailable",
                 metadata.id
             )));
+        }
+        Ok(())
+    }
+
+    fn require_resume_recovery_resolved(metadata: &SandboxMetadata) -> Result<()> {
+        if metadata.resume_recovery_pending {
+            return Err(OrchestratorError::SandboxRecoveryRequired {
+                sandbox_id: metadata.id,
+            });
         }
         Ok(())
     }
@@ -1944,6 +2023,8 @@ where
                 .wait_for_transition(sandbox_id, SandboxState::Resuming)
                 .await?;
         }
+
+        Self::require_resume_recovery_resolved(&metadata)?;
 
         match metadata.state {
             SandboxState::Killing => {
@@ -2009,13 +2090,18 @@ where
 
         if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
             warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
+            let uncertain_commit = err.is_uncertain_commit();
             let _ = self
                 .store
                 .update_if_state(&sandbox_id, &[SandboxState::Resuming], |metadata| {
                     metadata.state = SandboxState::Paused;
                     metadata.paused_runtime_stopped = prior_paused_stop_proof;
+                    metadata.resume_recovery_pending = uncertain_commit;
                 })
                 .await;
+            if uncertain_commit {
+                return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+            }
             return Err(OrchestratorError::InternalError(format!(
                 "failed to mark persisted sandbox record as resuming: {err:#}"
             )));
@@ -2889,6 +2975,18 @@ where
                     Ok(()) => true,
                     Err(err) => {
                         warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
+                        if err.is_uncertain_commit() {
+                            // The rollback write may have committed despite
+                            // its error. Never carry forward an in-memory
+                            // stop proof or let a later resume/delete treat
+                            // the snapshot as safe until host recovery has
+                            // reconciled the durable marker.
+                            self.mark_resume_recovery_pending_after_launch_rollback(
+                                plan.sandbox_id(),
+                                expected_state,
+                            )
+                            .await;
+                        }
                         false
                     }
                 };
@@ -2913,10 +3011,43 @@ where
                         }
                         Err(err) => {
                             warn!(error = %format_args!("{err:#}"), "failed to restore durable paused runtime stop proof after launch rollback");
+                            if err.is_uncertain_commit() {
+                                self.mark_resume_recovery_pending_after_launch_rollback(
+                                    plan.sandbox_id(),
+                                    expected_state,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+
+    async fn mark_resume_recovery_pending_after_launch_rollback(
+        &self,
+        sandbox_id: SandboxId,
+        expected_state: SandboxState,
+    ) {
+        if let Err(error) = self
+            .store
+            .update_if_state(
+                &sandbox_id,
+                &[SandboxState::Paused, SandboxState::Resuming, expected_state],
+                |metadata| {
+                    metadata.state = SandboxState::Paused;
+                    metadata.paused_runtime_stopped = false;
+                    metadata.resume_recovery_pending = true;
+                },
+            )
+            .await
+        {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %format_args!("{error:#}"),
+                "failed to mark paused sandbox recovery-pending after uncertain launch rollback"
+            );
         }
     }
 
