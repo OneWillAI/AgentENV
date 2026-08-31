@@ -579,10 +579,13 @@ impl Slot {
         }
     }
 
-    /// Keep announcing the new TAP MAC after snapshot resume until virtio-net
-    /// is processing again. A single worker enters the namespace once and
-    /// owns the bounded repair window; fresh boots never need this repair.
-    pub(crate) fn spawn_resume_arp_refresh(&self) {
+    /// Keep announcing the TAP MAC until the guest can answer readiness.
+    ///
+    /// Both a fresh boot and a snapshot resume can drop the first frame while
+    /// virtio-net comes online.  The readiness boundary starts exactly one
+    /// cancellable worker, so callers do not create separate boot and resume
+    /// loops or keep polling after the sandbox is torn down.
+    pub(crate) fn spawn_readiness_arp_refresh(&self) {
         let netns_path = self.namespace_path();
         let tap_ip = self.address_plan.tap_ip();
         let vm_ip = self.address_plan.vm_ip();

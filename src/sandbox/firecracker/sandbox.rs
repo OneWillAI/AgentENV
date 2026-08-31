@@ -599,6 +599,7 @@ impl FirecrackerSandbox {
             if let Err(error) = slot.refresh_guest_arp_once() {
                 warn!(error = %error, "failed to announce guest ARP before envd health");
             }
+            slot.spawn_readiness_arp_refresh();
         }
         let health_started = Instant::now();
         envd_instance
@@ -1608,9 +1609,6 @@ impl FirecrackerSandbox {
             .context("reconcile disk rate limiter on snapshot resume")?;
 
         self.fc_instance.resume().await?;
-        if let Some(slot) = self.network_slot.as_ref() {
-            slot.spawn_resume_arp_refresh();
-        }
 
         debug!("sandbox restored from snapshot config");
         Ok(())
