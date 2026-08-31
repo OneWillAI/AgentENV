@@ -557,6 +557,28 @@ impl Slot {
         )
     }
 
+    /// Announce the TAP identity once before the first envd health probe.
+    ///
+    /// Fresh boots normally learn it during guest network setup, but the first
+    /// packet can race virtio-net on slower image starts.  This synchronous
+    /// nudge is deliberately separate from the bounded resume repair worker:
+    /// ordinary boots get no background polling and snapshot resumes retain
+    /// their short cancellable repair window.
+    pub(crate) fn refresh_guest_arp_once(&self) -> Result<()> {
+        let netns_path = self.namespace_path();
+        let tap_ip = self.address_plan.tap_ip();
+        let vm_ip = self.address_plan.vm_ip();
+        let handle = thread::spawn(move || -> Result<()> {
+            let _netns = enter_network_namespace(&netns_path)?;
+            send_arp_request_on_tap("tap0", tap_ip, vm_ip)?;
+            send_arp_request_on_tap("tap0", tap_ip, tap_ip)
+        });
+        match handle.join() {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("ARP refresh thread panicked: {error:?}")),
+        }
+    }
+
     /// Keep announcing the new TAP MAC after snapshot resume until virtio-net
     /// is processing again. A single worker enters the namespace once and
     /// owns the bounded repair window; fresh boots never need this repair.
@@ -937,10 +959,7 @@ fn refresh_guest_arp_in(
     vm_ip: Ipv4Addr,
     cancellation: &ArpRefreshCancellation,
 ) -> Result<()> {
-    let netns = File::open(&netns_path)
-        .with_context(|| format!("failed to open network namespace {}", netns_path.display()))?;
-    nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
-        .context("failed to enter sandbox network namespace for ARP refresh")?;
+    let _netns = enter_network_namespace(&netns_path)?;
 
     for attempt in 0..40 {
         if cancellation.is_cancelled() {
@@ -961,6 +980,14 @@ fn refresh_guest_arp_in(
         }
     }
     Ok(())
+}
+
+fn enter_network_namespace(netns_path: &PathBuf) -> Result<File> {
+    let netns = File::open(netns_path)
+        .with_context(|| format!("failed to open network namespace {}", netns_path.display()))?;
+    nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
+        .context("failed to enter sandbox network namespace for ARP refresh")?;
+    Ok(netns)
 }
 
 fn build_arp_request_frame(

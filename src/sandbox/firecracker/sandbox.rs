@@ -595,6 +595,11 @@ impl FirecrackerSandbox {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
+        if let Some(slot) = self.network_slot.as_ref() {
+            if let Err(error) = slot.refresh_guest_arp_once() {
+                warn!(error = %error, "failed to announce guest ARP before envd health");
+            }
+        }
         let health_started = Instant::now();
         envd_instance
             .wait_for_ready(
