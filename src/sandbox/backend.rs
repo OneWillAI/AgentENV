@@ -259,6 +259,11 @@ pub trait SandboxBackend: Send + 'static {
     /// patch-params hook is invoked by the caller (orchestrator layer), not
     /// by the backend. Cannot fail.
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>);
+
+    /// Copy the writable disk into `output_dir` and return an overlaybd image
+    /// config the next cold-create can boot. This must not copy RAM or
+    /// processes. The source sandbox stays running.
+    async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf>;
 }
 
 /// Factory interface for creating and restoring sandbox backend instances.

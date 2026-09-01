@@ -91,6 +91,9 @@ impl ImageResolver {
     }
 
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        if let Some(path) = image_ref.trim().strip_prefix("overlaybd-config:") {
+            return resolve_overlaybd_config_ref(path);
+        }
         let candidates = image_ref_candidates(
             image_ref,
             &self.search_registries,
@@ -328,6 +331,38 @@ impl ImageResolver {
             image_config_metadata,
         ))
     }
+}
+
+fn resolve_overlaybd_config_ref(path: &str) -> ImageResult<ResolvedBlockImage> {
+    let requested = PathBuf::from(path.trim());
+    if !requested.is_absolute() {
+        return Err(ImageError::InvalidReference {
+            reason: "overlaybd-config path must be absolute".to_string(),
+        });
+    }
+    let metadata = std::fs::metadata(&requested).map_err(|_| ImageError::NotFound {
+        reason: format!("overlaybd-config '{}' was not found", requested.display()),
+    })?;
+    if !metadata.is_file() {
+        return Err(ImageError::InvalidReference {
+            reason: "overlaybd-config path must be a file".to_string(),
+        });
+    }
+    let canonical = requested.canonicalize().map_err(|error| {
+        ImageError::Other(anyhow!("canonicalize overlaybd-config path: {error}"))
+    })?;
+    let as_text = canonical.to_string_lossy();
+    if !as_text.contains("/disk-branches/") && !as_text.contains("\\disk-branches\\") {
+        return Err(ImageError::InvalidReference {
+            reason: "overlaybd-config path is outside the disk-branch directory".to_string(),
+        });
+    }
+    Ok(ResolvedBlockImage {
+        image_ref: format!("overlaybd-config:{}", canonical.display()),
+        overlaybd_config_path: canonical,
+        base_context: ImageBaseContext::default(),
+        raw_config: None,
+    })
 }
 
 fn resolved_from_cached_config(

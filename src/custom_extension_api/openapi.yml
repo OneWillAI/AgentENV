@@ -144,6 +144,14 @@ components:
           type: string
           format: ipv4
           description: Per-runtime host interaction address routed to this sandbox.
+        firecrackerPid:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >
+            Firecracker process ID after the microVM process exists and before
+            it is started. Present so the extension can place the VM in a
+            lineage cgroup.
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
 

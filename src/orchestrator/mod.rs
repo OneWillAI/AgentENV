@@ -39,6 +39,7 @@ pub enum SandboxOperation {
     Resume,
     Snapshot,
     Fork,
+    DiskBranch,
     UpdateNetwork,
     PatchCustomExtensionParams,
     Stop,

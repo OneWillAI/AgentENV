@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -1023,6 +1024,72 @@ where
                 .await
         })
         .await
+    }
+
+    /// Copy a running sandbox's writable disk without cloning RAM or processes.
+    pub async fn branch_sandbox_disk(
+        self: &Arc<Self>,
+        source_sandbox_id: SandboxId,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("disk-branch", source_sandbox_id, async move {
+            this.branch_sandbox_disk_inner(source_sandbox_id, idempotency_key)
+                .await
+        })
+        .await
+    }
+
+    async fn branch_sandbox_disk_inner(
+        self: Arc<Self>,
+        source_sandbox_id: SandboxId,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
+        self.ensure_accepting_lifecycle_operations()?;
+        let metadata = self
+            .store
+            .get(&source_sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id: source_sandbox_id,
+                state: metadata.state,
+            });
+        }
+        let branch_id = disk_branch_id(idempotency_key.as_deref(), source_sandbox_id);
+        let output_dir = disk_branch_root().join(&branch_id);
+        let marker = output_dir.join("branch.ref");
+        if let Ok(image) = tokio::fs::read_to_string(&marker).await {
+            let image = image.trim();
+            if !image.is_empty() {
+                return Ok(image.to_string());
+            }
+        }
+        let handle = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&source_sandbox_id).cloned()
+        }
+        .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        let image_config = {
+            let mut sandbox = handle.lock().await;
+            sandbox.branch_disk(&output_dir).await.map_err(|source| {
+                OrchestratorError::SandboxOperationFailed {
+                    sandbox_id: source_sandbox_id,
+                    operation: SandboxOperation::DiskBranch,
+                    source,
+                }
+            })?
+        };
+        let image = overlaybd_config_image_ref(&image_config);
+        if let Err(error) = tokio::fs::write(&marker, &image).await {
+            warn!(
+                error = %error,
+                path = %marker.display(),
+                "failed to persist disk-branch replay marker"
+            );
+        }
+        Ok(image)
     }
 
     #[tracing::instrument(
@@ -3517,6 +3584,37 @@ fn resources_with_runtime_info(
         resources.disk_size_mib = bytes_to_mib_ceil(size);
     }
     resources
+}
+
+const OVERLAYBD_CONFIG_IMAGE_PREFIX: &str = "overlaybd-config:";
+
+fn disk_branch_root() -> PathBuf {
+    ConfigManager::global_config()
+        .firecracker
+        .work_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("aenv"))
+        .join("managed-snapshots")
+        .join("disk-branches")
+}
+
+fn disk_branch_id(idempotency_key: Option<&str>, sandbox_id: SandboxId) -> String {
+    let raw = idempotency_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| sandbox_id.to_string());
+    raw.chars()
+        .map(|char| match char {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => char,
+            _ => '_',
+        })
+        .take(128)
+        .collect()
+}
+
+fn overlaybd_config_image_ref(path: &std::path::Path) -> String {
+    format!("{OVERLAYBD_CONFIG_IMAGE_PREFIX}{}", path.display())
 }
 
 fn configured_runtime_versions() -> SnapshotRuntimeVersions {
