@@ -12,9 +12,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::codecs::{
-    decode_record, decode_stored_paused_entry, sha256_hex, ManifestEntry, PersistedPausedIndex,
-    PersistedPausedRecord, StoredPausedEntry, LEGACY_RECORD_VERSION, PAUSED_INDEX_VERSION,
-    PAUSED_MANIFEST_FILE, PAUSED_MANIFEST_VERSION, PAUSED_RECOVERY_MARKER_FILE, QUARANTINE_VERSION,
+    decode_paused_index, decode_record, sha256_hex, ManifestEntry, PersistedPausedIndex,
+    PersistedPausedRecord, PAUSED_INDEX_VERSION, PAUSED_MANIFEST_FILE, PAUSED_MANIFEST_VERSION,
+    PAUSED_RECOVERY_MARKER_FILE, QUARANTINE_VERSION,
 };
 use super::paused_transactions::{
     PersistedPausedCommitState, PersistedPausedLifecycle, StopProofReconciliation,
@@ -35,16 +35,13 @@ use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
-/// Version one records live directly in RocksDB.  They remain readable so
-/// existing paused sandboxes survive the upgrade, but every new write uses a
-/// manifest and a small RocksDB index entry instead.
 const RECORD_DB_DIR: &str = "records.db";
 const QUARANTINE_DB_DIR: &str = "quarantine.db";
 const CREATE_IDEMPOTENCY_DB_DIR: &str = "create-idempotency.db";
 
 /// A changed Linux boot ID proves any Firecracker child from an interrupted
 /// prior AgentENV process cannot still be alive. Missing boot IDs deliberately
-/// provide no proof, including for legacy records written before this field.
+/// provide no proof.
 fn host_reboot_proves_runtime_absent(
     recorded_boot_id: Option<&str>,
     current_boot_id: Option<&str>,
@@ -198,28 +195,10 @@ impl FileBackedSandboxPersister {
         super::managed_paths::validated_sandbox_root_path(&self.root, sandbox_id, path)
     }
 
-    /// Version-one records were created by the same allocator used today:
-    /// `<store>/artifacts/<sandbox-id>/<generation>`.  Keep this separate
-    /// policy boundary even though the historical layout is currently the
-    /// same as v2, so accepting a legacy record never relaxes the v2 path
-    /// contract or permits an arbitrary old path to be deleted.
-    fn validated_legacy_artifact_root(
-        &self,
-        sandbox_id: &SandboxId,
-        path: &Path,
-    ) -> Option<PathBuf> {
-        self.validated_managed_generation_path(sandbox_id, path)
-    }
-
-    fn path_is_valid_legacy_artifact_root(&self, sandbox_id: &SandboxId, path: &Path) -> bool {
-        self.validated_legacy_artifact_root(sandbox_id, path)
-            .is_some()
-    }
-
     /// A raw index can be replaced only when a fully valid, same-ID v2
     /// manifest already exists.  Preserve the raw bytes in quarantine first.
-    /// Recognizable but conflicting identities, unsupported formats, and
-    /// legacy records remain blocking rather than being silently superseded.
+    /// Recognizable but conflicting identities and unsupported formats remain
+    /// blocking rather than being silently superseded.
     fn raw_index_can_be_rebuilt_from_manifest(
         bytes: &[u8],
         sandbox_id: &SandboxId,
@@ -232,24 +211,19 @@ impl FileBackedSandboxPersister {
             return true;
         };
 
-        let Some(index_version) = object.get("indexVersion") else {
-            // A recognizable persisted record is never an index-repair
-            // candidate, even if it is malformed or unsupported.
-            return object.get("version").is_none();
-        };
-        match index_version.as_u64() {
-            Some(version) if version != u64::from(PAUSED_INDEX_VERSION) => return false,
-            // A string, null, or other malformed representation is damaged
-            // index data. Continue checking any identity fields before using
-            // the coherent v2 manifest as the repair source.
-            Some(_) | None => {}
+        if let Some(index_version) = object.get("indexVersion") {
+            match index_version.as_u64() {
+                Some(version) if version != u64::from(PAUSED_INDEX_VERSION) => return false,
+                // A malformed version is damaged index data. Continue checking
+                // any identity fields before using the coherent manifest.
+                Some(_) | None => {}
+            }
         }
         if let Some(raw_sandbox_id) = object.get("sandboxId").and_then(Value::as_str) {
             match SandboxId::parse_str(raw_sandbox_id) {
                 Ok(index_sandbox_id) if index_sandbox_id == *sandbox_id => {}
                 Ok(_) => return false,
-                // This is malformed raw index data, not a declared foreign
-                // identity. The coherent manifest remains authoritative.
+                // Malformed index data does not override the coherent manifest.
                 Err(_) => {}
             }
         }
@@ -775,21 +749,8 @@ impl FileBackedSandboxPersister {
                 reason: format!("paused sandbox record {sandbox_id} not found"),
                 source: None,
             })?;
-        match decode_stored_paused_entry(&bytes)? {
-            StoredPausedEntry::Legacy(record) => {
-                if record.metadata.id != *sandbox_id {
-                    return Err(SandboxPersistenceError::InvalidRecord {
-                        reason: format!(
-                            "paused sandbox record key {sandbox_id} contains metadata for {}",
-                            record.metadata.id
-                        ),
-                        source: None,
-                    });
-                }
-                Ok(record)
-            }
-            StoredPausedEntry::Index(index) => self.resolve_index(sandbox_id, &index).await,
-        }
+        let index = decode_paused_index(&bytes)?;
+        self.resolve_index(sandbox_id, &index).await
     }
 
     async fn resolve_index(
@@ -1155,34 +1116,6 @@ impl FileBackedSandboxPersister {
         Ok(())
     }
 
-    /// Preserve legacy v1 storage while adding the boot observation used for
-    /// safe stop-proof migration. Older binaries continue to see the same v1
-    /// record shape; v2 records keep their manifest/index transaction.
-    async fn persist_reconciled_record(
-        &self,
-        record: &PersistedPausedRecord,
-    ) -> PersistenceResult<()> {
-        if record.version != LEGACY_RECORD_VERSION {
-            return self.put_record(record).await;
-        }
-        let bytes = serde_json::to_vec(record).map_err(|source| {
-            SandboxPersistenceError::InvalidRecord {
-                reason: "failed to serialize reconciled legacy paused sandbox record".to_string(),
-                source: Some(source.into()),
-            }
-        })?;
-        self.db()
-            .await?
-            .put(record.metadata.id.to_string(), bytes)
-            .await
-            .map_err(|source| {
-                SandboxPersistenceError::store(
-                    "persist reconciled legacy paused sandbox record",
-                    source,
-                )
-            })
-    }
-
     async fn remove_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         self.db()
             .await?
@@ -1394,10 +1327,7 @@ impl FileBackedSandboxPersister {
     /// Find manifest generations without following symlinks.  A directory
     /// without a manifest is intentionally not an orphan to delete: it is a
     /// recovery candidate and is indexed in quarantine instead.
-    async fn scan_manifests(
-        &self,
-        legacy_artifact_roots: &HashSet<PathBuf>,
-    ) -> PersistenceResult<(Vec<ManifestEntry>, usize)> {
+    async fn scan_manifests(&self) -> PersistenceResult<(Vec<ManifestEntry>, usize)> {
         let artifacts_root = self.artifacts_root();
         let mut manifests = Vec::new();
         let mut quarantined = 0;
@@ -1485,12 +1415,6 @@ impl FileBackedSandboxPersister {
                 {
                     continue;
                 }
-                if stdfs::canonicalize(&generation_path)
-                    .ok()
-                    .is_some_and(|path| legacy_artifact_roots.contains(&path))
-                {
-                    continue;
-                }
                 self.quarantine(
                     "markerless paused sandbox artifact generation",
                     None,
@@ -1532,10 +1456,7 @@ impl FileBackedSandboxPersister {
                 let key_id = std::str::from_utf8(key)
                     .ok()
                     .and_then(|value| SandboxId::parse_str(value).ok())?;
-                let StoredPausedEntry::Index(index) = decode_stored_paused_entry(bytes).ok()?
-                else {
-                    return None;
-                };
+                let index = decode_paused_index(bytes).ok()?;
                 (index.sandbox_id == key_id).then_some((key_id, index))
             })
             .collect()
@@ -1635,67 +1556,6 @@ impl FileBackedSandboxPersister {
                 });
             };
             Self::remove_artifact_root(&path).await?;
-        }
-        Ok(())
-    }
-
-    async fn reconcile_legacy_index_entry(
-        &self,
-        key_id: Option<SandboxId>,
-        key: &[u8],
-        bytes: &[u8],
-        record: PersistedPausedRecord,
-        candidates: &HashMap<SandboxId, ManifestEntry>,
-        recovery_blocks: &PausedRecoveryBlocks,
-        legacy: &mut Vec<PersistedPausedRecord>,
-        blocked: &mut HashSet<SandboxId>,
-        report: &mut PausedSandboxRecoveryReport,
-    ) -> PersistenceResult<()> {
-        let sandbox_id = record.metadata.id;
-        if key_id != Some(sandbox_id) {
-            self.quarantine(
-                "legacy paused sandbox record key does not match metadata",
-                Some(key),
-                Some(bytes),
-                None,
-                None,
-            )
-            .await?;
-            report.quarantined_items += 1;
-        } else if let Some(candidate) = candidates.get(&sandbox_id) {
-            self.quarantine(
-                "legacy paused sandbox record conflicts with a v2 manifest",
-                Some(key),
-                Some(bytes),
-                Some(&record.artifact_root),
-                None,
-            )
-            .await?;
-            self.quarantine(
-                "v2 paused sandbox manifest conflicts with a legacy record",
-                None,
-                None,
-                Some(&candidate.record.artifact_root),
-                Some(&candidate.path),
-            )
-            .await?;
-            report.quarantined_items += 2;
-            blocked.insert(sandbox_id);
-        } else if !self.path_is_valid_legacy_artifact_root(&sandbox_id, &record.artifact_root) {
-            self.quarantine(
-                "legacy paused sandbox record references an unsafe artifact path",
-                Some(key),
-                Some(bytes),
-                Some(&record.artifact_root),
-                None,
-            )
-            .await?;
-            report.quarantined_items += 1;
-            blocked.insert(sandbox_id);
-        } else if recovery_blocks.contains_record(&sandbox_id, &record.artifact_root) {
-            blocked.insert(sandbox_id);
-        } else {
-            legacy.push(record);
         }
         Ok(())
     }
@@ -1875,35 +1735,12 @@ impl FileBackedSandboxPersister {
     async fn reconcile_manifest_index(
         &self,
         allow_manual_recovery: bool,
-    ) -> PersistenceResult<(
-        Vec<PersistedPausedRecord>,
-        Vec<PersistedPausedRecord>,
-        PausedSandboxRecoveryReport,
-    )> {
+    ) -> PersistenceResult<(Vec<PersistedPausedRecord>, PausedSandboxRecoveryReport)> {
         let entries = self.db().await?.entries().await.map_err(|source| {
             SandboxPersistenceError::store("scan paused sandbox records", source)
         })?;
 
-        // A valid v1 record is still the source of truth for its snapshot
-        // tree. Discover it before looking for markerless generations so the
-        // migration scanner never quarantines a valid legacy pause.
-        let legacy_artifact_roots = entries
-            .iter()
-            .filter_map(|(key, bytes)| {
-                let key_id = std::str::from_utf8(key)
-                    .ok()
-                    .and_then(|value| SandboxId::parse_str(value).ok())?;
-                let StoredPausedEntry::Legacy(record) = decode_stored_paused_entry(bytes).ok()?
-                else {
-                    return None;
-                };
-                (record.metadata.id == key_id
-                    && self.path_is_valid_legacy_artifact_root(&key_id, &record.artifact_root))
-                .then(|| stdfs::canonicalize(record.artifact_root).ok())
-                .flatten()
-            })
-            .collect::<HashSet<_>>();
-        let (manifests, mut quarantined) = self.scan_manifests(&legacy_artifact_roots).await?;
+        let (manifests, mut quarantined) = self.scan_manifests().await?;
         let manifest_selection = self.select_manifest_candidates(&entries, manifests).await?;
         quarantined += manifest_selection.quarantined_items;
         let mut report = PausedSandboxRecoveryReport {
@@ -1920,7 +1757,6 @@ impl FileBackedSandboxPersister {
             self.recovery_blocks().await?
         };
         let mut selected_v2 = HashMap::new();
-        let mut legacy = Vec::new();
         let mut blocked = manifest_selection.blocked;
         for (sandbox_id, candidate) in &candidates {
             if recovery_blocks.contains_manifest(candidate) {
@@ -1932,22 +1768,8 @@ impl FileBackedSandboxPersister {
             let key_id = std::str::from_utf8(&key)
                 .ok()
                 .and_then(|value| SandboxId::parse_str(value).ok());
-            match decode_stored_paused_entry(&bytes) {
-                Ok(StoredPausedEntry::Legacy(record)) => {
-                    self.reconcile_legacy_index_entry(
-                        key_id,
-                        &key,
-                        &bytes,
-                        record,
-                        &candidates,
-                        &recovery_blocks,
-                        &mut legacy,
-                        &mut blocked,
-                        &mut report,
-                    )
-                    .await?;
-                }
-                Ok(StoredPausedEntry::Index(index)) => {
+            match decode_paused_index(&bytes) {
+                Ok(index) => {
                     self.reconcile_v2_index_entry(
                         key_id,
                         &key,
@@ -1992,7 +1814,7 @@ impl FileBackedSandboxPersister {
         )
         .await;
 
-        Ok((selected_v2.into_values().collect(), legacy, report))
+        Ok((selected_v2.into_values().collect(), report))
     }
 
     async fn reconcile_uncertain_quarantines(&self) -> PersistenceResult<usize> {
@@ -2020,7 +1842,7 @@ impl FileBackedSandboxPersister {
     /// only absent or corrupt index entries from a valid v2 manifest; an index
     /// mismatch remains quarantined for explicit operator review.
     pub async fn reconcile_quarantines(&self) -> PersistenceResult<PausedSandboxRecoveryReport> {
-        let (_v2, _legacy, mut report) = self.reconcile_manifest_index(true).await?;
+        let (_records, mut report) = self.reconcile_manifest_index(true).await?;
         report.reconciled_quarantines += self.reconcile_uncertain_quarantines().await?;
         Ok(report)
     }
@@ -2040,7 +1862,7 @@ impl FileBackedSandboxPersister {
         else {
             return Ok(false);
         };
-        let Ok(StoredPausedEntry::Index(index)) = decode_stored_paused_entry(current_record) else {
+        let Ok(index) = decode_paused_index(current_record) else {
             return Ok(false);
         };
         if index.sandbox_id != sandbox_id
@@ -2238,8 +2060,7 @@ impl FileBackedSandboxPersister {
         F: SandboxBackendFactory,
     {
         let artifact_root = record.artifact_root.clone();
-        let manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
-            .then(|| Self::manifest_path(&artifact_root));
+        let manifest_path = Self::manifest_path(&artifact_root);
         record.metadata.resume_recovery_pending = true;
         record.metadata.paused_runtime_stopped = false;
         if record.metadata.virtualization_mode != self.virtualization_mode {
@@ -2255,7 +2076,7 @@ impl FileBackedSandboxPersister {
                     None,
                     None,
                     Some(&artifact_root),
-                    manifest_path.as_deref(),
+                    Some(&manifest_path),
                 )
                 .await?;
                 None
@@ -2294,8 +2115,7 @@ impl FileBackedSandboxPersister {
             return Ok(PersistedRecordLoad::Complete(Some(metadata)));
         }
         let artifact_root = record.artifact_root.clone();
-        let manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
-            .then(|| Self::manifest_path(&artifact_root));
+        let manifest_path = Self::manifest_path(&artifact_root);
         let metadata = match super::codecs::decode_recovery_pending_state(record, factory) {
             Ok(metadata) => Some(metadata),
             Err(error) => {
@@ -2307,7 +2127,7 @@ impl FileBackedSandboxPersister {
                     None,
                     None,
                     Some(&artifact_root),
-                    manifest_path.as_deref(),
+                    Some(&manifest_path),
                 )
                 .await?;
                 None
@@ -2329,12 +2149,12 @@ impl FileBackedSandboxPersister {
             match record.reconcile_stop_proof_for_boot(&boot_id) {
                 StopProofReconciliation::Unchanged => {}
                 StopProofReconciliation::ObservationRecorded => {
-                    info!(sandbox_id = %sandbox_id, "recorded host boot for paused sandbox with legacy or unacknowledged stop proof");
-                    self.persist_reconciled_record(&record).await?;
+                    info!(sandbox_id = %sandbox_id, "recorded host boot for paused sandbox without stop proof");
+                    self.put_record(&record).await?;
                 }
                 StopProofReconciliation::RuntimeAbsent => {
                     info!(sandbox_id = %sandbox_id, "later host boot proved paused runtime absent; restored stop proof");
-                    self.persist_reconciled_record(&record).await?;
+                    self.put_record(&record).await?;
                 }
             }
         }
@@ -2351,8 +2171,7 @@ impl FileBackedSandboxPersister {
         }
 
         let artifact_root = record.artifact_root.clone();
-        let manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
-            .then(|| Self::manifest_path(&artifact_root));
+        let manifest_path = Self::manifest_path(&artifact_root);
         match super::codecs::decode_paused_state(record, factory) {
             Ok(metadata) => Ok(Some(metadata)),
             Err(error) => {
@@ -2362,7 +2181,7 @@ impl FileBackedSandboxPersister {
                     None,
                     None,
                     Some(&artifact_root),
-                    manifest_path.as_deref(),
+                    Some(&manifest_path),
                 )
                 .await?;
                 Ok(None)
@@ -2378,24 +2197,21 @@ impl SandboxPersister for FileBackedSandboxPersister {
         F: SandboxBackendFactory,
     {
         info!(store = %self.root.display(), "loading paused sandbox records");
-        let (mut v2_records, legacy_records, recovery_report) =
-            self.reconcile_manifest_index(false).await?;
-        v2_records.extend(legacy_records);
+        let (records, recovery_report) = self.reconcile_manifest_index(false).await?;
         let mut sandboxes = Vec::new();
         let mut seen_sandbox_ids = HashSet::new();
 
-        for record in v2_records {
+        for record in records {
             let sandbox_id = record.metadata.id;
             let record_artifact_root = record.artifact_root.clone();
-            let record_manifest_path = (record.version == PAUSED_MANIFEST_VERSION)
-                .then(|| Self::manifest_path(&record_artifact_root));
+            let record_manifest_path = Self::manifest_path(&record_artifact_root);
             if !seen_sandbox_ids.insert(sandbox_id) {
                 self.quarantine(
                     "multiple persisted paused records claim the same sandbox ID",
                     None,
                     None,
                     Some(&record_artifact_root),
-                    record_manifest_path.as_deref(),
+                    Some(&record_manifest_path),
                 )
                 .await?;
                 continue;
@@ -2627,17 +2443,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
             });
         }
         // Revalidate immediately before deletion and remove only the
-        // canonical managed generation. A decodable legacy record is not a
-        // deletion authorization for an arbitrary path.
-        let canonical_artifact_root = match record.version {
-            LEGACY_RECORD_VERSION => {
-                self.validated_legacy_artifact_root(sandbox_id, &record.artifact_root)
-            }
-            PAUSED_MANIFEST_VERSION => {
-                self.validated_managed_generation_path(sandbox_id, &record.artifact_root)
-            }
-            _ => None,
-        };
+        // canonical managed generation.
+        let canonical_artifact_root =
+            self.validated_managed_generation_path(sandbox_id, &record.artifact_root);
         let Some(canonical_artifact_root) = canonical_artifact_root else {
             let record_key = sandbox_id.to_string();
             self.quarantine(
@@ -2645,9 +2453,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 Some(record_key.as_bytes()),
                 None,
                 Some(&record.artifact_root),
-                (record.version == PAUSED_MANIFEST_VERSION)
-                    .then(|| Self::manifest_path(&record.artifact_root))
-                    .as_deref(),
+                Some(&Self::manifest_path(&record.artifact_root)),
             )
             .await?;
             return Err(SandboxPersistenceError::manual_recovery(

@@ -1,9 +1,7 @@
 //! Versioned on-disk representations and their codecs.
 //!
-//! Persistence policy lives in the persister; this module only knows how to
-//! decode the records that have existed in the store. Keeping these codecs
-//! separate makes compatibility changes reviewable without mixing them with
-//! filesystem or recovery actions.
+//! Persistence policy lives in the persister; this module only defines the
+//! current record formats and validates their versions.
 
 use std::path::PathBuf;
 
@@ -17,7 +15,6 @@ use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::SandboxBackendFactory;
 use crate::types::SandboxId;
 
-pub(super) const LEGACY_RECORD_VERSION: u32 = 1;
 pub(super) const PAUSED_MANIFEST_VERSION: u32 = 2;
 pub(super) const PAUSED_INDEX_VERSION: u32 = 2;
 pub(super) const PAUSED_MANIFEST_FILE: &str = "paused-record.v2.json";
@@ -29,7 +26,6 @@ pub(super) const CREATE_IDEMPOTENCY_RECORD_VERSION: u32 = 1;
 #[serde(rename_all = "camelCase")]
 pub(super) struct PersistedPausedRecord {
     pub(super) version: u32,
-    #[serde(default = "default_commit_state")]
     pub(super) commit_state: PersistedPausedCommitState,
     pub(super) lifecycle: PersistedPausedLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,21 +70,11 @@ impl ManifestEntry {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum StoredPausedEntry {
-    Legacy(PersistedPausedRecord),
-    Index(PersistedPausedIndex),
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct PersistedCreateIdempotencyRecord {
     pub(super) version: u32,
     pub(super) record: super::CreateIdempotencyRecord,
-}
-
-fn default_commit_state() -> PersistedPausedCommitState {
-    PersistedPausedCommitState::Committed
 }
 
 pub(super) fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
@@ -102,7 +88,7 @@ pub(super) fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRe
 }
 
 pub(super) fn ensure_supported_record_version(version: u32) -> PersistenceResult<()> {
-    if matches!(version, LEGACY_RECORD_VERSION | PAUSED_MANIFEST_VERSION) {
+    if version == PAUSED_MANIFEST_VERSION {
         Ok(())
     } else {
         Err(SandboxPersistenceError::InvalidRecord {
@@ -116,42 +102,22 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-pub(super) fn decode_stored_paused_entry(bytes: &[u8]) -> PersistenceResult<StoredPausedEntry> {
-    let value: Value =
+pub(super) fn decode_paused_index(bytes: &[u8]) -> PersistenceResult<PersistedPausedIndex> {
+    let index: PersistedPausedIndex =
         serde_json::from_slice(bytes).map_err(|source| SandboxPersistenceError::InvalidRecord {
-            reason: "failed to deserialize paused sandbox record or index".to_string(),
+            reason: "failed to deserialize paused sandbox index".to_string(),
             source: Some(source.into()),
         })?;
-    if value.get("indexVersion").is_some() {
-        let index: PersistedPausedIndex = serde_json::from_value(value).map_err(|source| {
-            SandboxPersistenceError::InvalidRecord {
-                reason: "failed to deserialize paused sandbox index".to_string(),
-                source: Some(source.into()),
-            }
-        })?;
-        if index.index_version != PAUSED_INDEX_VERSION {
-            return Err(SandboxPersistenceError::InvalidRecord {
-                reason: format!(
-                    "unsupported paused sandbox index version {}",
-                    index.index_version
-                ),
-                source: None,
-            });
-        }
-        return Ok(StoredPausedEntry::Index(index));
-    }
-
-    let record = decode_record(bytes)?;
-    if record.version != LEGACY_RECORD_VERSION {
+    if index.index_version != PAUSED_INDEX_VERSION {
         return Err(SandboxPersistenceError::InvalidRecord {
             reason: format!(
-                "paused sandbox record version {} must be stored in a v2 manifest",
-                record.version
+                "unsupported paused sandbox index version {}",
+                index.index_version
             ),
             source: None,
         });
     }
-    Ok(StoredPausedEntry::Legacy(record))
+    Ok(index)
 }
 
 pub(super) fn decode_create_idempotency_record(

@@ -559,11 +559,8 @@ impl Slot {
 
     /// Announce the TAP identity once before the first envd health probe.
     ///
-    /// Fresh boots normally learn it during guest network setup, but the first
-    /// packet can race virtio-net on slower image starts.  This synchronous
-    /// nudge is deliberately separate from the bounded resume repair worker:
-    /// ordinary boots get no background polling and snapshot resumes retain
-    /// their short cancellable repair window.
+    /// The first packet can race virtio-net on slower image starts, so send one
+    /// frame synchronously before starting the bounded readiness worker.
     pub(crate) fn refresh_guest_arp_once(&self) -> Result<()> {
         let netns_path = self.namespace_path();
         let tap_ip = self.address_plan.tap_ip();

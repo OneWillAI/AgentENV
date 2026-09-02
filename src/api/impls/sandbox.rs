@@ -389,8 +389,8 @@ fn normalize_create_fingerprint_body(route: &str, body: &mut serde_json::Value) 
         body.remove("envVars");
     }
 
-    // The legacy MCP request member is currently ignored by the warm handler;
-    // it must not turn an otherwise identical replay into a conflict.
+    // The warm handler ignores MCP configuration, so exclude it from replay
+    // identity too.
     if route == "/sandboxes" {
         body.remove("mcp");
     }

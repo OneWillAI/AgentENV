@@ -168,11 +168,8 @@ impl TemplateBuilder {
                     .map(|failure| failure.reason.clone())
             })
             .unwrap_or_else(|| {
-                // Preserve the useful part of an unexpected error chain in the
-                // persisted build record.  The old generic fallback made a
-                // failed build impossible to diagnose without server logs.
-                // Keep this bounded and single-line because the reason is also
-                // returned through the public template status API.
+                // This reason is returned through the public template status
+                // API, so keep it bounded and single-line.
                 let message = error
                     .chain()
                     .map(ToString::to_string)
