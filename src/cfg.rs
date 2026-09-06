@@ -355,6 +355,8 @@ pub struct OssBackendConfig {
     pub prefix: Option<String>,
     #[serde(alias = "credentialProcess", alias = "credential-process")]
     pub credential_process: Option<String>,
+    #[serde(default)]
+    pub google_service_account: bool,
     pub access_key_id: Option<String>,
     pub access_key_secret: Option<String>,
     pub security_token: Option<String>,

@@ -46,6 +46,7 @@ impl NormalizedOssConfig {
                 secret_access_key: config.access_key_secret.as_deref(),
                 security_token: config.security_token.as_deref(),
                 credential_process: config.credential_process.as_deref(),
+                google_service_account: config.google_service_account,
             },
             CredentialSourceOptions {
                 scope: "backend.oss",
@@ -110,6 +111,7 @@ mod tests {
             bucket: " demo-bucket ".to_string(),
             prefix: Some(" /snapshots/managed/ ".to_string()),
             credential_process: None,
+            google_service_account: false,
             access_key_id: Some(" ak ".to_string()),
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
@@ -162,6 +164,23 @@ mod tests {
         assert!(err
             .to_string()
             .contains("credential_process cannot be combined"));
+    }
+
+    #[test]
+    fn normalized_config_accepts_google_service_account() {
+        let mut config = sample_config();
+        config.access_key_id = None;
+        config.access_key_secret = None;
+        config.security_token = None;
+        config.google_service_account = true;
+
+        let normalized =
+            NormalizedOssConfig::new(&config, SnapshotImageStoragePolicy::ObjectStorage)
+                .expect("normalize Google OAuth config");
+        assert!(matches!(
+            normalized.credential_source(),
+            object_store_operator::CredentialSource::GoogleServiceAccount
+        ));
     }
 
     #[test]

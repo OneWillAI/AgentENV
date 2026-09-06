@@ -209,6 +209,7 @@ pub struct OssConfig {
     pub secret_access_key: String,
     pub security_token: String,
     pub credential_process: String,
+    pub google_service_account: bool,
     pub default_region: String,
     pub default_endpoint: String,
     /// Per-request timeout in seconds (connect + transfer). Default 30.
@@ -225,6 +226,7 @@ impl Default for OssConfig {
             secret_access_key: String::new(),
             security_token: String::new(),
             credential_process: String::new(),
+            google_service_account: false,
             default_region: String::new(),
             default_endpoint: String::new(),
             timeout_secs: 30,
@@ -639,6 +641,14 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
             "ossConfig.credentialProcess cannot be combined with accessKeyId/secretAccessKey/securityToken"
         );
         ensure!(
+            !cfg.oss_config.google_service_account
+                || (cfg.oss_config.access_key_id.is_empty()
+                    && cfg.oss_config.secret_access_key.is_empty()
+                    && cfg.oss_config.security_token.is_empty()
+                    && cfg.oss_config.credential_process.trim().is_empty()),
+            "ossConfig.googleServiceAccount cannot be combined with static credentials or credentialProcess"
+        );
+        ensure!(
             cfg.oss_config.security_token.is_empty()
                 || (!cfg.oss_config.access_key_id.is_empty()
                     && !cfg.oss_config.secret_access_key.is_empty()),
@@ -932,6 +942,24 @@ mod tests {
         let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
         cfg.normalize_compat_fields();
         validate_global_config(&cfg).expect("credential_process-only config should validate");
+    }
+
+    #[test]
+    fn test_oss_config_allows_google_service_account_without_static_credentials() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "defaultEndpoint": "https://storage.googleapis.com",
+            "defaultRegion": "us-east-1",
+            "googleServiceAccount": true
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        validate_global_config(&cfg).expect("Google service account config should validate");
     }
 
     #[test]

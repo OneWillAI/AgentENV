@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::{stream, TryStreamExt};
 use object_store_operator::{
-    build_object_store_operator, run_with_refresh, AddressingStyle, CachedCredentialSource,
-    CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError, OperatorWithCredential,
+    build_object_store_operator, run_with_refresh, AddressingStyle, CachedBearerTokenSource,
+    CachedCredentialSource, CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError,
+    OperatorWithCredential,
 };
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -74,6 +75,8 @@ impl OssClient {
         prefix: String,
         credential_source: CredentialSource,
     ) -> Result<Self> {
+        let bearer_tokens = matches!(credential_source, CredentialSource::GoogleServiceAccount)
+            .then(|| Arc::new(CachedBearerTokenSource::google_compute_engine()));
         Ok(Self {
             operator_config: ObjectStoreOperatorConfig {
                 addressing_style: detect_addressing_style(&endpoint, &bucket)?,
@@ -82,6 +85,7 @@ impl OssClient {
                 region,
                 timeout: None,
                 max_retries: None,
+                bearer_tokens,
             },
             prefix,
             credentials: Arc::new(CachedCredentialSource::new(credential_source)),
@@ -327,14 +331,14 @@ impl OssClient {
         // retry semantics so individual OSS operations don't each have to
         // reason about cached credentials and operator replacement.
         let current = self.ensure_fresh_operator().await?;
-        let (value, refreshed) = run_with_refresh(
-            &current,
-            Some(self.credentials.as_ref()),
-            &self.operator_config,
-            operation,
-        )
-        .await
-        .map_err(anyhow::Error::from)?;
+        let credentials = current
+            .credential()
+            .is_some()
+            .then_some(self.credentials.as_ref());
+        let (value, refreshed) =
+            run_with_refresh(&current, credentials, &self.operator_config, operation)
+                .await
+                .map_err(anyhow::Error::from)?;
         if let Some(refreshed) = refreshed {
             *self.cached_operator.write().await = Some(refreshed);
         }
@@ -342,22 +346,23 @@ impl OssClient {
     }
 
     async fn ensure_fresh_operator(&self) -> Result<OperatorWithCredential> {
-        let credential = self.credentials.current().await?.ok_or_else(|| {
-            anyhow::anyhow!("snapshot OSS client requires non-anonymous credentials")
-        })?;
+        let credential = self.credentials.current().await?;
+        if credential.is_none() && self.operator_config.bearer_tokens.is_none() {
+            anyhow::bail!("snapshot OSS client requires non-anonymous credentials");
+        }
 
         {
             let cached = self.cached_operator.read().await;
             if let Some(state) = cached.as_ref() {
-                if state.credential() == Some(&credential) {
+                if state.credential() == credential.as_ref() {
                     return Ok(state.clone());
                 }
             }
         }
 
         let entry = OperatorWithCredential::new(
-            build_object_store_operator(&self.operator_config, Some(&credential))?,
-            Some(credential),
+            build_object_store_operator(&self.operator_config, credential.as_ref())?,
+            credential,
         );
         *self.cached_operator.write().await = Some(entry.clone());
         Ok(entry)

@@ -119,6 +119,7 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
         bucket: fixture.bucket.clone(),
         prefix: Some(prefix.to_string()),
         credential_process: None,
+        google_service_account: false,
         access_key_id: Some(MINIO_USER.to_string()),
         access_key_secret: Some(MINIO_PASS.to_string()),
         security_token: None,

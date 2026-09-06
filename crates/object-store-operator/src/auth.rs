@@ -11,12 +11,15 @@ use tokio::time::timeout;
 
 pub const CREDENTIAL_REFRESH_BUFFER: Duration = Duration::from_secs(120);
 pub const CREDENTIAL_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+pub const GOOGLE_METADATA_TOKEN_ENDPOINT: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
     Anonymous,
     Static(ResolvedCredential),
     Process { command: String },
+    GoogleServiceAccount,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -27,12 +30,33 @@ pub struct ResolvedCredential {
     pub expires_at: Option<SystemTime>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedBearerToken {
+    pub access_token: String,
+    pub expires_at: SystemTime,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleMetadataTokenResponse {
+    access_token: String,
+    expires_in: u64,
+    token_type: String,
+}
+
+pub struct CachedBearerTokenSource {
+    endpoint: String,
+    client: reqwest::Client,
+    cached: RwLock<Option<ResolvedBearerToken>>,
+    refresh_lock: Mutex<()>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CredentialFields<'a> {
     pub access_key_id: Option<&'a str>,
     pub secret_access_key: Option<&'a str>,
     pub security_token: Option<&'a str>,
     pub credential_process: Option<&'a str>,
+    pub google_service_account: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +145,105 @@ impl ResolvedCredential {
     }
 }
 
+impl fmt::Debug for ResolvedBearerToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedBearerToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl ResolvedBearerToken {
+    fn should_refresh(&self, now: SystemTime) -> bool {
+        let refresh_at = now.checked_add(CREDENTIAL_REFRESH_BUFFER).unwrap_or(now);
+        self.expires_at <= refresh_at
+    }
+}
+
+impl CachedBearerTokenSource {
+    pub fn google_compute_engine() -> Self {
+        Self::google_compute_engine_with_endpoint(GOOGLE_METADATA_TOKEN_ENDPOINT)
+    }
+
+    pub fn google_compute_engine_with_endpoint(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            client: reqwest::Client::new(),
+            cached: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
+        }
+    }
+
+    pub async fn current(&self) -> Result<ResolvedBearerToken> {
+        {
+            let cached = self.cached.read().await;
+            if let Some(token) = cached.as_ref() {
+                if !token.should_refresh(SystemTime::now()) {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
+        let _guard = self.refresh_lock.lock().await;
+        {
+            let cached = self.cached.read().await;
+            if let Some(token) = cached.as_ref() {
+                if !token.should_refresh(SystemTime::now()) {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
+        let token = self.fetch_google_metadata_token().await?;
+        *self.cached.write().await = Some(token.clone());
+        Ok(token)
+    }
+
+    async fn fetch_google_metadata_token(&self) -> Result<ResolvedBearerToken> {
+        let response = self
+            .client
+            .get(&self.endpoint)
+            .header("Metadata-Flavor", "Google")
+            .timeout(CREDENTIAL_PROCESS_TIMEOUT)
+            .send()
+            .await
+            .context("fetch Google service-account OAuth token from metadata server")?
+            .error_for_status()
+            .context("Google metadata token endpoint returned an error")?;
+        let payload: GoogleMetadataTokenResponse = response
+            .json()
+            .await
+            .context("parse Google metadata token response")?;
+        if !payload.token_type.eq_ignore_ascii_case("bearer") {
+            bail!("Google metadata token response has unsupported token_type");
+        }
+        let access_token = payload.access_token.trim().to_string();
+        if access_token.is_empty() {
+            bail!("Google metadata token response has an empty access_token");
+        }
+        if payload.expires_in == 0 {
+            bail!("Google metadata token response has a zero expires_in");
+        }
+        let expires_at = SystemTime::now()
+            .checked_add(Duration::from_secs(payload.expires_in))
+            .context("Google metadata token expiration overflows system time")?;
+        Ok(ResolvedBearerToken {
+            access_token,
+            expires_at,
+        })
+    }
+}
+
+impl fmt::Debug for CachedBearerTokenSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CachedBearerTokenSource")
+            .field("kind", &"google_compute_engine")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
 pub fn credential_source_from_fields(
     fields: CredentialFields<'_>,
     options: CredentialSourceOptions<'_>,
@@ -128,6 +251,20 @@ pub fn credential_source_from_fields(
     let access_key_id = normalized_credential(fields.access_key_id);
     let secret_access_key = normalized_credential(fields.secret_access_key);
     let security_token = normalized_credential(fields.security_token);
+
+    if fields.google_service_account {
+        if access_key_id.is_some()
+            || secret_access_key.is_some()
+            || security_token.is_some()
+            || normalized_credential(fields.credential_process).is_some()
+        {
+            bail!(
+                "{} google_service_account cannot be combined with static credentials or credential_process",
+                options.scope
+            );
+        }
+        return Ok(CredentialSource::GoogleServiceAccount);
+    }
 
     if let Some(command) = normalized_credential(fields.credential_process) {
         if access_key_id.is_some() || secret_access_key.is_some() || security_token.is_some() {
@@ -333,6 +470,7 @@ impl CachedCredentialSource {
         match &self.source {
             CredentialSource::Anonymous => Ok(None),
             CredentialSource::Static(credential) => Ok(Some(credential.clone())),
+            CredentialSource::GoogleServiceAccount => Ok(None),
             CredentialSource::Process { command } => {
                 {
                     let cached = self.cached.read().await;
@@ -367,6 +505,7 @@ impl CachedCredentialSource {
         match &self.source {
             CredentialSource::Anonymous => Ok(None),
             CredentialSource::Static(credential) => Ok(Some(credential.clone())),
+            CredentialSource::GoogleServiceAccount => Ok(None),
             CredentialSource::Process { command } => {
                 let _guard = self.refresh_lock.lock().await;
                 {
@@ -399,6 +538,7 @@ impl fmt::Debug for CachedCredentialSource {
                     CredentialSource::Anonymous => "anonymous",
                     CredentialSource::Static(_) => "static",
                     CredentialSource::Process { .. } => "process",
+                    CredentialSource::GoogleServiceAccount => "google_service_account",
                 },
             )
             .finish()
@@ -408,6 +548,45 @@ impl fmt::Debug for CachedCredentialSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    fn serve_metadata_tokens(
+        payloads: Vec<&'static str>,
+    ) -> (String, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind metadata test server");
+        let address = listener.local_addr().expect("metadata test address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            for payload in payloads {
+                let (mut stream, _) = listener.accept().expect("accept metadata request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read metadata request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests_tx
+                    .send(String::from_utf8(request).expect("request UTF-8"))
+                    .expect("capture metadata request");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                )
+                .expect("write metadata response");
+            }
+        });
+        (format!("http://{address}/token"), requests_rx, handle)
+    }
 
     #[test]
     fn mixed_process_and_static_credentials_are_rejected() {
@@ -417,6 +596,7 @@ mod tests {
                 secret_access_key: Some("sk"),
                 security_token: None,
                 credential_process: Some("echo '{}'"),
+                google_service_account: false,
             },
             CredentialSourceOptions {
                 scope: "backend.oss",
@@ -428,6 +608,73 @@ mod tests {
         .expect_err("mixed source should fail");
 
         assert!(err.to_string().contains("credential_process"));
+    }
+
+    #[test]
+    fn google_service_account_rejects_other_credentials() {
+        let err = credential_source_from_fields(
+            CredentialFields {
+                access_key_id: Some("ak"),
+                secret_access_key: Some("sk"),
+                security_token: None,
+                credential_process: None,
+                google_service_account: true,
+            },
+            CredentialSourceOptions {
+                scope: "backend.oss",
+                allow_anonymous: false,
+                required_access_key_id_label: "backend.oss.access_key_id",
+                required_secret_access_key_label: "backend.oss.access_key_secret",
+            },
+        )
+        .expect_err("mixed Google and static credentials should fail");
+
+        assert!(err.to_string().contains("google_service_account"));
+    }
+
+    #[tokio::test]
+    async fn google_metadata_tokens_are_injected_from_metadata_and_cached() {
+        let (endpoint, requests, server) = serve_metadata_tokens(vec![
+            r#"{"access_token":"token-one","expires_in":3600,"token_type":"Bearer"}"#,
+        ]);
+        let source = CachedBearerTokenSource::google_compute_engine_with_endpoint(endpoint);
+
+        assert_eq!(
+            source.current().await.expect("first token").access_token,
+            "token-one"
+        );
+        assert_eq!(
+            source.current().await.expect("cached token").access_token,
+            "token-one"
+        );
+        let request = requests.recv().expect("metadata request");
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("metadata-flavor: google"));
+        server.join().expect("metadata server");
+    }
+
+    #[tokio::test]
+    async fn google_metadata_token_refreshes_before_expiration() {
+        let (endpoint, _requests, server) = serve_metadata_tokens(vec![
+            r#"{"access_token":"token-one","expires_in":1,"token_type":"Bearer"}"#,
+            r#"{"access_token":"token-two","expires_in":3600,"token_type":"Bearer"}"#,
+        ]);
+        let source = CachedBearerTokenSource::google_compute_engine_with_endpoint(endpoint);
+
+        assert_eq!(
+            source.current().await.expect("first token").access_token,
+            "token-one"
+        );
+        assert_eq!(
+            source
+                .current()
+                .await
+                .expect("refreshed token")
+                .access_token,
+            "token-two"
+        );
+        server.join().expect("metadata server");
     }
 
     #[test]

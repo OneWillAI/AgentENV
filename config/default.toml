@@ -238,6 +238,7 @@ p2p_enabled = true
 # bucket = "agentenv-snapshots"
 # region = "cn-beijing"
 # prefix = "snapshots/"
+# google_service_account = false
 # credential_process = "/usr/local/bin/get-oss-credentials"
 # access_key_id = "..."
 # access_key_secret = "..."

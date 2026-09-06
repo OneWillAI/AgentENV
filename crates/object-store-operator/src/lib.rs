@@ -3,9 +3,10 @@ mod operator;
 
 pub use auth::{
     credential_source_from_fields, normalized_credential, parse_expiration,
-    resolve_credential_from_process, CachedCredentialSource, CredentialFields, CredentialSource,
-    CredentialSourceOptions, ResolvedCredential, CREDENTIAL_PROCESS_TIMEOUT,
-    CREDENTIAL_REFRESH_BUFFER,
+    resolve_credential_from_process, CachedBearerTokenSource, CachedCredentialSource,
+    CredentialFields, CredentialSource, CredentialSourceOptions, ResolvedBearerToken,
+    ResolvedCredential, CREDENTIAL_PROCESS_TIMEOUT, CREDENTIAL_REFRESH_BUFFER,
+    GOOGLE_METADATA_TOKEN_ENDPOINT,
 };
 pub use operator::{
     build_object_store_operator, run_with_refresh, AddressingStyle, ObjectStoreOperatorConfig,
