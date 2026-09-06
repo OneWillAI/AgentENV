@@ -583,31 +583,8 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
     ensure!(cfg.io_engine <= 2, "unknown ioEngine {}", cfg.io_engine);
     validate_download_chunk_knobs(&cfg.download, "download.concurrency")?;
     validate_download_scheduler_caps(&cfg.download, "download")?;
-
-    match cfg.cache_config.cache_type.as_str() {
-        "file" | "ocf" | "download" => {}
-        other => {
-            bail!("unknown cache type: {other}");
-        }
-    }
-
-    ensure!(
-        !(cfg.enable_thread && cfg.cache_config.cache_type == "file"),
-        "enableThread=true is invalid when cache type is file"
-    );
-
-    match cfg.credential_config.mode.as_str() {
-        "" => {}
-        "file" | "http" => {
-            ensure!(
-                !cfg.credential_config.path.is_empty(),
-                "credentialConfig.path cannot be empty when mode is set"
-            );
-        }
-        other => {
-            bail!("invalid credential mode {other}");
-        }
-    }
+    validate_cache_config(cfg)?;
+    validate_credential_config(cfg)?;
 
     ensure!(
         !(cfg.p2p_config.enable && cfg.p2p_config.address.is_empty()),
@@ -620,44 +597,76 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
         cfg.registry_fs_version
     );
 
-    if cfg.oss_config.enable {
-        ensure!(
-            !cfg.oss_config.default_endpoint.is_empty(),
-            "ossConfig.defaultEndpoint cannot be empty when oss is enabled"
-        );
-        ensure!(
-            !cfg.oss_config.default_region.trim().is_empty(),
-            "ossConfig.defaultRegion cannot be empty when oss is enabled"
-        );
-        ensure!(
-            cfg.oss_config.access_key_id.is_empty() == cfg.oss_config.secret_access_key.is_empty(),
-            "ossConfig.accessKeyId and ossConfig.secretAccessKey must be set together"
-        );
-        ensure!(
-            cfg.oss_config.credential_process.trim().is_empty()
-                || (cfg.oss_config.access_key_id.is_empty()
-                    && cfg.oss_config.secret_access_key.is_empty()
-                    && cfg.oss_config.security_token.is_empty()),
-            "ossConfig.credentialProcess cannot be combined with accessKeyId/secretAccessKey/securityToken"
-        );
-        ensure!(
-            !cfg.oss_config.google_service_account
-                || (cfg.oss_config.access_key_id.is_empty()
-                    && cfg.oss_config.secret_access_key.is_empty()
-                    && cfg.oss_config.security_token.is_empty()
-                    && cfg.oss_config.credential_process.trim().is_empty()),
-            "ossConfig.googleServiceAccount cannot be combined with static credentials or credentialProcess"
-        );
-        ensure!(
-            cfg.oss_config.security_token.is_empty()
-                || (!cfg.oss_config.access_key_id.is_empty()
-                    && !cfg.oss_config.secret_access_key.is_empty()),
-            "ossConfig.securityToken requires accessKeyId and secretAccessKey"
-        );
-    }
+    validate_oss_config(cfg)?;
 
     ensure!(cfg.nr_io_rings != 0, "nr_io_rings cannot be zero");
 
+    Ok(())
+}
+
+fn validate_cache_config(cfg: &GlobalConfig) -> Result<()> {
+    match cfg.cache_config.cache_type.as_str() {
+        "file" | "ocf" | "download" => {}
+        other => bail!("unknown cache type: {other}"),
+    }
+    ensure!(
+        !(cfg.enable_thread && cfg.cache_config.cache_type == "file"),
+        "enableThread=true is invalid when cache type is file"
+    );
+    Ok(())
+}
+
+fn validate_credential_config(cfg: &GlobalConfig) -> Result<()> {
+    match cfg.credential_config.mode.as_str() {
+        "" => Ok(()),
+        "file" | "http" => {
+            ensure!(
+                !cfg.credential_config.path.is_empty(),
+                "credentialConfig.path cannot be empty when mode is set"
+            );
+            Ok(())
+        }
+        other => bail!("invalid credential mode {other}"),
+    }
+}
+
+fn validate_oss_config(cfg: &GlobalConfig) -> Result<()> {
+    if !cfg.oss_config.enable {
+        return Ok(());
+    }
+    ensure!(
+        !cfg.oss_config.default_endpoint.is_empty(),
+        "ossConfig.defaultEndpoint cannot be empty when oss is enabled"
+    );
+    ensure!(
+        !cfg.oss_config.default_region.trim().is_empty(),
+        "ossConfig.defaultRegion cannot be empty when oss is enabled"
+    );
+    ensure!(
+        cfg.oss_config.access_key_id.is_empty() == cfg.oss_config.secret_access_key.is_empty(),
+        "ossConfig.accessKeyId and ossConfig.secretAccessKey must be set together"
+    );
+    ensure!(
+        cfg.oss_config.credential_process.trim().is_empty()
+            || (cfg.oss_config.access_key_id.is_empty()
+                && cfg.oss_config.secret_access_key.is_empty()
+                && cfg.oss_config.security_token.is_empty()),
+        "ossConfig.credentialProcess cannot be combined with accessKeyId/secretAccessKey/securityToken"
+    );
+    ensure!(
+        !cfg.oss_config.google_service_account
+            || (cfg.oss_config.access_key_id.is_empty()
+                && cfg.oss_config.secret_access_key.is_empty()
+                && cfg.oss_config.security_token.is_empty()
+                && cfg.oss_config.credential_process.trim().is_empty()),
+        "ossConfig.googleServiceAccount cannot be combined with static credentials or credentialProcess"
+    );
+    ensure!(
+        cfg.oss_config.security_token.is_empty()
+            || (!cfg.oss_config.access_key_id.is_empty()
+                && !cfg.oss_config.secret_access_key.is_empty()),
+        "ossConfig.securityToken requires accessKeyId and secretAccessKey"
+    );
     Ok(())
 }
 

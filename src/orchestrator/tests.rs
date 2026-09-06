@@ -698,6 +698,35 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
 }
 
 #[tokio::test]
+async fn same_boot_resume_tombstone_blocks_resume_and_delete() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let mut paused = paused_resume_metadata(sandbox_id);
+    paused.resume_recovery_pending = true;
+    let persister = RecordingPersister::with_loaded(vec![paused]);
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister,
+    )
+    .await?;
+
+    for result in [
+        orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+            .await
+            .map(|_| ()),
+        orchestrator.delete_sandbox(sandbox_id).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id: id }) if id == sandbox_id
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn new_converts_an_interrupted_create_claim_to_a_durable_tombstone() -> Result<()> {
     setup();
     let sandbox_id = SandboxId::new();
@@ -797,6 +826,64 @@ async fn restart_finishes_a_durable_deleting_record_before_releasing_the_key() -
 }
 
 #[tokio::test]
+async fn restart_releases_a_deleting_record_when_artifacts_require_manual_recovery() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let key = "delete-quarantine-restart";
+    let fingerprint = "sha256:delete-quarantine-restart";
+    let record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        sandbox_id,
+        state: CreateIdempotencyRecordState::Deleting,
+    };
+    let persister =
+        RecordingPersister::with_loaded_and_create_idempotency(Vec::new(), vec![record]);
+    persister.fail_next_manual_recovery(RecordingCall::DeleteRecordAndArtifacts);
+
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await
+    .expect("unreferenced paused artifacts must not prevent worker startup");
+    assert!(restarted.get_sandbox(&sandbox_id).await?.is_none());
+    assert!(persister.create_idempotency_records().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_keeps_a_failed_create_tombstone_when_delete_cleanup_fails() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let key = "delete-cleanup-io-restart";
+    let fingerprint = "sha256:delete-cleanup-io-restart";
+    let record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        sandbox_id,
+        state: CreateIdempotencyRecordState::Deleting,
+    };
+    let persister =
+        RecordingPersister::with_loaded_and_create_idempotency(Vec::new(), vec![record]);
+    persister.fail_next(RecordingCall::DeleteRecordAndArtifacts);
+
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await
+    .expect("a failed paused delete at startup must not prevent worker boot");
+    assert!(restarted.get_sandbox(&sandbox_id).await?.is_none());
+    let retained = persister.create_idempotency_records();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].state, CreateIdempotencyRecordState::Failed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn restored_paused_idempotent_delete_retains_the_key_and_durable_record() -> Result<()> {
     setup();
     let sandbox_id = SandboxId::new();
@@ -862,7 +949,7 @@ async fn restored_paused_idempotent_delete_retains_the_key_and_durable_record() 
 }
 
 #[tokio::test]
-async fn idempotent_pause_stop_proof_allows_same_process_delete() -> Result<()> {
+async fn pause_stop_proof_allows_same_process_delete() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
     let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
@@ -895,7 +982,7 @@ async fn idempotent_pause_stop_proof_allows_same_process_delete() -> Result<()> 
 }
 
 #[tokio::test]
-async fn failed_pause_stop_remains_unproven_after_restart_and_rejects_resume() -> Result<()> {
+async fn non_idempotent_failed_pause_stop_remains_unproven_after_restart() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
     let behavior = Arc::new(MockBehavior::new());
@@ -910,16 +997,14 @@ async fn failed_pause_stop_remains_unproven_after_restart_and_rejects_resume() -
         MockBackendFactory::with_behavior(behavior),
         persister.clone(),
     );
-    let key = "pause-stop-failure";
-    let fingerprint = "sha256:pause-stop-failure";
     let created = orchestrator
-        .create_sandbox(idempotent_create_request(key, fingerprint))
+        .create_sandbox(create_request(Some(60), &[("team", "pause-stop-failure")]))
         .await?;
 
     let err = orchestrator
         .pause_sandbox(created.id)
         .await
-        .expect_err("idempotent pause must surface an uncertain stop");
+        .expect_err("every pause must surface an uncertain stop");
     assert!(matches!(
         err,
         OrchestratorError::SandboxOperationFailed {
@@ -954,15 +1039,14 @@ async fn failed_pause_stop_remains_unproven_after_restart_and_rejects_resume() -
         .resume_sandbox(created.id, NewTimeout::UseExisting)
         .await
         .expect_err("resume must reject missing durable stop proof");
-    restarted
+    let delete_error = restarted
         .delete_sandbox(created.id)
         .await
-        .expect_err("delete must retain the key without durable stop proof");
+        .expect_err("delete must retain the sandbox without durable stop proof");
+    assert!(delete_error
+        .to_string()
+        .contains("runtime handle is missing"));
     assert!(!persister.calls().contains(&RecordingCall::MarkResuming));
-    let records = persister.create_idempotency_records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].key, key);
-    assert_eq!(records[0].state, CreateIdempotencyRecordState::Succeeded);
     Ok(())
 }
 
@@ -2281,7 +2365,7 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 }
 
 #[tokio::test]
-async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot() -> Result<()> {
+async fn pause_stop_failure_is_reported_and_keeps_stop_proof_unset() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -2296,17 +2380,28 @@ async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
 
-    orchestrator.pause_sandbox(created.id).await?;
+    let error = orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("pause must not report success without positive stop proof");
+    assert!(matches!(
+        error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::Stop,
+            ..
+        }
+    ));
 
     let paused = orchestrator
         .get_sandbox(&created.id)
         .await?
         .expect("sandbox should still exist after pause");
     assert_eq!(paused.state, SandboxState::Paused);
+    assert!(!paused.paused_runtime_stopped);
 
-    // Resource metrics are derived from the current metadata state, so a
-    // sandbox that is logically Paused no longer counts toward allocated
-    // CPU/memory regardless of whether the backing VM `stop()` succeeded.
+    // Resource metrics are derived from metadata state. The sandbox stays
+    // visibly Paused but lifecycle operations remain fail-closed until stop
+    // absence can be proven.
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
@@ -2829,6 +2924,7 @@ async fn resume_sandbox_build_failure_does_not_subtract_metrics_that_were_never_
             id: paused_id,
             state: SandboxState::Paused,
             paused_state: Some(test_paused_state().clone()),
+            paused_runtime_stopped: true,
             ..Default::default()
         })
         .await?;
@@ -4272,6 +4368,104 @@ async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
 }
 
 #[tokio::test]
+async fn uncertain_resume_rollback_marks_metadata_recovery_pending() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "uncertain-resume-rollback")],
+        ))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+    persister.fail_next_uncertain(RecordingCall::RollbackResuming);
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "forced resume wait failure".to_string(),
+        },
+    );
+
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect_err(
+            "resume launch failure should retain an uncertain rollback as recovery-pending",
+        );
+
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+    );
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("metadata should remain after uncertain resume rollback");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(metadata.resume_recovery_pending);
+    assert!(!metadata.paused_runtime_stopped);
+    Ok(())
+}
+
+#[tokio::test]
+async fn uncertain_resume_stop_proof_rollback_marks_metadata_recovery_pending() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "uncertain-resume-stop-proof")],
+        ))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+    persister.fail_next_uncertain(RecordingCall::MarkPausedRuntimeStopped);
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "forced resume wait failure".to_string(),
+        },
+    );
+
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect_err(
+            "resume launch failure should retain an uncertain stop proof as recovery-pending",
+        );
+
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::MarkResuming,
+            RecordingCall::RollbackResuming,
+            RecordingCall::MarkPausedRuntimeStopped,
+        ]
+    );
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("metadata should remain after uncertain stop proof");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(metadata.resume_recovery_pending);
+    assert!(!metadata.paused_runtime_stopped);
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_when_stop_fails_returns_error_and_allows_retry() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
@@ -4382,6 +4576,7 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
         state: SandboxState::Paused,
         virtualization_mode: sandbox_mode,
         paused_state: None,
+        paused_runtime_stopped: true,
         ..Default::default()
     }]);
     let orchestrator = Orchestrator::new_inner(
@@ -4579,25 +4774,61 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
 }
 
 #[tokio::test]
-async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
+async fn shutdown_waits_for_multiple_slow_serial_pauses() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let mut sandbox_ids = Vec::new();
+    for index in 0..3 {
+        let team = format!("shutdown-slow-{index}");
+        sandbox_ids.push(
+            orchestrator
+                .create_sandbox(create_request(Some(60), &[("team", &team)]))
+                .await?
+                .id,
+        );
+    }
+
+    const PAUSE_DELAY: Duration = Duration::from_millis(80);
+    for _ in &sandbox_ids {
+        behavior.push_action(MockOperation::Pause, MockAction::SucceedAfter(PAUSE_DELAY));
+    }
+
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), orchestrator.shutdown())
+        .await
+        .expect("shutdown should wait for every slow pause")?;
+
+    // The shutdown loop pauses each sandbox serially. A systemd timeout must
+    // accommodate all of them, not only the first one that begins snapshotting.
+    assert!(
+        started.elapsed() >= PAUSE_DELAY.saturating_mul(2),
+        "shutdown returned before all serialized pause operations completed"
+    );
+    for sandbox_id in sandbox_ids {
+        assert_eq!(
+            orchestrator
+                .get_sandbox(&sandbox_id)
+                .await?
+                .expect("sandbox should remain after shutdown")
+                .state,
+            SandboxState::Paused
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_reports_unproven_stop_after_pause() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
         MockOperation::Stop,
         MockAction::Fail {
             message: "shutdown stop failure 1".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown stop failure 2".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown stop failure 3".to_string(),
         },
     );
     let orchestrator =
@@ -4611,15 +4842,17 @@ async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
         .await?;
     let sandbox_id = created.id;
 
-    orchestrator.shutdown().await?;
+    orchestrator
+        .shutdown()
+        .await
+        .expect_err("shutdown must report a paused runtime whose stop is unproven");
 
     let metadata = orchestrator
         .get_sandbox(&sandbox_id)
         .await?
         .expect("paused sandbox metadata should remain after shutdown");
     assert_eq!(metadata.state, SandboxState::Paused);
-
-    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(!metadata.paused_runtime_stopped);
     Ok(())
 }
 
@@ -4693,29 +4926,9 @@ async fn shutdown_returns_error_after_exhausting_pause_retries() -> Result<()> {
 }
 
 #[tokio::test]
-async fn shutdown_reuses_recorded_success_instead_of_running_cleanup_again() -> Result<()> {
+async fn shutdown_is_idempotent_after_preserving_a_running_sandbox() -> Result<()> {
     setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 1".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 2".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 3".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let orchestrator = make_orchestrator().await;
 
     let created = orchestrator
         .create_sandbox(create_request(

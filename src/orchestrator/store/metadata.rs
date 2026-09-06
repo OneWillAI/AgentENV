@@ -55,9 +55,14 @@ pub struct SandboxMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_request_fingerprint: Option<String>,
     /// Durable proof that the paused runtime was successfully stopped after
-    /// its resume artifacts were persisted. Legacy records default false.
-    #[serde(default)]
+    /// its resume artifacts were persisted.
     pub paused_runtime_stopped: bool,
+    /// Set when startup finds a `Resuming` persistence record from this same
+    /// host boot. The previous AgentENV process may have left its Firecracker
+    /// child alive, so the retained snapshot must not be resumed or deleted
+    /// until a later host boot proves that child is gone.
+    #[serde(skip)]
+    pub resume_recovery_pending: bool,
     pub network_policy: SandboxNetworkPolicy,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Persisted into committed snapshots so template launches inherit it
@@ -101,6 +106,7 @@ impl Default for SandboxMetadata {
             create_idempotency_key: None,
             create_request_fingerprint: None,
             paused_runtime_stopped: false,
+            resume_recovery_pending: false,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             secure: false,
@@ -162,17 +168,6 @@ mod tests {
         metadata.set_timeout(None);
         assert_eq!(metadata.timeout, None);
         assert_eq!(metadata.expires_at, None);
-    }
-
-    #[test]
-    fn legacy_metadata_without_paused_stop_proof_defaults_fail_closed() {
-        let mut value = serde_json::to_value(SandboxMetadata::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("paused_runtime_stopped");
-        let metadata: SandboxMetadata = serde_json::from_value(value).unwrap();
-        assert!(!metadata.paused_runtime_stopped);
     }
 
     #[test]

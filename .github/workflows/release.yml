@@ -137,7 +137,7 @@ jobs:
           OPENSSL_STATIC: "1"
         run: |
           cargo build --release --locked \
-            -p agentenv --bin server \
+            -p agentenv --bin server --bin aenv-paused-recovery \
             -p uvm-ublk-daemon --bin uvm-ublk-daemon \
             --features vendored-openssl
 
@@ -150,6 +150,11 @@ jobs:
             mkdir -p "$BUNDLE/ublk"
             cp target/release/server "$BUNDLE/server"
             strip "$BUNDLE/server"
+            # This utility is deliberately packaged only with the native
+            # server bundle.  scripts/install.sh installs it root-only on
+            # the worker; it is not part of the runtime container/API.
+            cp target/release/aenv-paused-recovery "$BUNDLE/aenv-paused-recovery"
+            strip "$BUNDLE/aenv-paused-recovery"
             cp target/release/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
             strip "$BUNDLE/ublk/uvm-ublk-daemon"
             cp config/default.toml "$BUNDLE/default.toml"

@@ -204,13 +204,15 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     local url="$2"
     local timeout="$3"
     log "Waiting for ${label} at ${url}/health (timeout ${timeout}s) ..."
-    for ((i = 1; i <= timeout; i++)); do
-      if curl -sf "${url}/health" >/dev/null 2>&1; then
-        log "${label} is ready."
-        return 0
-      fi
-      sleep 1
-    done
+    if wait_until "${timeout}" _health_url_is_ready "${url}"; then
+      log "${label} is ready."
+      return 0
+    fi
+    return 1
+  }
+
+  _health_url_is_ready() {
+    curl -sf "${1}/health" >/dev/null 2>&1 && return 0
     return 1
   }
 
@@ -235,26 +237,30 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     local ready_count
 
     log "Waiting for scheduler to observe ${expected_count} ready node(s) via ${AENV_URL}/nodes (timeout ${timeout}s) ..."
-    for ((i = 1; i <= timeout; i++)); do
-      response=$(curl -s \
-        -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
-        -w $'\n%{http_code}' \
-        "${AENV_URL}/nodes" 2>/dev/null || true)
-      status="${response##*$'\n'}"
-      nodes_body="${response%$'\n'*}"
-      if [[ "${status}" == "200" ]]; then
-        ready_count=$(printf '%s' "${nodes_body}" | jq '[.[] | select(.status == "ready")] | length' 2>/dev/null || printf '0')
-        if [[ "${ready_count}" -ge "${expected_count}" ]]; then
-          log "scheduler has ${ready_count} ready node(s)."
-          return 0
-        fi
-      fi
-      sleep 1
-    done
+    if wait_until "${timeout}" _scheduler_has_ready_nodes "${expected_count}"; then
+      log "scheduler has ${ready_count} ready node(s)."
+      return 0
+    fi
 
     warn "Timed out waiting for scheduler ready nodes; last /nodes response:"
     printf '%s\n' "${nodes_body}" >&2
     return 1
+  }
+
+  _scheduler_has_ready_nodes() {
+    local expected_count="$1"
+    local response
+    local status
+
+    response=$(curl -s \
+      -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
+      -w $'\n%{http_code}' \
+      "${AENV_URL}/nodes" 2>/dev/null || true)
+    status="${response##*$'\n'}"
+    nodes_body="${response%$'\n'*}"
+    [[ "${status}" == "200" ]] || return 1
+    ready_count=$(printf '%s' "${nodes_body}" | jq '[.[] | select(.status == "ready")] | length' 2>/dev/null || printf '0')
+    [[ "${ready_count}" -ge "${expected_count}" ]]
   }
 
   start_compose_runtime() {
@@ -284,8 +290,12 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     local port="${1:?usage: _kill_local_port <port>}"
     if command -v fuser >/dev/null 2>&1; then
       fuser -k "${port}/tcp" 2>/dev/null || true
-      sleep 0.2
+      wait_until 5 _local_port_is_free "${port}" || true
     fi
+  }
+
+  _local_port_is_free() {
+    ! fuser "${1}/tcp" >/dev/null 2>&1
   }
 
   _k8s_wait_for_rollout() {
@@ -309,20 +319,23 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     _K8S_PORT_FORWARD_PIDS+=("${pid}")
     _K8S_PORT_FORWARD_LOGS+=("${log_file}")
 
-    for ((i = 0; i < 20; i++)); do
-      if ! kill -0 "${pid}" 2>/dev/null; then
-        warn "kubectl port-forward for ${log_name} exited early"
-        [[ -f "${log_file}" ]] && cat "${log_file}" >&2
-        return 1
-      fi
-      if bash -c "exec 3<>/dev/tcp/127.0.0.1/${local_port}" >/dev/null 2>&1; then
-        return 0
-      fi
-      sleep 0.5
-    done
+    if wait_until 10 _port_forward_is_ready "${pid}" "${local_port}"; then
+      return 0
+    elif ! kill -0 "${pid}" 2>/dev/null; then
+      warn "kubectl port-forward for ${log_name} exited early"
+      [[ -f "${log_file}" ]] && cat "${log_file}" >&2
+      return 1
+    fi
 
     warn "kubectl port-forward for ${log_name} did not become ready on localhost:${local_port}"
     [[ -f "${log_file}" ]] && cat "${log_file}" >&2
+    return 1
+  }
+
+  _port_forward_is_ready() {
+    local pid="$1" local_port="$2"
+    kill -0 "${pid}" 2>/dev/null || return 2
+    bash -c "exec 3<>/dev/tcp/127.0.0.1/${local_port}" >/dev/null 2>&1 && return 0
     return 1
   }
 

@@ -87,6 +87,12 @@ User-visible rootfs images are selected at the template API layer.
 - short name: normalize standard Docker Hub forms such as `ubuntu:24.04`
   and `node:20`
 
+## `[template]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `apply_cluster_cpu_config` | boolean | `true` | Apply the scheduler-provided cluster CPU intersection to temporary template-build VMs. Dedicated builders with an incompatible KVM CPU-template interface may disable this with `AENV_TEMPLATE_APPLY_CLUSTER_CPU_CONFIG=false`; ordinary sandbox CPU policy is unchanged. |
+
 ## `[image.resolver]`
 
 | Key | Type | Default | Description |

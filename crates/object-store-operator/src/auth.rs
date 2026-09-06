@@ -251,33 +251,64 @@ pub fn credential_source_from_fields(
     let access_key_id = normalized_credential(fields.access_key_id);
     let secret_access_key = normalized_credential(fields.secret_access_key);
     let security_token = normalized_credential(fields.security_token);
+    let credential_process = normalized_credential(fields.credential_process);
 
     if fields.google_service_account {
-        if access_key_id.is_some()
-            || secret_access_key.is_some()
-            || security_token.is_some()
-            || normalized_credential(fields.credential_process).is_some()
-        {
-            bail!(
+        validate_provider_exclusivity(
+            access_key_id,
+            secret_access_key,
+            security_token,
+            credential_process,
+            &format!(
                 "{} google_service_account cannot be combined with static credentials or credential_process",
                 options.scope
-            );
-        }
+            ),
+        )?;
         return Ok(CredentialSource::GoogleServiceAccount);
     }
 
-    if let Some(command) = normalized_credential(fields.credential_process) {
-        if access_key_id.is_some() || secret_access_key.is_some() || security_token.is_some() {
-            bail!(
+    if let Some(command) = credential_process {
+        validate_provider_exclusivity(
+            access_key_id,
+            secret_access_key,
+            security_token,
+            None,
+            &format!(
                 "{} credential_process cannot be combined with access_key_id, secret_access_key, or security_token",
                 options.scope
-            );
-        }
+            ),
+        )?;
         return Ok(CredentialSource::Process {
             command: command.to_string(),
         });
     }
 
+    static_credential_source(access_key_id, secret_access_key, security_token, options)
+}
+
+fn validate_provider_exclusivity(
+    access_key_id: Option<&str>,
+    secret_access_key: Option<&str>,
+    security_token: Option<&str>,
+    credential_process: Option<&str>,
+    conflict_message: &str,
+) -> Result<()> {
+    if access_key_id.is_some()
+        || secret_access_key.is_some()
+        || security_token.is_some()
+        || credential_process.is_some()
+    {
+        bail!("{conflict_message}");
+    }
+    Ok(())
+}
+
+fn static_credential_source(
+    access_key_id: Option<&str>,
+    secret_access_key: Option<&str>,
+    security_token: Option<&str>,
+    options: CredentialSourceOptions<'_>,
+) -> Result<CredentialSource> {
     match (access_key_id, secret_access_key) {
         (None, None) => {
             if security_token.is_some() {
