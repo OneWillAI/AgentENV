@@ -557,10 +557,32 @@ impl Slot {
         )
     }
 
-    /// Keep announcing the new TAP MAC after snapshot resume until virtio-net
-    /// is processing again. A single worker enters the namespace once and
-    /// owns the bounded repair window; fresh boots never need this repair.
-    pub(crate) fn spawn_resume_arp_refresh(&self) {
+    /// Announce the TAP identity once before the first envd health probe.
+    ///
+    /// The first packet can race virtio-net on slower image starts, so send one
+    /// frame synchronously before starting the bounded readiness worker.
+    pub(crate) fn refresh_guest_arp_once(&self) -> Result<()> {
+        let netns_path = self.namespace_path();
+        let tap_ip = self.address_plan.tap_ip();
+        let vm_ip = self.address_plan.vm_ip();
+        let handle = thread::spawn(move || -> Result<()> {
+            let _netns = enter_network_namespace(&netns_path)?;
+            send_arp_request_on_tap("tap0", tap_ip, vm_ip)?;
+            send_arp_request_on_tap("tap0", tap_ip, tap_ip)
+        });
+        match handle.join() {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("ARP refresh thread panicked: {error:?}")),
+        }
+    }
+
+    /// Keep announcing the TAP MAC until the guest can answer readiness.
+    ///
+    /// Both a fresh boot and a snapshot resume can drop the first frame while
+    /// virtio-net comes online.  The readiness boundary starts exactly one
+    /// cancellable worker, so callers do not create separate boot and resume
+    /// loops or keep polling after the sandbox is torn down.
+    pub(crate) fn spawn_readiness_arp_refresh(&self) {
         let netns_path = self.namespace_path();
         let tap_ip = self.address_plan.tap_ip();
         let vm_ip = self.address_plan.vm_ip();
@@ -937,22 +959,27 @@ fn refresh_guest_arp_in(
     vm_ip: Ipv4Addr,
     cancellation: &ArpRefreshCancellation,
 ) -> Result<()> {
-    let netns = File::open(&netns_path)
-        .with_context(|| format!("failed to open network namespace {}", netns_path.display()))?;
-    nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
-        .context("failed to enter sandbox network namespace for ARP refresh")?;
-
     for attempt in 0..40 {
         if cancellation.is_cancelled() {
             return Ok(());
         }
-        let result = send_arp_request_on_tap("tap0", tap_ip, vm_ip)
-            .and_then(|()| send_arp_request_on_tap("tap0", tap_ip, tap_ip));
+        // setns is per-thread. Use a fresh thread for each attempt, as the
+        // original implementation did, so the caller's namespace and its
+        // capability state are never changed by a long-lived worker.
+        let attempt_netns = netns_path.clone();
+        let result = thread::spawn(move || -> Result<()> {
+            let _netns = enter_network_namespace(&attempt_netns)?;
+            send_arp_request_on_tap("tap0", tap_ip, vm_ip)
+                .and_then(|()| send_arp_request_on_tap("tap0", tap_ip, tap_ip))
+        })
+        .join()
+        .map_err(|error| anyhow!("ARP refresh attempt panicked: {error:?}"))
+        .and_then(|result| result);
         if let Err(error) = result {
             // The interface can be briefly unavailable while Firecracker
             // reconnects virtio-net. One missed frame must not give up the
             // bounded two-second repair window.
-            warn!(error = %error, attempt, "guest ARP refresh failed");
+            warn!(error = %format_args!("{error:#}"), attempt, "guest ARP refresh failed");
         }
         if attempt < 39 {
             if !cancellation.wait(Duration::from_millis(50)) {
@@ -961,6 +988,14 @@ fn refresh_guest_arp_in(
         }
     }
     Ok(())
+}
+
+fn enter_network_namespace(netns_path: &PathBuf) -> Result<File> {
+    let netns = File::open(netns_path)
+        .with_context(|| format!("failed to open network namespace {}", netns_path.display()))?;
+    nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
+        .context("failed to enter sandbox network namespace for ARP refresh")?;
+    Ok(netns)
 }
 
 fn build_arp_request_frame(

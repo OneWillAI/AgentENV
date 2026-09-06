@@ -346,9 +346,9 @@ pub struct SnapshotConfig {
 
 #[derive(Debug, Clone, Config)]
 pub struct TemplateConfig {
-    /// Apply the scheduler-provided cluster CPU intersection to ephemeral VMs
-    /// used while building templates. Operators may disable this on dedicated
-    /// builders whose KVM cannot accept the advertised CPU template.
+    /// Apply the scheduler-provided cluster CPU intersection to new templates
+    /// and cold-started VMs. Operators may disable this on dedicated hosts
+    /// whose KVM cannot accept the advertised CPU template.
     #[config(default = true, env = "AENV_TEMPLATE_APPLY_CLUSTER_CPU_CONFIG")]
     pub apply_cluster_cpu_config: bool,
 }

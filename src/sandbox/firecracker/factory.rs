@@ -32,6 +32,12 @@ impl FirecrackerSandboxFactory {
     }
 
     pub fn with_cpu_config(arc: Arc<RwLock<Option<String>>>) -> Self {
+        if !ConfigManager::global_config()
+            .template
+            .apply_cluster_cpu_config
+        {
+            return Self::new();
+        }
         Self {
             cpu_config_arc: Some(arc),
         }

@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -213,7 +214,7 @@ impl TemplateBuildRunner {
                     .context("create tokio runtime")?;
                 rt.block_on(async move {
                     let mut sandbox = create_sandbox()?;
-                    let run_result = async {
+                    let run_result: Result<TemplateBuildExecution> = async {
                         debug!(
                             cpu_count = resources.cpu_count,
                             memory_mib = resources.memory_mib,
@@ -244,14 +245,22 @@ impl TemplateBuildRunner {
                     }
                     .await;
 
+                    let diagnostics = run_result.as_ref().err().map(|error| {
+                        format!(
+                            "{error:#}; firecracker logs:\n{}",
+                            firecracker_diagnostics(&sandbox)
+                        )
+                    });
                     let stop_result = sandbox.stop().await;
                     match (run_result, stop_result) {
                         (Ok(result), Ok(())) => Ok(result),
-                        (Err(run_err), Ok(())) => Err(run_err),
+                        (Err(run_err), Ok(())) => Err(anyhow!(
+                            diagnostics.unwrap_or_else(|| format!("{run_err:#}"))
+                        )),
                         (Ok(_), Err(stop_err)) => Err(stop_err),
                         (Err(run_err), Err(stop_err)) => Err(anyhow!(
                             "{}; additionally failed to stop sandbox: {}",
-                            run_err,
+                            diagnostics.unwrap_or_else(|| format!("{run_err:#}")),
                             stop_err
                         )),
                     }
@@ -262,6 +271,38 @@ impl TemplateBuildRunner {
             Err(_) => bail!("snapshot build worker thread panicked"),
         }
     }
+}
+
+const FIRECRACKER_LOG_TAIL_BYTES: u64 = 16 * 1024;
+
+fn firecracker_diagnostics(sandbox: &FirecrackerSandbox) -> String {
+    let mut output = String::new();
+    for (label, path) in [
+        ("stdout", sandbox.firecracker_stdout_path()),
+        ("stderr", sandbox.firecracker_stderr_path()),
+        ("log", sandbox.firecracker_log_path()),
+    ] {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => continue,
+            Err(error) => {
+                output.push_str(&format!(
+                    "[{label} {} unavailable: {error}]\n",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let start = bytes
+            .len()
+            .saturating_sub(FIRECRACKER_LOG_TAIL_BYTES as usize);
+        output.push_str(&format!(
+            "[{label} {}]\n{}\n",
+            path.display(),
+            String::from_utf8_lossy(&bytes[start..])
+        ));
+    }
+    output
 }
 
 /// Provision the template's default user when the image does not have it.
