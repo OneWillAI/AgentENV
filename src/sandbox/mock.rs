@@ -6,7 +6,7 @@
 //! need a real VM.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +53,7 @@ pub enum MockOperation {
     Snapshot,
     Fork,
     ForkChild,
+    BranchDisk,
     Stop,
     UpdateNetwork,
 }
@@ -355,6 +356,11 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}
+
+    async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        self.behavior.apply_async(MockOperation::BranchDisk).await?;
+        Ok(output_dir.join("image.json"))
+    }
 }
 
 // ── MockBackendFactory ────────────────────────────────────────────────────────

@@ -37,6 +37,7 @@
 # API Reference
 
 - [API Reference](./api/index.md)
+- [Disk Branching and Runtime Discovery](./internals/disk-branch-api.md)
 
 # Integration
 

@@ -53,6 +53,8 @@ pub(crate) enum HoldNamespace {
     Runtime,
     /// Durable lease for an owner that is paused.
     Paused,
+    /// Durable hold for an immutable disk branch, independent of its parent.
+    DiskBranch,
 }
 
 impl HoldNamespace {
@@ -60,6 +62,7 @@ impl HoldNamespace {
         match self {
             HoldNamespace::Runtime => RUNTIME_HOLD_NAMESPACE,
             HoldNamespace::Paused => PAUSED_HOLD_NAMESPACE,
+            HoldNamespace::DiskBranch => "disk-branch",
         }
     }
 
@@ -67,6 +70,7 @@ impl HoldNamespace {
         match self {
             HoldNamespace::Runtime => "runtime_release",
             HoldNamespace::Paused => "paused_release",
+            HoldNamespace::DiskBranch => "disk_branch_release",
         }
     }
 }
@@ -1622,6 +1626,48 @@ mod tests {
             OverlaybdLayerLocation::CacheDir(_) => {}
             other => panic!("expected CacheDir for missing commit, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn disk_branch_layers_survive_restart_and_parent_hold_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(test_service(&temp));
+        let layer = write_commit_file(&service, "sha256:branch", b"branch");
+        service
+            .record_hard_commit_object("sha256:branch", Some(layer.clone()), Some(6))
+            .await
+            .unwrap();
+        let config = temp.path().join("branch.json");
+        write_image_config(
+            &config,
+            "",
+            json!([{
+                "file": layer.display().to_string(), "digest": "sha256:branch", "size": 6
+            }]),
+        );
+        service
+            .protect(HoldNamespace::DiskBranch, "branch-id", vec![config])
+            .await
+            .unwrap();
+        drop(service);
+        let reopened = Arc::new(test_service(&temp));
+        reopened
+            .reconcile_namespace(HoldNamespace::Paused, &[])
+            .await
+            .unwrap();
+        reopened.run_gc(BTreeMap::new(), true).await.unwrap();
+        assert!(
+            layer.exists(),
+            "retiring parent holds must preserve branch layers"
+        );
+        reopened
+            .release_protection_best_effort(HoldNamespace::DiskBranch, "branch-id")
+            .await;
+        reopened.run_gc(BTreeMap::new(), true).await.unwrap();
+        assert!(
+            !layer.exists(),
+            "explicitly retiring the branch permits reclamation"
+        );
     }
 
     #[tokio::test]

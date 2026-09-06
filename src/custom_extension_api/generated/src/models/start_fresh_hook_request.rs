@@ -24,6 +24,9 @@ pub struct StartFreshHookRequest {
     /// Per-runtime host interaction address routed to this sandbox.
     #[serde(rename = "hostInteractionIp")]
     pub host_interaction_ip: String,
+    /// Firecracker process ID after spawn and before boot.
+    #[serde(rename = "firecrackerPid", skip_serializing_if = "Option::is_none")]
+    pub firecracker_pid: Option<i32>,
     /// Opaque JSON object interpreted only by the custom extension. An absent value and an empty object are equivalent: both mean empty params.
     #[serde(
         rename = "customExtensionParams",
@@ -44,6 +47,7 @@ impl StartFreshHookRequest {
             sandbox_instance_id,
             network_namespace_path,
             host_interaction_ip,
+            firecracker_pid: None,
             custom_extension_params: None,
         }
     }

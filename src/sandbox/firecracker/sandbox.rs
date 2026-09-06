@@ -433,6 +433,10 @@ impl SandboxBackend for FirecrackerSandbox {
         }
     }
 
+    async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        FirecrackerSandbox::branch_user_disk(self, output_dir).await
+    }
+
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
         self.current_custom_extension_params = params;
     }
@@ -1004,6 +1008,42 @@ impl FirecrackerSandbox {
         self.work_dir.path().join(USER_ROOTFS_DRIVE_PATH)
     }
 
+    /// Pause Firecracker, copy the writable overlay, then resume. Does not
+    /// snapshot RAM or clone processes.
+    async fn branch_user_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(output_dir)
+            .await
+            .with_context(|| format!("create disk-branch dir {}", output_dir.display()))?;
+        self.fc_instance
+            .pause()
+            .await
+            .context("pause Firecracker for disk-branch")?;
+        let branched = self.export_user_disk(output_dir).await;
+        if let Err(resume_err) = self.fc_instance.resume().await {
+            return match branched {
+                Ok(_) => Err(resume_err).context("resume Firecracker after disk-branch"),
+                Err(copy_err) => Err(copy_err).context(format!(
+                    "resume Firecracker after failed disk-branch also failed: {resume_err:#}"
+                )),
+            };
+        }
+        branched
+    }
+
+    async fn export_user_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        let Some(runtime) = self.rootfs_runtime.as_ref() else {
+            anyhow::bail!("disk-branch requires an overlaybd-backed user image");
+        };
+        restack_snapshot_overlaybd_rootfs(
+            &runtime.device,
+            false,
+            &runtime.image_config_path,
+            output_dir,
+        )
+        .await
+        .context("copy writable overlay upper for disk-branch")
+    }
+
     fn new_managed_persistent_snapshot_root(&self) -> Arc<PersistentSnapshotRootGuard> {
         let sandbox_dir = self.id.to_string();
         let root = managed_snapshot_base().join(sandbox_dir);
@@ -1325,25 +1365,6 @@ impl FirecrackerSandbox {
             None => ip_config,
         });
 
-        // ── Custom extension hook: start-fresh (may contribute extra boot args) ──
-        if let Some(client) = CustomExtensionClient::global() {
-            let mut guard = CustomExtensionHookGuard::new(client, self.id);
-            let extra_boot_args = guard
-                .start_fresh(
-                    &netns.to_string_lossy(),
-                    interaction_ip,
-                    config.common.custom_extension_params.as_ref(),
-                )
-                .await?;
-            self.custom_extension_hook_guard = Some(guard);
-            if let Some(extra) = extra_boot_args.filter(|args| !args.trim().is_empty()) {
-                boot_args = Some(match boot_args.take() {
-                    Some(existing) => format!("{existing} {extra}"),
-                    None => extra,
-                });
-            }
-        }
-
         // ── Spawn Firecracker inside the network namespace so it can access tap0 ──
         let firecracker_binary = config.common.firecracker_binary.clone();
         let stdout_path = self.firecracker_stdout_path();
@@ -1357,6 +1378,27 @@ impl FirecrackerSandbox {
                 Some(&netns),
             )
             .await?;
+
+        // ── Custom extension hook: start-fresh after spawn, before boot ──
+        if let Some(client) = CustomExtensionClient::global() {
+            let mut guard = CustomExtensionHookGuard::new(client, self.id);
+            let firecracker_pid = self.fc_instance.pid().ok().map(|pid| pid.as_raw());
+            let extra_boot_args = guard
+                .start_fresh(
+                    &netns.to_string_lossy(),
+                    interaction_ip,
+                    firecracker_pid,
+                    config.common.custom_extension_params.as_ref(),
+                )
+                .await?;
+            self.custom_extension_hook_guard = Some(guard);
+            if let Some(extra) = extra_boot_args.filter(|args| !args.trim().is_empty()) {
+                boot_args = Some(match boot_args.take() {
+                    Some(existing) => format!("{existing} {extra}"),
+                    None => extra,
+                });
+            }
+        }
 
         let envd_base_url = format!(
             "http://{}:{}",

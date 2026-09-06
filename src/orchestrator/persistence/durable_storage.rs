@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-pub(super) fn sync_regular_file(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_regular_file(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
 
@@ -18,7 +18,7 @@ fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(super) fn sync_tree_bottom_up(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_tree_bottom_up(path: &Path) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -42,7 +42,7 @@ pub(super) fn sync_tree_bottom_up(path: &Path) -> std::io::Result<()> {
     sync_directory(path)
 }
 
-pub(super) fn sync_directory_chain(start: &Path, root: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory_chain(start: &Path, root: &Path) -> std::io::Result<()> {
     let mut current = Some(start);
     while let Some(directory) = current {
         sync_directory(directory)?;
@@ -54,7 +54,7 @@ pub(super) fn sync_directory_chain(start: &Path, root: &Path) -> std::io::Result
     Ok(())
 }
 
-pub(super) fn sync_artifact_tree_and_parents(
+pub(crate) fn sync_artifact_tree_and_parents(
     artifact_root: &Path,
     root: &Path,
 ) -> std::io::Result<()> {
@@ -71,7 +71,7 @@ pub(super) fn sync_artifact_tree_and_parents(
     sync_directory_chain(parent, root)
 }
 
-pub(super) fn write_file_atomically_and_sync(
+pub(crate) fn write_file_atomically_and_sync(
     path: &Path,
     bytes: &[u8],
     root: &Path,
@@ -93,7 +93,7 @@ pub(super) fn write_file_atomically_and_sync(
     sync_directory_chain(parent, root)
 }
 
-pub(super) fn remove_file_and_sync(path: &Path, root: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_file_and_sync(path: &Path, root: &Path) -> std::io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

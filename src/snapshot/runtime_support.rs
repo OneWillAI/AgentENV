@@ -271,34 +271,32 @@ async fn write_image_config(
     let serialized = serde_json::to_vec_pretty(image_config).map_err(|error| {
         RepositoryError::backend(format!("serialize runtime image config for {label}"), error)
     })?;
-    let mut tmp_path = destination.to_path_buf();
-    let mut tmp_name = destination
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_else(|| "image.json".into());
-    tmp_name.push(".tmp");
-    tmp_path.set_file_name(tmp_name);
-
-    tokio::fs::write(&tmp_path, serialized)
-        .await
-        .map_err(|error| {
-            RepositoryError::backend(
-                format!("write temp runtime image config '{}'", tmp_path.display()),
-                error,
+    let path = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image config has no parent",
             )
         })?;
-    tokio::fs::rename(&tmp_path, destination)
-        .await
-        .map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "move runtime image config '{}' to '{}'",
-                    tmp_path.display(),
-                    destination.display()
-                ),
-                error,
-            )
-        })?;
+        // A fixed .tmp name can be truncated by a concurrent materializer.
+        // Sync both the contents and rename before publishing a runnable path:
+        // a host reset must not leave a visible, empty image config.
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&serialized)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&path).map_err(|error| error.error)?;
+        std::fs::File::open(parent)?.sync_all()
+    })
+    .await
+    .map_err(|error| RepositoryError::backend("join runtime image publication", error))?
+    .map_err(|error| {
+        RepositoryError::backend(
+            format!("publish runtime image config '{}'", destination.display()),
+            error,
+        )
+    })?;
     Ok(destination.to_path_buf())
 }
 
@@ -427,5 +425,56 @@ mod tests {
         assert_eq!(cfg.lowers[1].uuid, "11111111-2222-3333-4444-555555555555");
         assert!(cfg.lowers.iter().all(|layer| layer.file.is_empty()));
         assert!(cfg.lowers.iter().all(|layer| !layer.dir.is_empty()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_materializers_publish_complete_configs_and_replace_damaged_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("image.json");
+        std::fs::write(&destination, b"").unwrap();
+        let layers = vec![OverlaybdLayerRef::External(ExternalLayer {
+            digest: "sha256:base".into(),
+            repo_blob_url: "https://registry.example/v2/base/blobs".into(),
+            size: 100,
+        })];
+        materialize_image_config(
+            &layers,
+            &destination,
+            "recovery",
+            None,
+            &TestOverlaybdLayerStore,
+            None,
+            |_, _| async { unreachable!("external layer") },
+        )
+        .await
+        .unwrap();
+        let mut writers = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let destination = destination.clone();
+            let layers = layers.clone();
+            writers.spawn(async move {
+                for _ in 0..8 {
+                    materialize_image_config(
+                        &layers,
+                        &destination,
+                        "concurrent",
+                        None,
+                        &TestOverlaybdLayerStore,
+                        None,
+                        |_, _| async { unreachable!("external layer") },
+                    )
+                    .await
+                    .unwrap();
+                    let bytes = tokio::fs::read(&destination).await.unwrap();
+                    let config: ImageConfig = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(config.lowers.len(), 1);
+                    assert_eq!(config.lowers[0].digest, "sha256:base");
+                }
+            });
+        }
+        while let Some(result) = writers.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

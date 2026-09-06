@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
-use overlaybd::config::{DownloadConfig, LayerConfig};
+use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig};
 use tracing::debug;
 
 use super::client::OssClient;
@@ -226,6 +226,21 @@ impl OssRuntimeResolver {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("{} has no layers", spec.label),
             });
+        }
+
+        // Older writers could leave zero-byte derived configs after a host
+        // reset. Rebuild only this disposable config from the committed record;
+        // retained snapshot data and layers are never removed.
+        if let Ok(bytes) = tokio::fs::read(destination).await {
+            if serde_json::from_slice::<ImageConfig>(&bytes).is_err() {
+                self.materialize_image_config(
+                    layers,
+                    destination,
+                    spec.label,
+                    spec.download.clone(),
+                )
+                .await?;
+            }
         }
 
         let download = spec.download.clone();

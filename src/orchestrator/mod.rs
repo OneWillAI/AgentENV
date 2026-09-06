@@ -1,6 +1,6 @@
 mod launch_plan;
 mod metrics;
-mod persistence;
+pub(crate) mod persistence;
 mod proxy;
 mod service;
 mod state_machine;
@@ -39,6 +39,7 @@ pub enum SandboxOperation {
     Resume,
     Snapshot,
     Fork,
+    DiskBranch,
     UpdateNetwork,
     PatchCustomExtensionParams,
     Stop,

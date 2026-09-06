@@ -1,6 +1,6 @@
 mod artifact_cleanup;
 mod codecs;
-mod durable_storage;
+pub(crate) mod durable_storage;
 mod file_backed;
 mod managed_paths;
 #[cfg(test)]

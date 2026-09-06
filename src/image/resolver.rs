@@ -63,6 +63,7 @@ pub struct ImageResolver {
     allowed_registries: Option<Vec<String>>,
     try_referrers_overlaybd_prefixes: Vec<String>,
     convert_standard_oci: bool,
+    disk_branch_root: PathBuf,
 }
 
 impl ImageResolver {
@@ -83,6 +84,7 @@ impl ImageResolver {
                 .try_referrers_overlaybd_prefixes
                 .clone(),
             convert_standard_oci: config.image.resolver.convert_standard_oci,
+            disk_branch_root: crate::disk_branch::root(config),
         }
     }
 
@@ -91,6 +93,9 @@ impl ImageResolver {
     }
 
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        if let Some(path) = image_ref.trim().strip_prefix("overlaybd-config:") {
+            return resolve_overlaybd_config_ref(&self.disk_branch_root, path);
+        }
         let candidates = image_ref_candidates(
             image_ref,
             &self.search_registries,
@@ -328,6 +333,24 @@ impl ImageResolver {
             image_config_metadata,
         ))
     }
+}
+
+fn resolve_overlaybd_config_ref(
+    root: &std::path::Path,
+    path: &str,
+) -> ImageResult<ResolvedBlockImage> {
+    let canonical =
+        crate::disk_branch::validate(root, std::path::Path::new(path)).map_err(|error| {
+            ImageError::InvalidReference {
+                reason: error.to_string(),
+            }
+        })?;
+    Ok(ResolvedBlockImage {
+        image_ref: format!("overlaybd-config:{}", canonical.display()),
+        overlaybd_config_path: canonical,
+        base_context: ImageBaseContext::default(),
+        raw_config: None,
+    })
 }
 
 fn resolved_from_cached_config(

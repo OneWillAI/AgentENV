@@ -1025,6 +1025,90 @@ where
         .await
     }
 
+    /// Copy a running sandbox's writable disk without cloning RAM or processes.
+    pub async fn branch_sandbox_disk(
+        self: &Arc<Self>,
+        source_sandbox_id: SandboxId,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("disk-branch", source_sandbox_id, async move {
+            this.branch_sandbox_disk_inner(source_sandbox_id, idempotency_key)
+                .await
+        })
+        .await
+    }
+
+    async fn branch_sandbox_disk_inner(
+        self: Arc<Self>,
+        source_sandbox_id: SandboxId,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
+        self.ensure_accepting_lifecycle_operations()?;
+        let metadata = self
+            .store
+            .get(&source_sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id: source_sandbox_id,
+                state: metadata.state,
+            });
+        }
+        let handle = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&source_sandbox_id).cloned()
+        }
+        .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        let mut sandbox = handle.lock().await;
+        let branch = crate::disk_branch::Publication::acquire(
+            crate::disk_branch::root(&ConfigManager::global_config()),
+            crate::disk_branch::identity(source_sandbox_id, idempotency_key.as_deref()),
+        )
+        .await?;
+        if let Some(image) = branch.replay()? {
+            let path = image
+                .strip_prefix("overlaybd-config:")
+                .expect("validated replay");
+            self.protect_image_refs(
+                RuntimeImageOwner::DiskBranch(branch.id.clone()),
+                RuntimeArtifactSet::from_overlaybd_image_configs(vec![path.into()]),
+                "disk-branch replay",
+            )
+            .await?;
+            return Ok(image);
+        }
+        // Recheck after taking the lifecycle lock; pause/delete may have won it.
+        let current = self
+            .store
+            .get(&source_sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        if current.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id: source_sandbox_id,
+                state: current.state,
+            });
+        }
+        branch.prepare()?;
+        let image_config = sandbox
+            .branch_disk(&branch.directory)
+            .await
+            .map_err(|source| OrchestratorError::SandboxOperationFailed {
+                sandbox_id: source_sandbox_id,
+                operation: SandboxOperation::DiskBranch,
+                source,
+            })?;
+        self.protect_image_refs(
+            RuntimeImageOwner::DiskBranch(branch.id.clone()),
+            RuntimeArtifactSet::from_overlaybd_image_configs(vec![image_config.clone()]),
+            "disk-branch publication",
+        )
+        .await?;
+        Ok(branch.commit(&image_config)?)
+    }
+
     #[tracing::instrument(
         name = "fork_sandbox",
         skip(self),

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cfg;
 mod digest;
+mod disk_branch;
 pub mod identity;
 pub mod image;
 mod local_store;
