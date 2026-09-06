@@ -13,8 +13,8 @@ use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxListFilter,
-    SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxIdempotency, CreateSandboxRequest, NewTimeout, OrchestratorError,
+    SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -68,6 +68,10 @@ impl From<OrchestratorError> for models::Error {
                 ),
             ),
             OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
+            OrchestratorError::CreateIdempotencyConflict { .. }
+            | OrchestratorError::CreateIdempotencyResultUnavailable { .. } => {
+                Self::new(400, err.to_string())
+            }
             other => ApiImpl::internal_error(&other),
         }
     }
@@ -259,6 +263,93 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
+fn create_idempotency<T: serde::Serialize>(
+    route: &'static str,
+    key: Option<&str>,
+    body: &T,
+) -> Result<Option<CreateSandboxIdempotency>, models::Error> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let mut body = serde_json::to_value(body).map_err(|err| ApiImpl::internal_error(&err))?;
+    normalize_create_fingerprint_body(route, &mut body);
+    canonicalize_json(&mut body);
+    let body = serde_json::to_vec(&body).map_err(|err| ApiImpl::internal_error(&err))?;
+    let mut fingerprint_input = Vec::with_capacity(route.len() + 1 + body.len());
+    fingerprint_input.extend_from_slice(route.as_bytes());
+    fingerprint_input.push(0);
+    fingerprint_input.extend_from_slice(&body);
+    let fingerprint = crate::digest::sha256_digest(&fingerprint_input);
+    CreateSandboxIdempotency::new(key, fingerprint)
+        .map(Some)
+        .map_err(|message| ApiImpl::error(400, message))
+}
+
+fn normalize_create_fingerprint_body(route: &str, body: &mut serde_json::Value) {
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+
+    // Normalize only static equivalences already enforced by the handlers.
+    // Config-dependent defaults (timeouts and cold-start resources) remain as
+    // supplied so a config reload cannot change an existing fingerprint.
+    let auto_pause = body
+        .get("autoPause")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    body.insert("autoPause".to_string(), serde_json::json!(auto_pause));
+
+    let secure = body
+        .get("secure")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    body.insert("secure".to_string(), serde_json::json!(secure));
+
+    let auto_resume = body
+        .get("autoResume")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|config| config.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    body.insert(
+        "autoResume".to_string(),
+        serde_json::json!({ "enabled": auto_resume }),
+    );
+
+    if body
+        .get("envVars")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|map| map.is_empty())
+    {
+        body.remove("envVars");
+    }
+
+    // The legacy MCP request member is currently ignored by the warm handler;
+    // it must not turn an otherwise identical replay into a conflict.
+    if route == "/sandboxes" {
+        body.remove("mcp");
+    }
+}
+
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize_json(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values_mut() {
+                canonicalize_json(value);
+            }
+            let mut entries: Vec<_> = std::mem::take(object).into_iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            object.extend(entries);
+        }
+        _ => {}
+    }
+}
+
 fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
     let config = ConfigManager::global_config();
     let default_cpu = config.machine.vcpu_count;
@@ -400,6 +491,41 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
+        let idempotency =
+            match create_idempotency("/sandboxes-cold", body.idempotency_key.as_deref(), body) {
+                Ok(idempotency) => idempotency,
+                Err(err) if err.code == 400 => {
+                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(err));
+                }
+                Err(err) => return Ok(SandboxesColdPostResponse::Status500_ServerError(err)),
+            };
+        if let Some(idempotency) = idempotency.as_ref() {
+            match self
+                .orchestrator
+                .replay_create_if_present(idempotency)
+                .await
+            {
+                Ok(Some(metadata)) => {
+                    let sandbox_id = metadata.id.to_string();
+                    return Ok(
+                        SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                            body: self.sandbox_model(metadata),
+                            x_agentenv_sandbox_id: Some(sandbox_id),
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(
+                    err @ (OrchestratorError::CreateIdempotencyConflict { .. }
+                    | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
+                ) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err.into())),
+                Err(err) => {
+                    return Ok(SandboxesColdPostResponse::Status500_ServerError(
+                        Self::internal_error(&err),
+                    ));
+                }
+            }
+        }
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
         // TODO: Move cold-start image resolution into an async create operation
@@ -505,6 +631,7 @@ impl Sandboxes<()> for ApiImpl {
             network_policy,
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
+            idempotency,
         };
 
         match timer
@@ -520,6 +647,10 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
+            Err(
+                err @ (OrchestratorError::CreateIdempotencyConflict { .. }
+                | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
+            ) => Ok(SandboxesColdPostResponse::Status400_BadRequest(err.into())),
             Err(err) => {
                 let invalid_request = match &err {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
@@ -577,6 +708,41 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
+        let idempotency =
+            match create_idempotency("/sandboxes", body.idempotency_key.as_deref(), body) {
+                Ok(idempotency) => idempotency,
+                Err(err) if err.code == 400 => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(err));
+                }
+                Err(err) => return Ok(SandboxesPostResponse::Status500_ServerError(err)),
+            };
+        if let Some(idempotency) = idempotency.as_ref() {
+            match self
+                .orchestrator
+                .replay_create_if_present(idempotency)
+                .await
+            {
+                Ok(Some(metadata)) => {
+                    let sandbox_id = metadata.id.to_string();
+                    return Ok(
+                        SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                            body: self.sandbox_model(metadata),
+                            x_agentenv_sandbox_id: Some(sandbox_id),
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(
+                    err @ (OrchestratorError::CreateIdempotencyConflict { .. }
+                    | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
+                ) => return Ok(SandboxesPostResponse::Status400_BadRequest(err.into())),
+                Err(err) => {
+                    return Ok(SandboxesPostResponse::Status500_ServerError(
+                        Self::internal_error(&err),
+                    ));
+                }
+            }
+        }
         let timer = SandboxStageTimer::new("create_warm");
         let snapshot = match timer
             .time(
@@ -638,6 +804,7 @@ impl Sandboxes<()> for ApiImpl {
             network_policy,
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
+            idempotency,
         };
 
         match timer
@@ -653,6 +820,10 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
+            Err(
+                err @ (OrchestratorError::CreateIdempotencyConflict { .. }
+                | OrchestratorError::CreateIdempotencyResultUnavailable { .. }),
+            ) => Ok(SandboxesPostResponse::Status400_BadRequest(err.into())),
             Err(err) => Ok(SandboxesPostResponse::Status500_ServerError(
                 Self::internal_error(&err),
             )),
@@ -1377,6 +1548,113 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_json_sorts_nested_object_keys() {
+        let mut value = serde_json::json!({
+            "z": { "second": 2, "first": 1 },
+            "a": [{ "right": true, "left": false }],
+        });
+        canonicalize_json(&mut value);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"a":[{"left":false,"right":true}],"z":{"first":1,"second":2}}"#
+        );
+    }
+
+    #[test]
+    fn create_idempotency_fingerprints_the_route_and_request() {
+        let mut body = models::NewSandbox::new("base-template".to_string());
+        body.idempotency_key = Some("create-operation-1".to_string());
+        let mut metadata = HashMap::new();
+        metadata.insert("first".to_string(), "1".to_string());
+        metadata.insert("second".to_string(), "2".to_string());
+        body.metadata = Some(metadata);
+        let first = create_idempotency("/sandboxes", body.idempotency_key.as_deref(), &body)
+            .unwrap()
+            .unwrap();
+        let mut replay_body = body.clone();
+        let mut reversed_metadata = HashMap::new();
+        reversed_metadata.insert("second".to_string(), "2".to_string());
+        reversed_metadata.insert("first".to_string(), "1".to_string());
+        replay_body.metadata = Some(reversed_metadata);
+        let replay = create_idempotency(
+            "/sandboxes",
+            replay_body.idempotency_key.as_deref(),
+            &replay_body,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first, replay);
+
+        body.timeout = Some(60);
+        let changed = create_idempotency("/sandboxes", body.idempotency_key.as_deref(), &body)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.request_fingerprint(), changed.request_fingerprint());
+
+        let other_route = create_idempotency(
+            "/sandboxes-cold",
+            replay_body.idempotency_key.as_deref(),
+            &replay_body,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            first.request_fingerprint(),
+            other_route.request_fingerprint()
+        );
+    }
+
+    #[test]
+    fn create_idempotency_normalizes_static_effective_defaults() {
+        let mut omitted = models::NewSandbox::new("base-template".to_string());
+        omitted.idempotency_key = Some("create-operation-defaults".to_string());
+        omitted.auto_pause = None;
+        omitted.auto_resume = None;
+        omitted.secure = None;
+        omitted.env_vars = None;
+
+        let mut explicit = omitted.clone();
+        explicit.auto_pause = Some(true);
+        explicit.auto_resume = Some(models::SandboxAutoResumeConfig::new());
+        explicit.secure = Some(false);
+        explicit.env_vars = Some(HashMap::new());
+
+        let omitted =
+            create_idempotency("/sandboxes", omitted.idempotency_key.as_deref(), &omitted)
+                .unwrap()
+                .unwrap();
+        let explicit =
+            create_idempotency("/sandboxes", explicit.idempotency_key.as_deref(), &explicit)
+                .unwrap()
+                .unwrap();
+        assert_eq!(omitted, explicit);
+    }
+
+    #[test]
+    fn create_idempotency_rejects_an_empty_key() {
+        let mut body = models::NewSandbox::new("base-template".to_string());
+        body.idempotency_key = Some(String::new());
+        let err = create_idempotency("/sandboxes", body.idempotency_key.as_deref(), &body)
+            .expect_err("empty key should be rejected");
+        assert_eq!(err.code, 400);
+    }
+
+    #[test]
+    fn create_idempotency_replay_errors_are_bad_requests() {
+        for err in [
+            OrchestratorError::CreateIdempotencyConflict {
+                key: "create-operation-1".to_string(),
+            },
+            OrchestratorError::CreateIdempotencyResultUnavailable {
+                key: "create-operation-2".to_string(),
+            },
+        ] {
+            let err: models::Error = err.into();
+            assert_eq!(err.code, 400);
+        }
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

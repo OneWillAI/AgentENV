@@ -2,18 +2,20 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
-    DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
+    CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister, RecordingCall,
+    RecordingPersister, SandboxPersister,
 };
 use super::super::types::SandboxLaunchSource;
 use super::*;
@@ -118,6 +120,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        create_idempotency: Mutex::new(HashMap::new()),
     })
 }
 
@@ -653,6 +656,8 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     let sandbox_id = SandboxId::new();
     let mut paused = paused_resume_metadata(sandbox_id);
     paused.auto_resume = true;
+    paused.create_idempotency_key = Some("restored-create-operation".to_string());
+    paused.create_request_fingerprint = Some("sha256:restored-request".to_string());
     let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
 
     let orchestrator = Orchestrator::new(
@@ -662,7 +667,14 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::LoadAll,
+            RecordingCall::LoadCreateIdempotency,
+            RecordingCall::PersistCreateIdempotency,
+        ]
+    );
     let restored = orchestrator
         .get_sandbox(&sandbox_id)
         .await?
@@ -673,8 +685,472 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
         orchestrator.proxy_lookup_for(&sandbox_id).await?,
         ProxyLookupResult::Paused { auto_resume: true }
     );
+    let replayed = orchestrator
+        .create_sandbox(idempotent_create_request(
+            "restored-create-operation",
+            "sha256:restored-request",
+        ))
+        .await?;
+    assert_eq!(replayed.id, sandbox_id);
+    assert_eq!(replayed.state, SandboxState::Paused);
     assert_metrics_values(&orchestrator, 0, 0, 0, 0, 0, 0).await;
     Ok(())
+}
+
+#[tokio::test]
+async fn new_converts_an_interrupted_create_claim_to_a_durable_tombstone() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let persister = RecordingPersister::with_loaded_and_create_idempotency(
+        Vec::new(),
+        vec![CreateIdempotencyRecord {
+            key: "interrupted-create".to_string(),
+            request_fingerprint: "sha256:interrupted".to_string(),
+            sandbox_id,
+            state: CreateIdempotencyRecordState::Creating,
+        }],
+    );
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await?;
+
+    let records = persister.create_idempotency_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, CreateIdempotencyRecordState::Failed);
+    let idempotency =
+        CreateSandboxIdempotency::new("interrupted-create", "sha256:interrupted").unwrap();
+    orchestrator
+        .replay_create_if_present(&idempotency)
+        .await
+        .expect_err("interrupted claim must remain fail-closed after restart");
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_rejects_duplicate_create_keys_in_paused_metadata() {
+    setup();
+    let mut first = paused_resume_metadata(SandboxId::new());
+    first.create_idempotency_key = Some("duplicate-create-key".to_string());
+    first.create_request_fingerprint = Some("sha256:duplicate".to_string());
+    let mut second = paused_resume_metadata(SandboxId::new());
+    second.create_idempotency_key = first.create_idempotency_key.clone();
+    second.create_request_fingerprint = first.create_request_fingerprint.clone();
+    let persister = RecordingPersister::with_loaded(vec![first, second]);
+
+    let result = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister,
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("duplicate restored create keys must fail startup"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("share create idempotency key"));
+}
+
+#[tokio::test]
+async fn restart_finishes_a_durable_deleting_record_before_releasing_the_key() -> Result<()> {
+    setup();
+    let key = "delete-restart";
+    let fingerprint = "sha256:delete-restart";
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(idempotent_create_request(key, fingerprint))
+        .await?;
+    let sandbox_id = created.id;
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::DeleteRecordAndArtifacts);
+
+    orchestrator
+        .delete_sandbox(sandbox_id)
+        .await
+        .expect_err("first durable delete should fail");
+    assert_eq!(
+        persister.create_idempotency_records()[0].state,
+        CreateIdempotencyRecordState::Deleting
+    );
+
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await?;
+    assert!(restarted.get_sandbox(&sandbox_id).await?.is_none());
+    assert!(persister.create_idempotency_records().is_empty());
+    let idempotency = CreateSandboxIdempotency::new(key, fingerprint).unwrap();
+    assert!(restarted
+        .replay_create_if_present(&idempotency)
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restored_paused_idempotent_delete_retains_the_key_and_durable_record() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let key = "delete-restored-paused";
+    let fingerprint = "sha256:delete-restored-paused";
+    let mut paused = paused_resume_metadata(sandbox_id);
+    paused.create_idempotency_key = Some(key.to_string());
+    paused.create_request_fingerprint = Some(fingerprint.to_string());
+    let record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        sandbox_id,
+        state: CreateIdempotencyRecordState::Succeeded,
+    };
+    let persister =
+        RecordingPersister::with_loaded_and_create_idempotency(vec![paused], vec![record.clone()]);
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await?;
+    persister.clear_calls();
+
+    let err = orchestrator
+        .delete_sandbox(sandbox_id)
+        .await
+        .expect_err("paused metadata alone cannot prove runtime absence");
+    assert!(err.to_string().contains("runtime handle is missing"));
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("paused metadata must remain")
+            .state,
+        SandboxState::Paused
+    );
+    assert_eq!(persister.create_idempotency_records(), vec![record.clone()]);
+    assert!(!persister.calls().iter().any(|call| matches!(
+        call,
+        RecordingCall::PersistCreateIdempotency
+            | RecordingCall::DeleteRecordAndArtifacts
+            | RecordingCall::DeleteCreateIdempotency
+    )));
+
+    drop(orchestrator);
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await?;
+    assert_eq!(
+        restarted
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("durable paused record must survive failed delete")
+            .state,
+        SandboxState::Paused
+    );
+    assert_eq!(persister.create_idempotency_records(), vec![record]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn idempotent_pause_stop_proof_allows_same_process_delete() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(idempotent_create_request(
+            "pause-delete-proof",
+            "sha256:pause-delete-proof",
+        ))
+        .await?;
+
+    orchestrator.pause_sandbox(created.id).await?;
+    let paused = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("paused metadata must remain");
+    assert!(paused.paused_runtime_stopped);
+    assert!(persister
+        .loaded_sandboxes()
+        .iter()
+        .any(|metadata| metadata.id == created.id && metadata.paused_runtime_stopped));
+
+    orchestrator.delete_sandbox(created.id).await?;
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert!(persister.create_idempotency_records().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_pause_stop_remains_unproven_after_restart_and_rejects_resume() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "pause stop is uncertain".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let key = "pause-stop-failure";
+    let fingerprint = "sha256:pause-stop-failure";
+    let created = orchestrator
+        .create_sandbox(idempotent_create_request(key, fingerprint))
+        .await?;
+
+    let err = orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("idempotent pause must surface an uncertain stop");
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::Stop,
+            ..
+        }
+    ));
+    let paused = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("uncertain pause metadata must remain fail-closed");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert!(!paused.paused_runtime_stopped);
+    orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("pause retry must not advertise an unproven stopped state");
+
+    let restarted = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await?;
+    let restored = restarted
+        .get_sandbox(&created.id)
+        .await?
+        .expect("uncertain paused record must remain durable");
+    assert!(!restored.paused_runtime_stopped);
+    persister.clear_calls();
+    restarted
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resume must reject missing durable stop proof");
+    restarted
+        .delete_sandbox(created.id)
+        .await
+        .expect_err("delete must retain the key without durable stop proof");
+    assert!(!persister.calls().contains(&RecordingCall::MarkResuming));
+    let records = persister.create_idempotency_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].key, key);
+    assert_eq!(records[0].state, CreateIdempotencyRecordState::Succeeded);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_running_sandbox_without_a_handle_keeps_the_key_fail_closed() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let key = "delete-missing-runtime-handle";
+    let fingerprint = "sha256:delete-missing-runtime-handle";
+    let record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        sandbox_id,
+        state: CreateIdempotencyRecordState::Succeeded,
+    };
+    let persister =
+        RecordingPersister::with_loaded_and_create_idempotency(Vec::new(), vec![record.clone()]);
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let mut metadata = SandboxMetadata {
+        id: sandbox_id,
+        state: SandboxState::Running,
+        create_idempotency_key: Some(key.to_string()),
+        create_request_fingerprint: Some(fingerprint.to_string()),
+        ..Default::default()
+    };
+    metadata.set_timeout(Some(Duration::from_secs(60)));
+    orchestrator.store.add(metadata).await?;
+    let (state, _) = tokio::sync::watch::channel(CreateIdempotencyState::Succeeded);
+    orchestrator.create_idempotency.lock().await.insert(
+        key.to_string(),
+        Arc::new(CreateIdempotencyEntry {
+            sandbox_id,
+            request_fingerprint: fingerprint.to_string(),
+            state,
+        }),
+    );
+
+    let err = orchestrator
+        .delete_sandbox(sandbox_id)
+        .await
+        .expect_err("missing running handle must not prove runtime absence");
+    assert!(err.to_string().contains("runtime handle is missing"));
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("metadata must be restored")
+            .state,
+        SandboxState::Running
+    );
+    assert_eq!(persister.create_idempotency_records(), vec![record]);
+    assert!(!persister.calls().iter().any(|call| matches!(
+        call,
+        RecordingCall::DeleteRecordAndArtifacts | RecordingCall::DeleteCreateIdempotency
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_delete_finisher_cannot_remove_a_new_claim_for_the_same_key() -> Result<()> {
+    setup();
+    let key = "delete-stale-finisher";
+    let new_record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: "sha256:new-claim".to_string(),
+        sandbox_id: SandboxId::new(),
+        state: CreateIdempotencyRecordState::Creating,
+    };
+    let persister = RecordingPersister::with_loaded_and_create_idempotency(
+        Vec::new(),
+        vec![new_record.clone()],
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let (new_state, _) = tokio::sync::watch::channel(CreateIdempotencyState::Creating);
+    let new_entry = Arc::new(CreateIdempotencyEntry {
+        sandbox_id: new_record.sandbox_id,
+        request_fingerprint: new_record.request_fingerprint.clone(),
+        state: new_state,
+    });
+    orchestrator
+        .create_idempotency
+        .lock()
+        .await
+        .insert(key.to_string(), Arc::clone(&new_entry));
+
+    let (old_state, _) = tokio::sync::watch::channel(CreateIdempotencyState::Deleting);
+    let stale_entry = Arc::new(CreateIdempotencyEntry {
+        sandbox_id: SandboxId::new(),
+        request_fingerprint: "sha256:old-claim".to_string(),
+        state: old_state,
+    });
+    orchestrator
+        .finish_durable_sandbox_delete(key, &stale_entry)
+        .await?;
+
+    assert_eq!(persister.create_idempotency_records(), vec![new_record]);
+    assert!(Arc::ptr_eq(
+        orchestrator
+            .create_idempotency
+            .lock()
+            .await
+            .get(key)
+            .expect("new claim must remain installed"),
+        &new_entry
+    ));
+    assert!(persister.calls().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_create_finisher_cannot_overwrite_a_deleting_claim() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let key = "create-stale-finisher";
+    let fingerprint = "sha256:create-stale-finisher";
+    let record = CreateIdempotencyRecord {
+        key: key.to_string(),
+        request_fingerprint: fingerprint.to_string(),
+        sandbox_id,
+        state: CreateIdempotencyRecordState::Deleting,
+    };
+    let persister =
+        RecordingPersister::with_loaded_and_create_idempotency(Vec::new(), vec![record.clone()]);
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let (state, _) = tokio::sync::watch::channel(CreateIdempotencyState::Deleting);
+    let entry = Arc::new(CreateIdempotencyEntry {
+        sandbox_id,
+        request_fingerprint: fingerprint.to_string(),
+        state,
+    });
+    orchestrator
+        .create_idempotency
+        .lock()
+        .await
+        .insert(key.to_string(), Arc::clone(&entry));
+
+    let err = orchestrator
+        .finish_idempotent_create(
+            key,
+            &entry,
+            Ok(SandboxMetadata {
+                id: sandbox_id,
+                state: SandboxState::Running,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("deleting must win over stale create completion");
+
+    assert!(matches!(
+        err,
+        OrchestratorError::CreateIdempotencyResultUnavailable { ref key }
+            if key == "create-stale-finisher"
+    ));
+    assert_eq!(persister.create_idempotency_records(), vec![record]);
+    assert!(persister.calls().is_empty());
+    Ok(())
+}
+
+#[test]
+fn create_completion_guard_never_overwrites_deleting() {
+    let (state, _) = tokio::sync::watch::channel(CreateIdempotencyState::Creating);
+    let entry = Arc::new(CreateIdempotencyEntry {
+        sandbox_id: SandboxId::new(),
+        request_fingerprint: "sha256:guard-delete-race".to_string(),
+        state,
+    });
+    let guard = CreateIdempotencyCompletionGuard::new(Arc::clone(&entry));
+    entry.state.send_replace(CreateIdempotencyState::Deleting);
+
+    drop(guard);
+
+    assert!(matches!(
+        &*entry.state.borrow(),
+        CreateIdempotencyState::Deleting
+    ));
 }
 
 #[tokio::test]
@@ -1078,7 +1554,298 @@ fn create_request(
         custom_extension_params: None,
         auto_resume: false,
         secure: false,
+        idempotency: None,
     }
+}
+
+fn idempotent_create_request(key: &str, fingerprint: &str) -> CreateSandboxRequest {
+    let mut request = create_request(Some(60), &[]);
+    request.idempotency = Some(
+        CreateSandboxIdempotency::new(key, fingerprint)
+            .expect("test idempotency input should be valid"),
+    );
+    request
+}
+
+#[tokio::test]
+async fn create_retry_after_caller_cancellation_replays_one_runtime() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::StartNowait,
+        MockAction::SucceedAfter(Duration::from_millis(100)),
+    );
+    let start_count = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    behavior.set_on_operation(MockOperation::StartNowait, {
+        let start_count = Arc::clone(&start_count);
+        let started = Arc::clone(&started);
+        Arc::new(move || {
+            start_count.fetch_add(1, Ordering::Relaxed);
+            started.notify_one();
+        })
+    });
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let request = idempotent_create_request("create-operation-1", "sha256:request-1");
+
+    let first = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        let request = request.clone();
+        async move { orchestrator.create_sandbox(request).await }
+    });
+    started.notified().await;
+    // Dropping the outer create future models an API handler being cancelled
+    // when its HTTP client times out. run_cancellation_safe must leave the
+    // spawned owner operation alive so this concurrent replay can join it.
+    first.abort();
+    assert!(first
+        .await
+        .expect_err("caller should be cancelled")
+        .is_cancelled());
+
+    let replayed = orchestrator.create_sandbox(request).await?;
+    let sandboxes = orchestrator.list_sandboxes().await?;
+    assert_eq!(
+        sandboxes.len(),
+        1,
+        "retry must not create an orphan runtime"
+    );
+    assert_eq!(sandboxes[0].id, replayed.id);
+    assert_eq!(start_count.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_retry_during_claim_persistence_reuses_the_supervised_claim() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let (claim_entered, release_claim) = persister.block_next_create_idempotency_persist();
+    let start_count = Arc::new(AtomicUsize::new(0));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(MockOperation::StartNowait, {
+        let start_count = Arc::clone(&start_count);
+        Arc::new(move || {
+            start_count.fetch_add(1, Ordering::Relaxed);
+        })
+    });
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let request = idempotent_create_request(
+        "create-operation-claim-cancel",
+        "sha256:request-claim-cancel",
+    );
+
+    let first = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        let request = request.clone();
+        async move { orchestrator.create_sandbox(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), claim_entered.acquire())
+        .await
+        .expect("first create must enter durable claim persistence")
+        .expect("claim barrier must remain open")
+        .forget();
+
+    first.abort();
+    assert!(first
+        .await
+        .expect_err("first caller should be cancelled")
+        .is_cancelled());
+
+    let retry = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.create_sandbox(request).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !retry.is_finished(),
+        "retry must wait for the supervised first claim"
+    );
+
+    release_claim.add_permits(1);
+    let replayed = tokio::time::timeout(Duration::from_secs(1), retry)
+        .await
+        .expect("retry must not hang after claim persistence is released")
+        .expect("retry task must not panic")?;
+
+    let sandboxes = orchestrator.list_sandboxes().await?;
+    assert_eq!(sandboxes.len(), 1);
+    assert_eq!(sandboxes[0].id, replayed.id);
+    assert_eq!(start_count.load(Ordering::Relaxed), 1);
+
+    let records = persister.create_idempotency_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].sandbox_id, replayed.id);
+    assert_eq!(records[0].state, CreateIdempotencyRecordState::Succeeded);
+    assert_eq!(
+        persister
+            .calls()
+            .into_iter()
+            .filter(|call| *call == RecordingCall::PersistCreateIdempotency)
+            .count(),
+        2,
+        "one Creating claim and one Succeeded result must be persisted"
+    );
+    let entries = orchestrator.create_idempotency.lock().await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries
+            .get("create-operation-claim-cancel")
+            .expect("current claim must remain published")
+            .sandbox_id,
+        replayed.id
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_rejects_idempotency_key_reuse_for_different_request() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    orchestrator
+        .create_sandbox(idempotent_create_request(
+            "create-operation-2",
+            "sha256:request-1",
+        ))
+        .await?;
+
+    let err = orchestrator
+        .create_sandbox(idempotent_create_request(
+            "create-operation-2",
+            "sha256:request-2",
+        ))
+        .await
+        .expect_err("changed request must not reuse an idempotency key");
+    assert!(matches!(
+        err,
+        OrchestratorError::CreateIdempotencyConflict { ref key }
+            if key == "create-operation-2"
+    ));
+    assert_eq!(orchestrator.list_sandboxes().await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn idempotent_create_is_journaled_before_start_and_fast_replays() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let start_count = Arc::new(AtomicUsize::new(0));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(MockOperation::StartNowait, {
+        let persister = persister.clone();
+        let start_count = Arc::clone(&start_count);
+        Arc::new(move || {
+            start_count.fetch_add(1, Ordering::Relaxed);
+            let records = persister.create_idempotency_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].state, CreateIdempotencyRecordState::Creating);
+        })
+    });
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let request = idempotent_create_request("create-operation-fast", "sha256:request-fast");
+    let idempotency = request.idempotency.clone().unwrap();
+
+    let created = orchestrator.create_sandbox(request).await?;
+    let replayed = orchestrator
+        .replay_create_if_present(&idempotency)
+        .await?
+        .expect("fast replay should find the successful create");
+    assert_eq!(replayed.id, created.id);
+    assert_eq!(start_count.load(Ordering::Relaxed), 1);
+    let records = persister.create_idempotency_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, CreateIdempotencyRecordState::Succeeded);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_retains_a_durable_tombstone_and_blocks_recreate() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "runtime never became ready".to_string(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "runtime cleanup uncertain".to_string(),
+        },
+    );
+    let start_count = Arc::new(AtomicUsize::new(0));
+    behavior.set_on_operation(MockOperation::StartNowait, {
+        let start_count = Arc::clone(&start_count);
+        Arc::new(move || {
+            start_count.fetch_add(1, Ordering::Relaxed);
+        })
+    });
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let request = idempotent_create_request("create-operation-failed", "sha256:request-failed");
+
+    orchestrator
+        .create_sandbox(request.clone())
+        .await
+        .expect_err("first create should fail");
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        orchestrator.create_sandbox(request),
+    )
+    .await
+    .expect("failed replay must not hang")
+    .expect_err("failed replay must remain fail-closed");
+    assert_eq!(start_count.load(Ordering::Relaxed), 1);
+    let records = persister.create_idempotency_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, CreateIdempotencyRecordState::Failed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_panic_becomes_a_durable_failure_instead_of_hanging_replay() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(
+        MockOperation::StartNowait,
+        Arc::new(|| panic!("forced create panic")),
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let request = idempotent_create_request("create-operation-panic", "sha256:request-panic");
+
+    orchestrator
+        .create_sandbox(request.clone())
+        .await
+        .expect_err("panicking create should return an error");
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        orchestrator.create_sandbox(request),
+    )
+    .await
+    .expect("panic replay must not hang")
+    .expect_err("panic replay must remain fail-closed");
+    let records = persister.create_idempotency_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, CreateIdempotencyRecordState::Failed);
+    Ok(())
 }
 
 fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size: u64) {
@@ -1140,6 +1907,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             custom_extension_params: None,
             auto_resume: false,
             secure: false,
+            idempotency: None,
         })
         .await?;
 
@@ -1643,7 +2411,8 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
         persister.calls(),
         vec![
             RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused
+            RecordingCall::PersistPaused,
+            RecordingCall::MarkPausedRuntimeStopped,
         ]
     );
     let metadata = orchestrator
@@ -1798,6 +2567,7 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
+            RecordingCall::MarkPausedRuntimeStopped,
         ]
     );
 
@@ -2904,6 +3674,7 @@ async fn orchestrator_delete_paused_sandbox_removes_metadata() -> Result<()> {
         vec![
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
+            RecordingCall::MarkPausedRuntimeStopped,
             RecordingCall::DeleteRecordAndArtifacts
         ]
     );
@@ -3374,6 +4145,46 @@ async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> 
 }
 
 #[tokio::test]
+async fn resume_clears_durable_stop_proof_before_building_a_runtime() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    let resume_builds = Arc::new(AtomicUsize::new(0));
+    behavior.set_on_operation(MockOperation::BuildFromSnapshot, {
+        let persister = persister.clone();
+        let resume_builds = Arc::clone(&resume_builds);
+        Arc::new(move || {
+            let records = persister.loaded_sandboxes();
+            assert_eq!(records.len(), 1);
+            assert!(
+                !records[0].paused_runtime_stopped,
+                "durable stop proof must be cleared before resume build"
+            );
+            resume_builds.fetch_add(1, Ordering::Relaxed);
+        })
+    });
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister,
+    );
+    let created = orchestrator
+        .create_sandbox(idempotent_create_request(
+            "resume-clears-stop-proof",
+            "sha256:resume-clears-stop-proof",
+        ))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    assert_eq!(resume_builds.load(Ordering::Relaxed), 1);
+    assert!(!resumed.paused_runtime_stopped);
+    Ok(())
+}
+
+#[tokio::test]
 async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
@@ -3443,13 +4254,18 @@ async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
     ));
     assert_eq!(
         persister.calls(),
-        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+        vec![
+            RecordingCall::MarkResuming,
+            RecordingCall::RollbackResuming,
+            RecordingCall::MarkPausedRuntimeStopped,
+        ]
     );
     let metadata = orchestrator
         .get_sandbox(&created.id)
         .await?
         .expect("metadata should remain after resume launch failure");
     assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(metadata.paused_runtime_stopped);
     assert_proxy_paused(&orchestrator, &created.id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
@@ -3605,7 +4421,10 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
     assert_eq!(metadata.state, SandboxState::Paused);
     assert_eq!(metadata.virtualization_mode, sandbox_mode);
     assert!(metadata.paused_state.is_none());
-    assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::LoadAll, RecordingCall::LoadCreateIdempotency]
+    );
 }
 
 #[tokio::test]
@@ -3742,8 +4561,10 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
         vec![
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
+            RecordingCall::MarkPausedRuntimeStopped,
             RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused
+            RecordingCall::PersistPaused,
+            RecordingCall::MarkPausedRuntimeStopped,
         ]
     );
 
@@ -4441,8 +5262,14 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
             .await;
     let mut request = create_request(Some(60), &[("team", "batch-fork-source")]);
     request.secure = true;
+    request.idempotency =
+        Some(CreateSandboxIdempotency::new("fork-source-create", "sha256:fork-source").unwrap());
     let source = orchestrator.create_sandbox(request).await?;
     assert!(source.secure);
+    assert_eq!(
+        source.create_idempotency_key.as_deref(),
+        Some("fork-source-create")
+    );
     let source_token = orchestrator
         .get_envd_access_token(&source)
         .expect("secure source has a token");
@@ -4467,6 +5294,8 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
         assert_eq!(child.user_metadata, source.user_metadata);
         assert_eq!(child.timeout, source.timeout);
         assert!(child.secure);
+        assert!(child.create_idempotency_key.is_none());
+        assert!(child.create_request_fingerprint.is_none());
         let child_token = orchestrator
             .get_envd_access_token(child)
             .expect("secure child has a token");

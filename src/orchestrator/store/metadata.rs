@@ -48,6 +48,16 @@ pub struct SandboxMetadata {
     #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
     pub image_configs: ImageConfigs,
     pub user_metadata: Option<HashMap<String, String>>,
+    /// Internal create retry identity. This is separate from user metadata so
+    /// clients cannot accidentally alter or filter on lifecycle bookkeeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_fingerprint: Option<String>,
+    /// Durable proof that the paused runtime was successfully stopped after
+    /// its resume artifacts were persisted. Legacy records default false.
+    #[serde(default)]
+    pub paused_runtime_stopped: bool,
     pub network_policy: SandboxNetworkPolicy,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Persisted into committed snapshots so template launches inherit it
@@ -88,6 +98,9 @@ impl Default for SandboxMetadata {
             startup: None,
             image_configs: ImageConfigs::new(),
             user_metadata: None,
+            create_idempotency_key: None,
+            create_request_fingerprint: None,
+            paused_runtime_stopped: false,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             secure: false,
@@ -149,6 +162,17 @@ mod tests {
         metadata.set_timeout(None);
         assert_eq!(metadata.timeout, None);
         assert_eq!(metadata.expires_at, None);
+    }
+
+    #[test]
+    fn legacy_metadata_without_paused_stop_proof_defaults_fail_closed() {
+        let mut value = serde_json::to_value(SandboxMetadata::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("paused_runtime_stopped");
+        let metadata: SandboxMetadata = serde_json::from_value(value).unwrap();
+        assert!(!metadata.paused_runtime_stopped);
     }
 
     #[test]

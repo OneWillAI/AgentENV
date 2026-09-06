@@ -92,6 +92,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             auto_resume: false,
             custom_extension_params: None,
             secure: true,
+            idempotency: None,
         };
 
         let created = orchestrator.create_sandbox(request).await?;
@@ -250,6 +251,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 secure: false,
+                idempotency: None,
             })
             .await?;
         let sandbox_id = created.id;
@@ -344,6 +346,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 secure: false,
+                idempotency: None,
             })
             .await?;
         assert_eq!(relaunched.state, SandboxState::Running);

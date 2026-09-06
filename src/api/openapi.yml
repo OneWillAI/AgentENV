@@ -523,6 +523,16 @@ components:
             Identifier of the required template/snapshot. Use
             POST /sandboxes-cold to create a sandbox directly from an external
             OCI image.
+        idempotencyKey:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >
+            Opaque identity for safely retrying this create request. A
+            successful replay routed to the same AgentENV node returns the
+            original sandbox while its result remains available. Uncertain or
+            restarted outcomes fail closed, and reusing the key with a
+            different request is rejected.
         timeout:
           type: integer
           format: int32
@@ -573,6 +583,16 @@ components:
             Explicit external OCI image reference to use as the sandbox rootfs.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
+        idempotencyKey:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >
+            Opaque identity for safely retrying this create request. A
+            successful replay routed to the same AgentENV node returns the
+            original sandbox while its result remains available. Uncertain or
+            restarted outcomes fail closed, and reusing the key with a
+            different request is rejected.
         timeout:
           type: integer
           format: int32

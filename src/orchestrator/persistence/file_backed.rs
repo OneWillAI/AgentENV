@@ -9,7 +9,9 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::{
+    CreateIdempotencyRecord, PersistenceResult, SandboxPersistenceError, SandboxPersister,
+};
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
@@ -18,6 +20,8 @@ use crate::virtualization::VirtualizationMode;
 
 const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
+const CREATE_IDEMPOTENCY_RECORD_VERSION: u32 = 1;
+const CREATE_IDEMPOTENCY_DB_DIR: &str = "create-idempotency.db";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +38,13 @@ struct PersistedPausedRecord {
     metadata: SandboxMetadata,
     artifact_root: PathBuf,
     state: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedCreateIdempotencyRecord {
+    version: u32,
+    record: CreateIdempotencyRecord,
 }
 
 impl PersistedPausedRecord {
@@ -83,11 +94,36 @@ fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
     }
 }
 
+fn decode_create_idempotency_record(bytes: &[u8]) -> PersistenceResult<CreateIdempotencyRecord> {
+    let persisted: PersistedCreateIdempotencyRecord =
+        serde_json::from_slice(bytes).map_err(|source| SandboxPersistenceError::InvalidRecord {
+            reason: "failed to deserialize create idempotency record".to_string(),
+            source: Some(source.into()),
+        })?;
+    if persisted.version != CREATE_IDEMPOTENCY_RECORD_VERSION {
+        return Err(SandboxPersistenceError::InvalidRecord {
+            reason: format!(
+                "unsupported create idempotency record version {}",
+                persisted.version
+            ),
+            source: None,
+        });
+    }
+    if persisted.record.key.is_empty() || persisted.record.request_fingerprint.is_empty() {
+        return Err(SandboxPersistenceError::InvalidRecord {
+            reason: "create idempotency record has an empty key or fingerprint".to_string(),
+            source: None,
+        });
+    }
+    Ok(persisted.record)
+}
+
 pub struct FileBackedSandboxPersister {
     root: PathBuf,
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
     db: OnceCell<LocalKvStore>,
+    create_idempotency_db: OnceCell<LocalKvStore>,
 }
 
 impl FileBackedSandboxPersister {
@@ -97,6 +133,7 @@ impl FileBackedSandboxPersister {
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
             db: OnceCell::new(),
+            create_idempotency_db: OnceCell::new(),
         }
     }
 
@@ -114,6 +151,10 @@ impl FileBackedSandboxPersister {
         self.root.join(RECORD_DB_DIR)
     }
 
+    fn create_idempotency_db_path(&self) -> PathBuf {
+        self.root.join(CREATE_IDEMPOTENCY_DB_DIR)
+    }
+
     fn artifacts_root(&self) -> PathBuf {
         self.root.join("artifacts")
     }
@@ -128,6 +169,19 @@ impl FileBackedSandboxPersister {
                 LocalKvStore::open(self.records_db_path(), self.durability)
                     .await
                     .map_err(|source| SandboxPersistenceError::store("open RocksDB", source))
+            })
+            .await
+            .cloned()
+    }
+
+    async fn create_idempotency_db(&self) -> PersistenceResult<LocalKvStore> {
+        self.create_idempotency_db
+            .get_or_try_init(|| async {
+                LocalKvStore::open(self.create_idempotency_db_path(), self.durability)
+                    .await
+                    .map_err(|source| {
+                        SandboxPersistenceError::store("open create idempotency RocksDB", source)
+                    })
             })
             .await
             .cloned()
@@ -371,10 +425,27 @@ impl SandboxPersister for FileBackedSandboxPersister {
         result
     }
 
+    async fn mark_paused_runtime_stopped(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        debug!(sandbox_id = %sandbox_id, "marking paused runtime as stopped");
+        let mut record = self.get_record(sandbox_id).await?;
+        if record.lifecycle != PersistedPausedLifecycle::Paused {
+            return Err(SandboxPersistenceError::InvalidRecord {
+                reason: format!(
+                    "cannot mark paused runtime {sandbox_id} stopped while record is {:?}",
+                    record.lifecycle
+                ),
+                source: None,
+            });
+        }
+        record.metadata.paused_runtime_stopped = true;
+        self.put_record(&record).await
+    }
+
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "marking paused sandbox as resuming");
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Resuming;
+        record.metadata.paused_runtime_stopped = false;
         self.put_record(&record).await
     }
 
@@ -382,6 +453,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         debug!(sandbox_id = %sandbox_id, "rolling back paused sandbox to paused");
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Paused;
+        record.metadata.paused_runtime_stopped = false;
         self.put_record(&record).await
     }
 
@@ -396,11 +468,83 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
         Ok(())
     }
+
+    async fn load_create_idempotency_records(
+        &self,
+    ) -> PersistenceResult<Vec<CreateIdempotencyRecord>> {
+        let entries = self
+            .create_idempotency_db()
+            .await?
+            .entries()
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::store("scan create idempotency records", source)
+            })?;
+        let mut records = Vec::with_capacity(entries.len());
+        for (key, bytes) in entries {
+            let stored_key = String::from_utf8(key).map_err(|source| {
+                SandboxPersistenceError::InvalidRecord {
+                    reason: "create idempotency record key is not UTF-8".to_string(),
+                    source: Some(source.into()),
+                }
+            })?;
+            let record = decode_create_idempotency_record(&bytes)?;
+            if record.key != stored_key {
+                return Err(SandboxPersistenceError::InvalidRecord {
+                    reason: format!(
+                        "create idempotency record key mismatch: database key '{stored_key}' contains '{}'",
+                        record.key
+                    ),
+                    source: None,
+                });
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    async fn persist_create_idempotency_record(
+        &self,
+        record: &CreateIdempotencyRecord,
+    ) -> PersistenceResult<()> {
+        if record.key.is_empty() || record.request_fingerprint.is_empty() {
+            return Err(SandboxPersistenceError::InvalidRecord {
+                reason: "create idempotency record has an empty key or fingerprint".to_string(),
+                source: None,
+            });
+        }
+        let bytes = serde_json::to_vec(&PersistedCreateIdempotencyRecord {
+            version: CREATE_IDEMPOTENCY_RECORD_VERSION,
+            record: record.clone(),
+        })
+        .map_err(|source| SandboxPersistenceError::InvalidRecord {
+            reason: "failed to serialize create idempotency record".to_string(),
+            source: Some(source.into()),
+        })?;
+        self.create_idempotency_db()
+            .await?
+            .put(record.key.as_bytes().to_vec(), bytes)
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::store("persist create idempotency record", source)
+            })
+    }
+
+    async fn delete_create_idempotency_record(&self, key: &str) -> PersistenceResult<()> {
+        self.create_idempotency_db()
+            .await?
+            .delete(key.as_bytes().to_vec())
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::store("delete create idempotency record", source)
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::persistence::CreateIdempotencyRecordState;
     use crate::sandbox::{
         mock::{MockBackendFactory, MockSnapshot},
         FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
@@ -501,6 +645,40 @@ mod tests {
             .get(sandbox_id.to_string())
             .await?
             .is_some())
+    }
+
+    #[tokio::test]
+    async fn create_idempotency_journal_round_trips_and_deletes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let mut record = CreateIdempotencyRecord {
+            key: "create-journal-roundtrip".to_string(),
+            request_fingerprint: "sha256:journal-roundtrip".to_string(),
+            sandbox_id: SandboxId::new(),
+            state: CreateIdempotencyRecordState::Creating,
+        };
+
+        persister.persist_create_idempotency_record(&record).await?;
+        assert_eq!(
+            persister.load_create_idempotency_records().await?,
+            vec![record.clone()]
+        );
+
+        record.state = CreateIdempotencyRecordState::Succeeded;
+        persister.persist_create_idempotency_record(&record).await?;
+        assert_eq!(
+            persister.load_create_idempotency_records().await?,
+            vec![record.clone()]
+        );
+
+        persister
+            .delete_create_idempotency_record(&record.key)
+            .await?;
+        assert!(persister
+            .load_create_idempotency_records()
+            .await?
+            .is_empty());
+        Ok(())
     }
 
     #[tokio::test]
