@@ -8,7 +8,7 @@ use super::stack::{
 use super::types::*;
 use crate::backend::local::LocalFile;
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile, VirtualFileWriter};
-use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
+use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET};
 use crate::lsmt::index::{ReadOnlyIndex, Segment, SegmentMapping};
 use crate::test_utils::test_io_ring;
 use anyhow::{bail, ensure, Result};
@@ -983,6 +983,109 @@ async fn test_hybrid_reopen_detects_file_type() {
 }
 
 #[tokio::test]
+async fn test_backed_zero_survives_rw_reopen_but_not_readonly_export() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data, index, upper) = create_hybrid_lsmt_env(&temp_dir, 1024 * 1024).await;
+    upper.write_at(0, &[0xAB; 4096]).await.unwrap();
+    upper.sync().await.unwrap();
+    drop(upper);
+
+    // Seed a backed-zero record without relying on discard retaining space
+    // yet. RW replay must preserve it, unlike readonly index construction.
+    let zero = SegmentMapping::new(1, 2, HEADER_SIZE / ALIGNMENT + 1, true, 0);
+    index
+        .write_at(
+            index.size().await.unwrap(),
+            DiskSegmentMapping::from_memory(&zero).as_bytes(),
+        )
+        .await
+        .unwrap();
+    index.sync().await.unwrap();
+    let upper = open_hybrid_lsmt_env(data.clone(), index, None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(upper.index.read().await.upper.dump()[1], zero);
+    assert_eq!(upper.read_at(512, 1024).await.unwrap().as_ref(), &[0; 1024]);
+    assert_eq!(upper.read_at(0, 512).await.unwrap().as_ref(), &[0xAB; 512]);
+    assert_eq!(
+        upper.read_at(1536, 512).await.unwrap().as_ref(),
+        &[0xAB; 512]
+    );
+
+    let exported: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("zero-export.lsmt")).unwrap());
+    upper
+        .export_upper_as_sealed(CommitArgs::new(exported.clone()))
+        .await
+        .unwrap();
+    assert_eq!(upper.index.read().await.upper.dump()[1], zero);
+    upper.close_seal().await.unwrap();
+
+    for sealed in [exported, data as Arc<dyn VirtualFile>] {
+        let trailer = verify_ht(&sealed, true, sealed.size().await.unwrap())
+            .await
+            .unwrap();
+        let raw = load_index_and_reset_tags(
+            &sealed,
+            trailer.index_offset.get(),
+            trailer.index_size.get() as usize,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw.iter().filter(|m| m.zeroed).count(), 1);
+        assert!(raw
+            .iter()
+            .filter(|m| m.zeroed)
+            .all(|m| m.moffset == NO_PHYSICAL_OFFSET));
+        let lower = open_file_ro(sealed).await.unwrap();
+        assert_eq!(lower.read_at(512, 1024).await.unwrap().as_ref(), &[0; 1024]);
+    }
+}
+
+#[tokio::test]
+async fn test_readonly_load_normalizes_legacy_zero_offsets() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = create_sealed_layer(&temp_dir, "zero-base", 8192, &[(0, 0xAA)]).await;
+    let top: Arc<dyn VirtualFile> =
+        create_sealed_layer(&temp_dir, "zero-top", 8192, &[(0, 0xBB)]).await;
+    let trailer = verify_ht(&top, true, top.size().await.unwrap())
+        .await
+        .unwrap();
+    // Legacy lower zero offsets have no meaning, even when they look like a
+    // physical address. Replace the sole data record with a legacy zero.
+    let legacy_zero = SegmentMapping::new(0, 8, 12345, true, 0);
+    top.write_at(
+        trailer.index_offset.get(),
+        DiskSegmentMapping::from_memory(&legacy_zero).as_bytes(),
+    )
+    .await
+    .unwrap();
+    let disk_before = top
+        .read_at(0, top.size().await.unwrap() as usize)
+        .await
+        .unwrap();
+    for lower in [
+        open_file_ro(top.clone()).await.unwrap(),
+        open_files_ro(&[base as Arc<dyn VirtualFile>, top.clone()])
+            .await
+            .unwrap(),
+    ] {
+        let view = lower.index_view().unwrap();
+        assert!(view
+            .mappings()
+            .iter()
+            .filter(|m| m.zeroed)
+            .all(|m| m.moffset == NO_PHYSICAL_OFFSET));
+        assert_eq!(lower.read_at(512, 1024).await.unwrap().as_ref(), &[0; 1024]);
+    }
+    assert_eq!(
+        top.read_at(0, disk_before.len()).await.unwrap(),
+        disk_before,
+        "normalizing a lower index must not modify its file"
+    );
+}
+
+#[tokio::test]
 async fn test_open_rejects_sparse_and_hybrid_header() {
     let temp_dir = TempDir::new().unwrap();
     let ring = test_io_ring();
@@ -1710,6 +1813,10 @@ async fn test_log_discard_range_persists_via_index() {
     let reopened = open_lsmt_env(f_data, f_index, vec![]).await.unwrap();
     let reopened_got = reopened.read_at(0, payload.len()).await.unwrap();
     assert!(reopened_got.iter().all(|&b| b == 0));
+    assert_eq!(
+        reopened.index.read().await.upper.dump(),
+        vec![SegmentMapping::new(0, 8, NO_PHYSICAL_OFFSET, true, 0)]
+    );
 }
 
 async fn create_counting_log_lsmt_env(
@@ -2497,6 +2604,36 @@ fn test_premerged_artifact_rejects_invalid_mapping_order_and_tag() {
     let body = serialize_premerged_mappings(&[SegmentMapping::new(0, 1, 20, false, 1)]);
     let err = deserialize_premerged_mappings(&body, 1, 1).unwrap_err();
     assert_err_contains(&err, "tag out of range");
+}
+
+#[test]
+fn test_premerged_artifact_normalizes_legacy_zero_offsets() {
+    let metadata = vec![test_layer_metadata(Uuid::new_v4(), 2)];
+    let key = PremergedIndexCacheKey::from_metadata(&metadata).unwrap();
+    let ordinary = SegmentMapping::new(8, 8, 200, false, 0);
+    let body = serialize_premerged_mappings(&[SegmentMapping::new(0, 8, 12345, true, 0), ordinary]);
+    let mut artifact =
+        build_premerged_artifact_header(&key, 2, body.len() as u64, Sha256::digest(&body).into());
+    artifact.extend_from_slice(&body);
+    let decoded = decode_premerged_index_artifact(&artifact, &key).unwrap();
+    assert_eq!(
+        decoded.mappings(),
+        &[
+            SegmentMapping::new(0, 8, NO_PHYSICAL_OFFSET, true, 0),
+            ordinary,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_index_load_rejects_data_with_no_physical_offset() {
+    let body =
+        serialize_premerged_mappings(&[SegmentMapping::new(0, 1, NO_PHYSICAL_OFFSET, false, 0)]);
+    let err = deserialize_premerged_mappings(&body, 1, 1).unwrap_err();
+    assert_err_contains(&err, "data mapping has no physical offset");
+    let file: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(body, 0));
+    let err = load_index_and_reset_tags(&file, 0, 1).await.unwrap_err();
+    assert_err_contains(&err, "data mapping has no physical offset");
 }
 
 #[tokio::test]

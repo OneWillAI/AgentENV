@@ -17,7 +17,7 @@ use crate::io::vfile_io::{
     read_exact, CtxRead, CtxWrite, DirectRead, DirectWrite, FileReader, FileWriter,
 };
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
-use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
+use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET};
 use crate::lsmt::index::{
     ComboIndex, LogIndex, MutableIndex, ReadOnlyIndex, Segment, SegmentMapping,
 };
@@ -648,29 +648,19 @@ impl LSMTFile {
             let step_bytes = remaining.min(max_discard_bytes);
             let step_blocks = (step_bytes / ALIGNMENT) as u32;
 
-            let m_mem = if self.file_type == LSMTFileType::SparseReadWrite {
+            if self.file_type == LSMTFileType::SparseReadWrite {
                 let phys_offset = HEADER_SIZE + current_offset;
                 self.rw_data_file.discard(phys_offset, step_bytes).await?;
-                SegmentMapping::new(
-                    current_offset / ALIGNMENT,
-                    step_blocks,
-                    phys_offset / ALIGNMENT,
-                    true,
-                    self.rw_tag as u8,
-                )
-            } else {
-                // Match upstream append-only OverlayBD: discard appends only a
-                // zeroed index entry at current EOF. Zeroed mappings never read
-                // from `moffset`, so no data block is materialized here.
-                let phys_offset = self.data_append_offset()?;
-                SegmentMapping::new(
-                    current_offset / ALIGNMENT,
-                    step_blocks,
-                    phys_offset / ALIGNMENT,
-                    true,
-                    self.rw_tag as u8,
-                )
-            };
+            }
+            // No physical range is retained by this discard path. Log-backed
+            // layouts append only an index entry; Sparse has punched a hole.
+            let m_mem = SegmentMapping::new(
+                current_offset / ALIGNMENT,
+                step_blocks,
+                NO_PHYSICAL_OFFSET,
+                true,
+                self.rw_tag as u8,
+            );
 
             let mut idx = self.index.write().await;
             idx.insert(m_mem);
@@ -888,6 +878,9 @@ impl LSMTFile {
             if m.tag as usize == self.rw_tag {
                 let mut cm = m;
                 cm.tag = 0;
+                if cm.zeroed {
+                    cm.moffset = NO_PHYSICAL_OFFSET;
+                }
                 compact_index.push(cm);
             }
         }
