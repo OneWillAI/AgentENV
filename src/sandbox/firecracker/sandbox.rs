@@ -1047,21 +1047,37 @@ impl FirecrackerSandbox {
         }
     }
 
-    async fn disk_branch_freeze(&self, action: &str, token: &str) -> Result<()> {
-        let output = self
-            .run_command_with_opts(
-                "/bin/sh",
-                &[
-                    "-c",
-                    include_str!("disk-freeze.sh"),
-                    "disk-freeze",
-                    action,
-                    token,
-                ],
-                &ProcessOpts::new().with_timeout(std::time::Duration::from_secs(15)),
-            )
-            .await
-            .with_context(|| format!("{action} guest root filesystem for disk-branch"))?;
+    async fn disk_branch_freeze(&mut self, action: &str, token: &str) -> Result<()> {
+        let envd = self
+            .envd_instance
+            .as_ref()
+            .context("sandbox is not running")?
+            .clone();
+        let operation = action.to_owned();
+        let token = token.to_owned();
+        let handle = tokio::runtime::Handle::current();
+        // The envd process transport is !Send. Keep it on one blocking task,
+        // as template execution does, without changing lifecycle trait bounds.
+        let output = tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                Executor::new(&envd)
+                    .run_command_with_opts(
+                        "/bin/sh",
+                        &[
+                            "-c",
+                            include_str!("disk-freeze.sh"),
+                            "disk-freeze",
+                            &operation,
+                            &token,
+                        ],
+                        &ProcessOpts::new().with_timeout(std::time::Duration::from_secs(15)),
+                    )
+                    .await
+            })
+        })
+        .await
+        .context("join disk-branch filesystem operation")?
+        .with_context(|| format!("{action} guest root filesystem for disk-branch"))?;
         if output.exit_code != 0 {
             bail!("disk-branch {action} failed: {}", output.stderr.trim());
         }
