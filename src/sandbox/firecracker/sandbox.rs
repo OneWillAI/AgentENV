@@ -42,7 +42,7 @@ use crate::sandbox::extra_drive::{
     USER_ROOTFS_DRIVE_ID,
 };
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
-use crate::sandbox::process::Executor;
+use crate::sandbox::process::{Executor, ProcessOpts};
 use crate::sandbox::ublk::{
     OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend,
     UblkCreateSpec, UblkDeviceManager,
@@ -1014,20 +1014,58 @@ impl FirecrackerSandbox {
         tokio::fs::create_dir_all(output_dir)
             .await
             .with_context(|| format!("create disk-branch dir {}", output_dir.display()))?;
-        self.fc_instance
-            .pause()
-            .await
-            .context("pause Firecracker for disk-branch")?;
-        let branched = self.export_user_disk(output_dir).await;
-        if let Err(resume_err) = self.fc_instance.resume().await {
-            return match branched {
-                Ok(_) => Err(resume_err).context("resume Firecracker after disk-branch"),
-                Err(copy_err) => Err(copy_err).context(format!(
-                    "resume Firecracker after failed disk-branch also failed: {resume_err:#}"
-                )),
-            };
+        // Pausing vCPUs alone leaves dirty guest metadata behind. A disk-only
+        // cold boot cannot recover that memory, unlike a full VM snapshot.
+        let token = Uuid::new_v4().to_string();
+        let frozen = self.disk_branch_freeze("freeze", &token).await;
+        let branched = match frozen {
+            Ok(()) => match self.fc_instance.pause().await {
+                Ok(()) => {
+                    let copied = self.export_user_disk(output_dir).await;
+                    match self.fc_instance.resume().await {
+                        Ok(()) => copied,
+                        Err(error) => Err(error).context(format!(
+                            "resume Firecracker after disk-branch (copy error: {:?})",
+                            copied.err()
+                        )),
+                    }
+                }
+                Err(error) => Err(error).context("pause Firecracker for disk-branch"),
+            },
+            Err(error) => Err(error),
+        };
+        // This also validates that the watchdog did not thaw before copying
+        // finished. Never publish a branch after losing the freeze lease.
+        let thawed = self.disk_branch_freeze("thaw", &token).await;
+        match (branched, thawed) {
+            (Ok(path), Ok(())) => Ok(path),
+            (Err(error), Ok(())) => Err(error),
+            (copy, Err(error)) => Err(error).context(format!(
+                "thaw source after disk-branch (copy error: {:?})",
+                copy.err()
+            )),
         }
-        branched
+    }
+
+    async fn disk_branch_freeze(&self, action: &str, token: &str) -> Result<()> {
+        let output = self
+            .run_command_with_opts(
+                "/bin/sh",
+                &[
+                    "-c",
+                    include_str!("disk-freeze.sh"),
+                    "disk-freeze",
+                    action,
+                    token,
+                ],
+                &ProcessOpts::new().with_timeout(std::time::Duration::from_secs(15)),
+            )
+            .await
+            .with_context(|| format!("{action} guest root filesystem for disk-branch"))?;
+        if output.exit_code != 0 {
+            bail!("disk-branch {action} failed: {}", output.stderr.trim());
+        }
+        Ok(())
     }
 
     async fn export_user_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
