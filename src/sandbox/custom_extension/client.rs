@@ -149,6 +149,7 @@ impl CustomExtensionClient {
         sandbox_instance_id: SandboxInstanceId,
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
+        firecracker_pid: Option<i32>,
         custom_extension_params: Option<&CustomExtensionParams>,
     ) -> Result<()> {
         let request = models::StartResumeHookRequest {
@@ -156,6 +157,7 @@ impl CustomExtensionClient {
             sandbox_instance_id: sandbox_instance_id.to_string(),
             network_namespace_path: network_namespace_path.to_string(),
             host_interaction_ip: host_interaction_ip.to_string(),
+            firecracker_pid,
             custom_extension_params: Some(
                 custom_extension_params
                     .cloned()
@@ -299,6 +301,7 @@ impl CustomExtensionHookGuard {
         &mut self,
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
+        firecracker_pid: Option<i32>,
         custom_extension_params: Option<&CustomExtensionParams>,
     ) -> Result<()> {
         // Recorded before delivery for the same reason as `start_fresh`.
@@ -310,6 +313,7 @@ impl CustomExtensionHookGuard {
                 sandbox_instance_id,
                 network_namespace_path,
                 host_interaction_ip,
+                firecracker_pid,
                 custom_extension_params,
             )
             .await?;
@@ -577,6 +581,7 @@ pub(crate) mod tests {
                 sandbox_instance_id,
                 "/var/run/netns/agentenv-ns-resume",
                 Ipv4Addr::new(10, 11, 0, 126),
+                Some(1234),
                 None,
             )
             .await
@@ -592,6 +597,7 @@ pub(crate) mod tests {
             "/var/run/netns/agentenv-ns-resume"
         );
         assert_eq!(json["hostInteractionIp"], "10.11.0.126");
+        assert_eq!(json["firecrackerPid"], 1234);
     }
 
     #[tokio::test]
@@ -711,6 +717,7 @@ pub(crate) mod tests {
             .start_resume(
                 "/var/run/netns/agentenv-ns-resume",
                 Ipv4Addr::new(10, 11, 0, 128),
+                Some(1234),
                 None,
             )
             .await

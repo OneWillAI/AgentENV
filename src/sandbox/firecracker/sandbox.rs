@@ -1621,23 +1621,6 @@ impl FirecrackerSandbox {
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
 
-        // ── Custom extension hook: start-resume ──
-        if let Some(client) = CustomExtensionClient::global() {
-            let slot = self
-                .network_slot
-                .as_ref()
-                .context("network slot must be allocated before start-resume hook")?;
-            let mut guard = CustomExtensionHookGuard::new(client, self.id);
-            guard
-                .start_resume(
-                    &slot.namespace_path().to_string_lossy(),
-                    slot.host_interaction_ip,
-                    config.common.custom_extension_params.as_ref(),
-                )
-                .await?;
-            self.custom_extension_hook_guard = Some(guard);
-        }
-
         let envd_base_url = format!(
             "http://{}:{}",
             interaction_ip, config.common.control_plane_port
@@ -1703,6 +1686,24 @@ impl FirecrackerSandbox {
             .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, reconciled)
             .await
             .context("reconcile disk rate limiter on snapshot resume")?;
+
+        // ── Custom extension hook: start-resume ──
+        if let Some(client) = CustomExtensionClient::global() {
+            let slot = self
+                .network_slot
+                .as_ref()
+                .context("network slot must be allocated before start-resume hook")?;
+            let mut guard = CustomExtensionHookGuard::new(client, self.id);
+            guard
+                .start_resume(
+                    &slot.namespace_path().to_string_lossy(),
+                    slot.host_interaction_ip,
+                    self.fc_instance.pid().ok().map(|pid| pid.as_raw()),
+                    config.common.custom_extension_params.as_ref(),
+                )
+                .await?;
+            self.custom_extension_hook_guard = Some(guard);
+        }
 
         self.fc_instance.resume().await?;
 

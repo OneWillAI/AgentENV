@@ -186,6 +186,11 @@ components:
           type: string
           format: ipv4
           description: Per-runtime host interaction address routed to this sandbox.
+        firecrackerPid:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Firecracker process ID after snapshot load and before guest execution resumes.
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
 
