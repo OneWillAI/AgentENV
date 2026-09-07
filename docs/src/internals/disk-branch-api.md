@@ -15,9 +15,18 @@ branch rather than taking a new copy of subsequent writes. Invalid keys return
 The API key/admin token header requirement is unchanged from the existing API;
 network isolation remains essential.
 
-The operation briefly pauses Firecracker, copies the writable disk layer, and
-resumes the source. It does not copy running processes or unsynced application
-buffers. Cold-create a new sandbox using the returned image to obtain an
+The operation freezes and flushes the guest root filesystem, briefly pauses
+Firecracker, copies the writable disk layer, then resumes and thaws the source.
+Images must provide `/bin/sh`, `fsfreeze`, `flock`, `stat`, and a tmpfs `/run`;
+unsupported images fail before publication. The freeze uses a per-operation
+lease and a 60-second guest watchdog to recover from a lost caller. Thawing an
+expired lease fails the branch rather than publishing a potentially inconsistent
+copy. A lock and exact lease token prevent an old watchdog thawing a later copy.
+The operation is cancellation-shielded, and thaw is attempted after every error;
+if the VM cannot resume, the watchdog runs when it resumes later.
+
+It does not copy running processes or flush application-level buffers that
+have not reached the kernel. Cold-create a new sandbox using the returned image to obtain an
 independent writable upper layer. Callers requiring an application-consistent
 copy must flush the application's data before requesting a branch.
 
@@ -63,7 +72,8 @@ and paused generations; automated reference-counted collection is not included.
 Tests use real files and OS locks to cover replay after reopening, incomplete
 attempt cleanup, immutable publication, key/source separation and managed-root
 validation. Hosted Firecracker acceptance must additionally prove file copying,
-write/process independence, and child survival after parent deletion.
+write/process independence, active atomic-file and symlink replacement, a
+working application on the copied filesystem, and child survival after parent deletion.
 
 ## Discovery hooks
 
