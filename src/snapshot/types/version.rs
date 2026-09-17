@@ -9,6 +9,10 @@ use crate::sandbox::{FirecrackerSandbox, SandboxExecutor};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRuntimeVersions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker_sha256: Option<String>,
     pub kernel_version: String,
     pub firecracker_version: String,
     pub envd_version: String,
@@ -24,6 +28,8 @@ impl SnapshotRuntimeVersions {
         tools_drive_version: String,
     ) -> Self {
         Self {
+            kernel_sha256: None,
+            firecracker_sha256: None,
             kernel_version,
             firecracker_version,
             envd_version,
@@ -50,12 +56,14 @@ impl SnapshotRuntimeVersions {
             firecracker_version, envd_version, tools_drive_version, "probed runtime versions"
         );
 
-        Ok(Self::new(
+        let mut versions = Self::new(
             kernel_version,
             firecracker_version,
             envd_version,
             tools_drive_version,
-        ))
+        );
+        (versions.kernel_sha256, versions.firecracker_sha256) = sandbox.runtime_digests();
+        Ok(versions)
     }
 }
 
@@ -202,6 +210,20 @@ mod tests {
     use anyhow::anyhow;
 
     use super::*;
+
+    #[test]
+    fn legacy_metadata_stays_unknown_and_new_artifact_digests_round_trip() {
+        let legacy = r#"{"kernel_version":"6.1","firecracker_version":"1.15","envd_version":"1.0","tools_drive_version":"1.0.0"}"#;
+        let mut versions: SnapshotRuntimeVersions = serde_json::from_str(legacy).unwrap();
+        assert!(versions.kernel_sha256.is_none());
+        assert!(versions.firecracker_sha256.is_none());
+        versions.kernel_sha256 = Some(format!("sha256:{}", "a".repeat(64)));
+        versions.firecracker_sha256 = Some(format!("sha256:{}", "b".repeat(64)));
+        let restored: SnapshotRuntimeVersions =
+            serde_json::from_str(&serde_json::to_string(&versions).unwrap()).unwrap();
+        assert_eq!(restored.kernel_sha256, versions.kernel_sha256);
+        assert_eq!(restored.firecracker_sha256, versions.firecracker_sha256);
+    }
 
     #[test]
     fn parse_plain_semver() {

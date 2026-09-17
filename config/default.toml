@@ -53,6 +53,8 @@ socket_poll_ms = 1
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.
 # image_path = "/opt/agentenv/vmlinux.bin"
+# Optional 64-character lowercase SHA256, checked during setup and cold boot.
+# sha256 = "..."
 
 [tools]
 # Import an existing ext4 tools drive. This also requires an explicit version;

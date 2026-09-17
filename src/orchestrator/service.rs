@@ -3605,7 +3605,7 @@ fn resources_with_runtime_info(
 
 fn configured_runtime_versions() -> SnapshotRuntimeVersions {
     let config = ConfigManager::global_config();
-    SnapshotRuntimeVersions::new(
+    let mut versions = SnapshotRuntimeVersions::new(
         config
             .kernel
             .version
@@ -3618,7 +3618,19 @@ fn configured_runtime_versions() -> SnapshotRuntimeVersions {
             .unwrap_or_else(|| "unknown".to_string()),
         config.envd.version.clone(),
         config.resolved_tools_version().to_string(),
-    )
+    );
+    // Record actual bytes, never relabel a snapshot using only version strings.
+    // Missing files remain unknown here; the cold-boot factory fails before
+    // launching if its configured runtime artifacts cannot be read/verified.
+    versions.kernel_sha256 =
+        crate::digest::FileDigest::describe_blocking(&config.resolved_kernel_image_path())
+            .ok()
+            .map(|digest| digest.sha256);
+    versions.firecracker_sha256 =
+        crate::digest::FileDigest::describe_blocking(&config.resolved_firecracker_binary_path())
+            .ok()
+            .map(|digest| digest.sha256);
+    versions
 }
 
 #[cfg(test)]

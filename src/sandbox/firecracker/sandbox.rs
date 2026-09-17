@@ -955,6 +955,14 @@ impl FirecrackerSandbox {
         &self.launch.common().tools_drive_version
     }
 
+    pub(crate) fn runtime_digests(&self) -> (Option<String>, Option<String>) {
+        let common = self.launch.common();
+        (
+            common.kernel_sha256.clone(),
+            common.firecracker_sha256.clone(),
+        )
+    }
+
     /// Resolve the Firecracker stdout log path for this sandbox.
     pub fn firecracker_stdout_path(&self) -> PathBuf {
         self.launch

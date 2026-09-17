@@ -110,6 +110,12 @@ impl FirecrackerRuntimePolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirecrackerCommonConfig {
     pub firecracker_binary: PathBuf,
+    /// Boot artifact identity; absent on legacy snapshots, never inferred from
+    /// the current node's kernel when restoring an older memory snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker_sha256: Option<String>,
     /// Immutable release version of the complete tools drive.
     #[serde(default)]
     pub tools_drive_version: String,
@@ -176,6 +182,8 @@ impl FirecrackerCommonConfig {
     ) -> Self {
         Self {
             firecracker_binary,
+            kernel_sha256: None,
+            firecracker_sha256: None,
             tools_drive_version,
             firecracker_work_base_dir: None,
             serial_output_base_dir: None,
@@ -243,6 +251,7 @@ impl FirecrackerCommonConfig {
                 self.firecracker_binary.display()
             );
         }
+        self.verify_firecracker_identity()?;
         if !tools_drive_path.exists() {
             anyhow::bail!(
                 "tools drive version '{}' is not installed on this node; resolved path: {}; dependency root: {}; install this immutable release before launching the sandbox",
@@ -276,6 +285,16 @@ impl FirecrackerCommonConfig {
                     config.deps_path.display()
                 )
             })
+    }
+
+    fn verify_firecracker_identity(&self) -> Result<()> {
+        if let Some(expected) = self.firecracker_sha256.as_deref() {
+            let actual = crate::digest::FileDigest::describe_blocking(&self.firecracker_binary)?;
+            if actual.sha256 != expected {
+                bail!("snapshot Firecracker digest differs from selected binary; use its original runtime release");
+            }
+        }
+        Ok(())
     }
 
     fn validate_persisted_artifacts(&self) -> Result<()> {
@@ -373,12 +392,17 @@ impl FirecrackerSandboxConfig {
         mut user_image_config: OverlaybdConfig,
     ) -> Result<Self> {
         let kernel_image = config.resolved_kernel_image_path();
+        config.kernel.verify_image(&kernel_image)?;
 
         let ublk = &config.ublk;
         let runtime_upper_mode = ublk.overlaybd.runtime_upper_mode;
         user_image_config.runtime_upper_mode = runtime_upper_mode;
 
         let mut common = FirecrackerCommonConfig::from_app_config(config)?;
+        common.kernel_sha256 =
+            Some(crate::digest::FileDigest::describe_blocking(&kernel_image)?.sha256);
+        common.firecracker_sha256 =
+            Some(crate::digest::FileDigest::describe_blocking(&common.firecracker_binary)?.sha256);
         common.rootfs_image_config = Some(user_image_config.clone());
         common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
             user_image_config.image_config_path.clone(),
@@ -427,6 +451,12 @@ impl FirecrackerSandboxConfig {
         self.common.validate()?;
         if !self.kernel_image.exists() {
             anyhow::bail!("kernel image not found at {}", self.kernel_image.display());
+        }
+        if let Some(expected) = self.common.kernel_sha256.as_deref() {
+            let actual = crate::digest::FileDigest::describe_blocking(&self.kernel_image)?;
+            if actual.sha256 != expected {
+                bail!("kernel image changed after cold-boot configuration was created");
+            }
         }
         let rootfs_image_config = self
             .common
@@ -489,6 +519,13 @@ impl FirecrackerSnapshotConfig {
             );
         }
         base_common.tools_drive_version = tools_drive_version.clone();
+        base_common.kernel_sha256 = snapshot.committed().runtime_versions.kernel_sha256.clone();
+        base_common.firecracker_sha256 = snapshot
+            .committed()
+            .runtime_versions
+            .firecracker_sha256
+            .clone();
+        base_common.verify_firecracker_identity()?;
         let rootfs_image_config = OverlaybdConfig {
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: app_config.ublk.overlaybd.read_only,
@@ -715,6 +752,13 @@ mod tests {
     #[test]
     fn sandbox_config_binds_overlaybd_to_user_image() -> Result<()> {
         let mut config = base_app_config();
+        let artifacts = tempfile::tempdir()?;
+        let kernel = artifacts.path().join("vmlinux");
+        let firecracker = artifacts.path().join("firecracker");
+        fs::write(&kernel, b"kernel artifact")?;
+        fs::write(&firecracker, b"firecracker artifact")?;
+        config.kernel.image_path = Some(kernel.clone());
+        config.firecracker.binary_path = Some(firecracker.clone());
         config.ublk = UblkTomlConfig {
             daemon_binary_path: None,
             daemon_log_path: None,
@@ -735,6 +779,14 @@ mod tests {
                 runtime_upper_mode: UpperMode::LogStructured,
             },
         )?;
+        assert_eq!(
+            sandbox_config.common.kernel_sha256,
+            Some(crate::digest::FileDigest::describe_blocking(&kernel)?.sha256)
+        );
+        assert_eq!(
+            sandbox_config.common.firecracker_sha256,
+            Some(crate::digest::FileDigest::describe_blocking(&firecracker)?.sha256)
+        );
         match sandbox_config
             .common
             .ublk_config
@@ -907,6 +959,19 @@ mod tests {
         assert!(err
             .to_string()
             .contains("snapshot does not record a tools drive version"));
+    }
+
+    #[test]
+    fn runnable_snapshot_keeps_its_original_kernel_identity() -> Result<()> {
+        let mut committed = CommittedSnapshot::mock();
+        let original = format!("sha256:{}", "a".repeat(64));
+        committed.runtime_versions.kernel_sha256 = Some(original.clone());
+        let snapshot =
+            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+        assert_eq!(config.common.kernel_sha256, Some(original));
+        assert!(config.common.firecracker_sha256.is_none());
+        Ok(())
     }
 
     #[test]

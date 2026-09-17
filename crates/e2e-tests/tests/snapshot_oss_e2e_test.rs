@@ -23,6 +23,8 @@ use tempfile::TempDir;
 
 fn test_runtime_versions() -> SnapshotRuntimeVersions {
     SnapshotRuntimeVersions {
+        kernel_sha256: None,
+        firecracker_sha256: None,
         kernel_version: "kernel".to_string(),
         firecracker_version: "fc".to_string(),
         envd_version: "envd".to_string(),

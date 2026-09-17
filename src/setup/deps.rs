@@ -156,13 +156,14 @@ async fn ensure_kernel(
     arch: &str,
 ) -> Result<()> {
     if let Some(kernel_path) = config.kernel.image_path.as_deref() {
-        return validate_explicit_file("kernel.image_path", kernel_path, false);
+        validate_explicit_file("kernel.image_path", kernel_path, false)?;
+        return config.kernel.verify_image(kernel_path);
     }
 
     let kernel_path = config.resolved_kernel_image_path();
     if file_exists_nonempty(&kernel_path) {
         debug!(path = %kernel_path.display(), "kernel image already present");
-        return Ok(());
+        return config.kernel.verify_image(&kernel_path);
     }
 
     let mode_manifest = manifest.kernel.for_mode(config.virtualization_mode);
@@ -176,7 +177,8 @@ async fn ensure_kernel(
         kernel_url_template,
         &[("version", kernel_version), ("arch", arch)],
     );
-    download_file(&kernel_url, &kernel_path).await
+    download_file(&kernel_url, &kernel_path).await?;
+    config.kernel.verify_image(&kernel_path)
 }
 
 fn ensure_tools(
@@ -922,6 +924,47 @@ mod tests {
             "VCSTag:     v0.11.55\n",
             "v0.11.5"
         ));
+    }
+
+    #[tokio::test]
+    async fn pinned_kernel_rejects_modified_explicit_and_cached_images() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let kernel = temp.path().join("vmlinux");
+        std::fs::write(&kernel, b"verified kernel").expect("write kernel");
+        let mut config = AppConfig::default();
+        config.kernel.image_path = Some(kernel.clone());
+        config.kernel.sha256 = Some(crate::digest::sha256_hex(b"verified kernel"));
+        ensure_kernel(&config, bundled_manifest(), "x86_64")
+            .await
+            .expect("matching explicit artifact");
+        std::fs::write(&kernel, b"different kernel").expect("replace kernel");
+        assert!(ensure_kernel(&config, bundled_manifest(), "x86_64")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch"));
+
+        config.kernel.image_path = None;
+        config.deps_path = temp.path().join("deps");
+        config.kernel.version = Some("pinned-test".to_string());
+        let cached = config.resolved_kernel_image_path();
+        std::fs::create_dir_all(cached.parent().unwrap()).expect("cache directory");
+        std::fs::write(&cached, b"different kernel").expect("cached wrong image");
+        assert!(ensure_kernel(&config, bundled_manifest(), "x86_64")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch"));
+        std::fs::write(&cached, b"verified kernel").expect("cached correct image");
+        ensure_kernel(&config, bundled_manifest(), "x86_64")
+            .await
+            .expect("matching cached artifact");
+        config.kernel.sha256 = Some("not-a-digest".to_string());
+        assert!(ensure_kernel(&config, bundled_manifest(), "x86_64")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("64 lowercase"));
     }
 
     #[tokio::test]

@@ -58,6 +58,7 @@ Linux kernel image for microVMs.
 | `version` | string | manifest value | Optional kernel version override for auto-download |
 | `url` | string | manifest value | Optional download URL template override with `{version}` placeholder |
 | `image_path` | string | derived from manifest/config version | Explicit path to a local `vmlinux.bin`. Setup skips the kernel download and requires this to be a readable, non-empty regular file |
+| `sha256` | string | unset | Expected kernel SHA-256 (64 lowercase hex characters); explicit, downloaded and cached images are checked during setup, and configured images are checked before cold boot. Unset preserves legacy behavior. |
 
 ## `[tools]`
 
