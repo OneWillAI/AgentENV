@@ -1,5 +1,6 @@
 mod access;
 mod backend;
+pub mod checkpoint_capacity;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;

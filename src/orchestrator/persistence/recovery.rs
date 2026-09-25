@@ -29,21 +29,12 @@ impl PausedRecoveryBlocks {
     pub(super) fn contains_sandbox(&self, sandbox_id: &SandboxId) -> bool {
         self.sandbox_ids.contains(sandbox_id)
     }
-
-    pub(super) fn contains_record(
-        &self,
-        sandbox_id: &SandboxId,
-        artifact_root: &std::path::Path,
-    ) -> bool {
-        self.contains_sandbox(sandbox_id) || self.artifact_roots.contains(artifact_root)
-    }
 }
 
 #[derive(Default)]
 pub(super) struct ManifestReconciliation {
     pub(super) candidates: HashMap<SandboxId, ManifestEntry>,
     pub(super) blocked: HashSet<SandboxId>,
-    pub(super) retire_after_selection: HashMap<SandboxId, Vec<PathBuf>>,
     pub(super) quarantined_items: usize,
 }
 

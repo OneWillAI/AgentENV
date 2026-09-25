@@ -450,6 +450,38 @@ impl UblkDaemonClient {
     }
 
     /// Request a restack-style snapshot of an overlaybd device's upper layer.
+    pub async fn export_snapshot(
+        &self,
+        dev_id: u32,
+        output_layer_path: &Path,
+    ) -> Result<RestackSnapshotStats> {
+        let request = DaemonRequest::ExportSnapshot {
+            dev_id,
+            output_layer_path: output_layer_path.to_path_buf(),
+        };
+        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+            DaemonResponse::RestackSnapshotCreated {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            } => Ok(RestackSnapshotStats {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            }),
+            DaemonResponse::TerminalError { message } => Err(
+                RestackSnapshotTerminalFailure::new(format!(
+                    "daemon: snapshot export dev_id={dev_id} failed after mutating live state: {message}"
+                ))
+                .into(),
+            ),
+            DaemonResponse::Error { message } => {
+                bail!("daemon: snapshot export dev_id={dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for snapshot export: {other:?}"),
+        }
+    }
+
     pub async fn restack_snapshot(
         &self,
         dev_id: u32,

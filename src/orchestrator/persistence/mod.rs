@@ -8,6 +8,7 @@ mod mock;
 mod operation_journal;
 mod paused_transactions;
 mod recovery;
+mod retention;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,16 @@ pub trait SandboxPersister: Send + Sync {
         sandbox_id: &SandboxId,
     ) -> PersistenceResult<Option<PathBuf>>;
 
+    /// Remove only the empty directory allocated for this failed capture.
+    /// Any payload or uncertain publication must remain for recovery review.
+    async fn discard_empty_capture(
+        &self,
+        _sandbox_id: &SandboxId,
+        _artifact_root: &Path,
+    ) -> PersistenceResult<()> {
+        Ok(())
+    }
+
     /// Persist metadata and runtime state for a paused sandbox.
     async fn persist_paused(
         &self,
@@ -164,6 +175,12 @@ pub trait SandboxPersister: Send + Sync {
             reason: "paused runtime stop proof is not supported by this persister".to_string(),
             source: None,
         })
+    }
+
+    /// Called only with lifecycle admission closed and all guests durably
+    /// stopped. Implementations may retain extra generations on any uncertainty.
+    async fn collect_stopped_checkpoints(&self, _ids: &[SandboxId]) -> PersistenceResult<()> {
+        Ok(())
     }
 
     /// Mark a paused sandbox as resuming.
@@ -268,4 +285,20 @@ impl SandboxPersister for DisabledSandboxPersister {
     async fn delete_create_idempotency_record(&self, _key: &str) -> PersistenceResult<()> {
         Ok(())
     }
+}
+
+/// Exclusive process-lifetime ownership of a persisted-sandbox store. Recovery
+/// tools take the same lock so they cannot purge artifacts from a live runtime.
+pub fn lock_runtime_store(root: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(root)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".runtime-owner.lock"))?;
+    lock.try_lock().map_err(|error| {
+        anyhow::anyhow!("runtime store is in use; stop/inspect the owner before recovery: {error}")
+    })?;
+    Ok(lock)
 }

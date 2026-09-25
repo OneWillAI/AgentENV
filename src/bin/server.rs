@@ -1,3 +1,6 @@
+#[path = "server/preservation.rs"]
+mod preservation;
+
 use std::sync::{Arc, RwLock};
 
 use agentenv::api::{server, ApiImpl};
@@ -30,6 +33,10 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 #[derive(Debug, Parser)]
 #[command(name = "agentenv server")]
 struct ServerCli {
+    /// Print the supported installer preservation protocol and exit without setup.
+    #[arg(long)]
+    preservation_protocol: bool,
+
     /// Run setup/provisioning only, then exit.
     #[arg(long)]
     setup_only: bool,
@@ -53,10 +60,14 @@ struct ServerCli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = ServerCli::parse();
+    if cli.preservation_protocol {
+        println!("1");
+        return Ok(());
+    }
     agentenv::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
-    let cli = ServerCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         agentenv::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
@@ -76,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let _runtime_store_lock = agentenv::orchestrator::lock_runtime_store(
+        &config.orchestrator.persisted_sandbox_store_path,
+    )?;
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
@@ -140,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    preservation::start(Arc::clone(&orchestrator)).await?;
+
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
         snapshot_manager,
@@ -170,10 +186,6 @@ async fn main() -> anyhow::Result<()> {
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
                 }
             }
-            info!(target: "agentenv", "stopping sandboxes before process exit");
-            if let Err(err) = shutdown_orchestrator.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
-            }
             if let Some(pool) = FirecrackerPool::global() {
                 info!(target: "agentenv", "shutting down firecracker pool");
                 if let Err(err) = pool.shutdown().await {
@@ -197,7 +209,18 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            loop {
+                shutdown_signal().await;
+                match shutdown_orchestrator.shutdown().await {
+                    Ok(()) => break,
+                    Err(err) => {
+                        // Do not close HTTP, drop VM handles, or stop storage.
+                        // A later signal can retry after capacity/recovery repair.
+                        warn!(target: "agentenv", error = %err,
+                            "shutdown refused: preservation failed; API and storage remain available");
+                    }
+                }
+            }
             let _ = shutdown_tx.send(());
         })
         .await?;

@@ -39,19 +39,6 @@ const RECORD_DB_DIR: &str = "records.db";
 const QUARANTINE_DB_DIR: &str = "quarantine.db";
 const CREATE_IDEMPOTENCY_DB_DIR: &str = "create-idempotency.db";
 
-/// A changed Linux boot ID proves any Firecracker child from an interrupted
-/// prior AgentENV process cannot still be alive. Missing boot IDs deliberately
-/// provide no proof.
-fn host_reboot_proves_runtime_absent(
-    recorded_boot_id: Option<&str>,
-    current_boot_id: Option<&str>,
-) -> bool {
-    matches!(
-        (recorded_boot_id, current_boot_id),
-        (Some(recorded), Some(current)) if recorded != current
-    )
-}
-
 fn current_host_boot_id() -> Option<String> {
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot_id = boot_id.trim();
@@ -1048,7 +1035,7 @@ impl FileBackedSandboxPersister {
         prepared.commit_state = PersistedPausedCommitState::Prepared;
         prepared.metadata.resume_recovery_pending = true;
         prepared.metadata.paused_runtime_stopped = false;
-        let prepared_entry = match self.write_manifest(&prepared).await {
+        let _prepared_entry = match self.write_manifest(&prepared).await {
             Ok(entry) => entry,
             Err(source) => {
                 return Err(self
@@ -1060,15 +1047,8 @@ impl FileBackedSandboxPersister {
                     .await);
             }
         };
-        if let Err(source) = self.write_index(&prepared_entry).await {
-            return Err(self
-                .quarantine_uncertain_commit(
-                    record,
-                    "failed to durably index prepared paused sandbox manifest",
-                    source,
-                )
-                .await);
-        }
+        // Keep the previous authoritative index until all new artifacts and
+        // the committed manifest are durable. Prepared state is never current.
 
         if let Err(source) = self.write_recovery_marker(sandbox_id, &artifact_root).await {
             return Err(self
@@ -1145,45 +1125,6 @@ impl FileBackedSandboxPersister {
 
     async fn remove_artifact_root(path: &Path) -> PersistenceResult<()> {
         super::artifact_cleanup::remove_root(path).await
-    }
-
-    /// Drop every managed generation except `keep`. The next incremental pause
-    /// still needs the last memory config, so resume must not call this.
-    async fn retire_replaced_generations(
-        &self,
-        sandbox_id: &SandboxId,
-        keep: &Path,
-    ) -> PersistenceResult<()> {
-        let Some(keep) = self.validated_managed_generation_path(sandbox_id, keep) else {
-            return Ok(());
-        };
-        let sandbox_root = self.sandbox_artifact_root(sandbox_id);
-        let mut entries = match fs::read_dir(&sandbox_root).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(SandboxPersistenceError::io(
-                    "read paused sandbox generations",
-                    sandbox_root,
-                    source,
-                ));
-            }
-        };
-        while let Some(entry) = entries.next_entry().await.map_err(|source| {
-            SandboxPersistenceError::io("scan paused sandbox generations", &sandbox_root, source)
-        })? {
-            let path = entry.path();
-            if path == keep {
-                continue;
-            }
-            let file_type = entry.file_type().await.map_err(|source| {
-                SandboxPersistenceError::io("inspect paused sandbox generation", &path, source)
-            })?;
-            if file_type.is_dir() && self.path_is_managed_generation(sandbox_id, &path) {
-                Self::remove_artifact_root(&path).await?;
-            }
-        }
-        Ok(())
     }
 
     /// Destroy may leave an empty `<sandbox-id>` directory after the last
@@ -1494,7 +1435,7 @@ impl FileBackedSandboxPersister {
                     .enumerate()
                     .filter_map(|(position, entry)| entry.matches_index(index).then_some(position))
                     .collect::<Vec<_>>();
-                (matches.len() == 1).then_some(matches[0])
+                (matches.len() == 1).then(|| matches[0])
             });
             if let Some(position) = selected_position {
                 let selected = group.swap_remove(position);
@@ -1506,18 +1447,6 @@ impl FileBackedSandboxPersister {
                     .iter()
                     .all(|entry| !Self::manifest_needs_recovery(entry))
                 {
-                    if selected.record.lifecycle == PersistedPausedLifecycle::Paused
-                        && selected.record.metadata.paused_runtime_stopped
-                        && !Self::manifest_needs_recovery(&selected)
-                    {
-                        selection.retire_after_selection.insert(
-                            sandbox_id,
-                            group
-                                .iter()
-                                .map(|entry| entry.record.artifact_root.clone())
-                                .collect(),
-                        );
-                    }
                     selection.candidates.insert(sandbox_id, selected);
                     continue;
                 }
@@ -1538,26 +1467,6 @@ impl FileBackedSandboxPersister {
             }
         }
         Ok(selection)
-    }
-
-    async fn retire_reconciled_generations(
-        &self,
-        sandbox_id: &SandboxId,
-        artifact_roots: &[PathBuf],
-    ) -> PersistenceResult<()> {
-        for artifact_root in artifact_roots {
-            let Some(path) = self.validated_managed_generation_path(sandbox_id, artifact_root)
-            else {
-                return Err(SandboxPersistenceError::InvalidRecord {
-                    reason: format!(
-                        "refusing to retire reconciled generation outside sandbox {sandbox_id}"
-                    ),
-                    source: None,
-                });
-            };
-            Self::remove_artifact_root(&path).await?;
-        }
-        Ok(())
     }
 
     async fn reconcile_v2_index_entry(
@@ -1703,35 +1612,6 @@ impl FileBackedSandboxPersister {
         Ok(())
     }
 
-    async fn retire_selected_generations(
-        &self,
-        retire_after_selection: HashMap<SandboxId, Vec<PathBuf>>,
-        recovery_blocks: &PausedRecoveryBlocks,
-        selected_v2: &HashMap<SandboxId, PersistedPausedRecord>,
-        blocked: &HashSet<SandboxId>,
-    ) {
-        for (sandbox_id, artifact_roots) in retire_after_selection {
-            if !selected_v2.contains_key(&sandbox_id)
-                || blocked.contains(&sandbox_id)
-                || artifact_roots
-                    .iter()
-                    .any(|path| recovery_blocks.contains_record(&sandbox_id, path))
-            {
-                continue;
-            }
-            if let Err(error) = self
-                .retire_reconciled_generations(&sandbox_id, &artifact_roots)
-                .await
-            {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %error,
-                    "failed to retire superseded paused generations after index reconciliation"
-                );
-            }
-        }
-    }
-
     async fn reconcile_manifest_index(
         &self,
         allow_manual_recovery: bool,
@@ -1749,7 +1629,6 @@ impl FileBackedSandboxPersister {
             reconciled_quarantines: 0,
         };
         let candidates = manifest_selection.candidates;
-        let retire_after_selection = manifest_selection.retire_after_selection;
 
         let recovery_blocks = if allow_manual_recovery {
             PausedRecoveryBlocks::default()
@@ -1806,13 +1685,8 @@ impl FileBackedSandboxPersister {
             &mut report,
         )
         .await?;
-        self.retire_selected_generations(
-            retire_after_selection,
-            &recovery_blocks,
-            &selected_v2,
-            &blocked,
-        )
-        .await;
+        // Startup is not proof that old VM/storage processes are absent.
+        // Retention runs after the server's explicit all-guests stop proof.
 
         Ok((selected_v2.into_values().collect(), report))
     }
@@ -2025,7 +1899,7 @@ impl FileBackedSandboxPersister {
 
     async fn reconcile_record_lifecycle<F>(
         &self,
-        mut record: PersistedPausedRecord,
+        record: PersistedPausedRecord,
         factory: &F,
     ) -> PersistenceResult<PersistedRecordLoad>
     where
@@ -2037,16 +1911,28 @@ impl FileBackedSandboxPersister {
             warn!(sandbox_id = %record.metadata.id, "retaining paused sandbox whose persistence commit is recovery-pending");
             return self.load_recovery_pending_record(record, factory).await;
         }
-        if record.lifecycle == PersistedPausedLifecycle::Resumed {
-            info!(sandbox_id = %record.metadata.id, "restoring last paused snapshot after a committed resume; the live VM cannot still be running");
-            record.lifecycle = PersistedPausedLifecycle::Paused;
-            record.resuming_boot_id = None;
-            record.unproven_stop_boot_id = None;
-            record.metadata.paused_runtime_stopped = true;
-            self.put_record(&record).await?;
-        }
-        if record.lifecycle == PersistedPausedLifecycle::Resuming {
-            return self.reconcile_interrupted_resume(record, factory).await;
+        if matches!(
+            record.lifecycle,
+            PersistedPausedLifecycle::Resumed | PersistedPausedLifecycle::Resuming
+        ) {
+            // Both a completed and an interrupted resume may have allowed guest
+            // writes. A host reboot proves absence, never preservation.
+            let reason = format!(
+                "guest {} has only an older checkpoint: checkpoint_at_unix_ms={:?}; potential data loss from that time until runtime failure (unknown for legacy records); explicit recovery required",
+                record.metadata.id, record.checkpoint_at_unix_ms,
+            );
+            warn!(sandbox_id = %record.metadata.id, %reason, "refusing stale automatic recovery");
+            self.quarantine_with_policy(
+                reason,
+                None,
+                None,
+                Some(&record.artifact_root),
+                Some(&Self::manifest_path(&record.artifact_root)),
+                true,
+                false,
+            )
+            .await?;
+            return self.load_recovery_pending_record(record, factory).await;
         }
         Ok(PersistedRecordLoad::Continue(record))
     }
@@ -2073,57 +1959,6 @@ impl FileBackedSandboxPersister {
             Err(error) => {
                 self.quarantine(
                     format!("recovery-pending paused sandbox could not be decoded: {error}"),
-                    None,
-                    None,
-                    Some(&artifact_root),
-                    Some(&manifest_path),
-                )
-                .await?;
-                None
-            }
-        };
-        Ok(PersistedRecordLoad::Complete(metadata))
-    }
-
-    async fn reconcile_interrupted_resume<F>(
-        &self,
-        mut record: PersistedPausedRecord,
-        factory: &F,
-    ) -> PersistenceResult<PersistedRecordLoad>
-    where
-        F: SandboxBackendFactory,
-    {
-        let sandbox_id = record.metadata.id;
-        if host_reboot_proves_runtime_absent(
-            record.resuming_boot_id.as_deref(),
-            current_host_boot_id().as_deref(),
-        ) {
-            info!(sandbox_id = %sandbox_id, "host reboot proved interrupted resumed runtime absent; restoring paused record");
-            record.lifecycle = PersistedPausedLifecycle::Paused;
-            record.resuming_boot_id = None;
-            record.unproven_stop_boot_id = None;
-            record.metadata.paused_runtime_stopped = true;
-            self.put_record(&record).await?;
-            return Ok(PersistedRecordLoad::Continue(record));
-        }
-
-        warn!(sandbox_id = %sandbox_id, "retaining paused sandbox record left in resuming state until a later host boot proves runtime absence");
-        if record.metadata.virtualization_mode != self.virtualization_mode {
-            let mut metadata = super::codecs::paused_metadata_without_runtime_state(record);
-            metadata.paused_runtime_stopped = false;
-            metadata.resume_recovery_pending = true;
-            return Ok(PersistedRecordLoad::Complete(Some(metadata)));
-        }
-        let artifact_root = record.artifact_root.clone();
-        let manifest_path = Self::manifest_path(&artifact_root);
-        let metadata = match super::codecs::decode_recovery_pending_state(record, factory) {
-            Ok(metadata) => Some(metadata),
-            Err(error) => {
-                warn!(sandbox_id = %sandbox_id, error = %error, "quarantining interrupted resume whose paused state could not be decoded");
-                self.quarantine(
-                    format!(
-                        "interrupted resume paused sandbox state could not be decoded: {error}"
-                    ),
                     None,
                     None,
                     Some(&artifact_root),
@@ -2256,6 +2091,47 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Ok(Some(artifact_root))
     }
 
+    async fn discard_empty_capture(
+        &self,
+        sandbox_id: &SandboxId,
+        artifact_root: &Path,
+    ) -> PersistenceResult<()> {
+        if matches!(fs::symlink_metadata(artifact_root).await, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(());
+        }
+        if !self.path_is_managed_generation(sandbox_id, artifact_root) {
+            return Err(SandboxPersistenceError::RuntimeState {
+                reason: "empty capture cleanup requires an owned generation",
+            });
+        }
+        // rmdir is atomic and cannot erase any payload, manifest, or child
+        // directory. Never use recursive deletion for a failed checkpoint.
+        match fs::remove_dir(artifact_root).await {
+            Ok(()) => {
+                let parent = self.sandbox_artifact_root(sandbox_id);
+                super::durable_storage::sync_directory_chain(&parent, &self.root).map_err(
+                    |source| {
+                        SandboxPersistenceError::io("sync empty capture removal", &parent, source)
+                    },
+                )
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Ok(())
+            }
+            Err(source) => Err(SandboxPersistenceError::io(
+                "remove empty capture directory",
+                artifact_root,
+                source,
+            )),
+        }
+    }
+
     async fn persist_paused(
         &self,
         metadata: &SandboxMetadata,
@@ -2315,6 +2191,12 @@ impl SandboxPersister for FileBackedSandboxPersister {
             return Err(source);
         }
         let record = PersistedPausedRecord {
+            checkpoint_at_unix_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
             version: PAUSED_MANIFEST_VERSION,
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -2325,16 +2207,8 @@ impl SandboxPersister for FileBackedSandboxPersister {
             state,
         };
         self.put_record(&record).await?;
-        if let Err(error) = self
-            .retire_replaced_generations(&metadata.id, artifact_root)
-            .await
-        {
-            warn!(
-                sandbox_id = %metadata.id,
-                error = %error,
-                "failed to retire replaced paused generations"
-            );
-        }
+        // Retention is performed only after runtime-stop proof, with a
+        // reference inventory. Publication must never delete rollback state.
         Ok(())
     }
 
@@ -2353,6 +2227,42 @@ impl SandboxPersister for FileBackedSandboxPersister {
         record.metadata.paused_runtime_stopped = true;
         record.unproven_stop_boot_id = None;
         self.put_record(&record).await
+    }
+
+    async fn collect_stopped_checkpoints(&self, ids: &[SandboxId]) -> PersistenceResult<()> {
+        if !self.stored_quarantines().await?.is_empty() {
+            warn!("retention skipped: quarantine requires review");
+            return Ok(());
+        }
+        let mut current = Vec::new();
+        for id in ids {
+            let record = self.get_record(id).await?;
+            if record.commit_state != PersistedPausedCommitState::Committed
+                || record.lifecycle != PersistedPausedLifecycle::Paused
+                || !record.metadata.paused_runtime_stopped
+            {
+                return Err(SandboxPersistenceError::InvalidRecord {
+                    reason: format!("retention refused: guest {id} has no durable stop proof"),
+                    source: None,
+                });
+            }
+            current.push(record.artifact_root);
+        }
+        let artifacts = self.artifacts_root();
+        if !artifacts.exists() {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || super::retention::collect(&artifacts, &current))
+            .await
+            .map_err(|error| SandboxPersistenceError::InvalidRecord {
+                reason: "retention task failed".to_string(),
+                source: Some(error.into()),
+            })?
+            .map_err(|error| SandboxPersistenceError::InvalidRecord {
+                reason: "checkpoint retention failed safely".to_string(),
+                source: Some(error),
+            })?;
+        Ok(())
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -2724,6 +2634,12 @@ mod tests {
         let snapshot_root = test_snapshot_root(&persister, &sandbox_id);
         let paused_state = paused_state(&snapshot_root);
         let record = PersistedPausedRecord {
+            checkpoint_at_unix_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
             version: PAUSED_MANIFEST_VERSION,
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -2781,6 +2697,12 @@ mod tests {
         metadata.resume_recovery_pending = true;
         metadata.paused_runtime_stopped = false;
         let record = PersistedPausedRecord {
+            checkpoint_at_unix_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
             version: PAUSED_MANIFEST_VERSION,
             commit_state: PersistedPausedCommitState::Prepared,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -2985,7 +2907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_boot_reconciles_resuming_record_to_paused() -> anyhow::Result<()> {
+    async fn later_boot_does_not_certify_interrupted_resume_writes() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -3013,11 +2935,16 @@ mod tests {
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
         assert_eq!(loaded.len(), 1);
-        assert!(!loaded[0].resume_recovery_pending);
-        assert!(loaded[0].paused_runtime_stopped);
+        assert!(loaded[0].resume_recovery_pending);
+        assert!(!loaded[0].paused_runtime_stopped);
         let record = persister.get_record(&sandbox_id).await?;
-        assert_eq!(record.lifecycle, PersistedPausedLifecycle::Paused);
-        assert!(record.resuming_boot_id.is_none());
+        assert_eq!(record.lifecycle, PersistedPausedLifecycle::Resuming);
+        assert!(record.resuming_boot_id.is_some());
+        assert!(persister
+            .list_quarantines()
+            .await?
+            .iter()
+            .any(|entry| entry.reason.contains("potential data loss")));
         assert!(snapshot_root.exists());
         Ok(())
     }
@@ -3146,7 +3073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_resume_rehydrates_the_last_snapshot_on_startup() -> anyhow::Result<()> {
+    async fn startup_refuses_stale_state_after_successful_resume() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -3172,12 +3099,138 @@ mod tests {
         assert_eq!(loaded[0].id, sandbox_id);
         assert_eq!(loaded[0].state, SandboxState::Paused);
         assert!(last_generation.exists());
-        assert!(persister.list_quarantines().await?.is_empty());
+        assert!(loaded[0].resume_recovery_pending);
+        assert!(!loaded[0].paused_runtime_stopped);
+        let quarantines = persister.list_quarantines().await?;
+        assert!(quarantines
+            .iter()
+            .any(|item| item.reason.contains("checkpoint_at_unix_ms")));
         Ok(())
     }
 
     #[tokio::test]
-    async fn next_pause_retires_the_replaced_generation() -> anyhow::Result<()> {
+    async fn failed_capture_cleanup_removes_only_empty_owned_generations() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let id = SandboxId::new();
+        for _ in 0..4 {
+            let empty = persister.allocate_artifact_root(&id).await?.unwrap();
+            persister.discard_empty_capture(&id, &empty).await?;
+            persister.discard_empty_capture(&id, &empty).await?;
+            assert!(!empty.exists());
+        }
+        let partial = persister.allocate_artifact_root(&id).await?.unwrap();
+        std::fs::write(partial.join("payload"), b"retain uncertain data")?;
+        persister.discard_empty_capture(&id, &partial).await?;
+        assert_eq!(
+            std::fs::read(partial.join("payload"))?,
+            b"retain uncertain data"
+        );
+        assert!(persister
+            .discard_empty_capture(&SandboxId::new(), &partial)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_exit_before_pointer_publication_preserves_prior_checkpoint(
+    ) -> anyhow::Result<()> {
+        const CHILD_ROOT: &str = "AENV_PERSISTENCE_CRASH_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let persister = FileBackedSandboxPersister::new_for_test(root.clone())
+                .with_durability(LocalStoreDurability::Sync);
+            let id = SandboxId::new();
+            let old = persister.allocate_artifact_root(&id).await?.unwrap();
+            std::fs::write(old.join("payload"), b"previous valid checkpoint")?;
+            let state = paused_state(&old);
+            let metadata = SandboxMetadata {
+                id,
+                state: SandboxState::Paused,
+                paused_state: Some(Arc::clone(&state)),
+                ..Default::default()
+            };
+            persister
+                .persist_paused(&metadata, Some(&old), state.as_ref())
+                .await?;
+            persister.mark_paused_runtime_stopped(&id).await?;
+            let old_manifest = std::fs::read(FileBackedSandboxPersister::manifest_path(&old))?;
+            let old_index = persister.db().await?.get(id.to_string()).await?.unwrap();
+            std::fs::write(root.join("old-manifest"), old_manifest)?;
+            std::fs::write(root.join("old-index"), old_index)?;
+            let new = persister.allocate_artifact_root(&id).await?.unwrap();
+            std::fs::write(new.join("payload"), b"unpublished checkpoint")?;
+            persister.sync_artifact_tree(&new).await?;
+            let mut record = persister.get_record(&id).await?;
+            record.artifact_root = new.clone();
+            record.commit_state = PersistedPausedCommitState::Prepared;
+            record.metadata.resume_recovery_pending = true;
+            record.metadata.paused_runtime_stopped = false;
+            persister.write_manifest(&record).await?;
+            std::fs::write(
+                root.join("fixture.json"),
+                serde_json::to_vec(&(id, old, new))?,
+            )?;
+            // Exit without running destructors or closing RocksDB. The WAL must
+            // preserve the old pointer; the Prepared sibling must block stale recovery.
+            std::process::exit(73);
+        }
+        let temp = TempDir::new()?;
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "orchestrator::persistence::file_backed::tests::process_exit_before_pointer_publication_preserves_prior_checkpoint", "--nocapture"])
+            .env(CHILD_ROOT, temp.path())
+            .status()?;
+        assert_eq!(status.code(), Some(73));
+        let (id, old, new): (SandboxId, PathBuf, PathBuf) =
+            serde_json::from_slice(&std::fs::read(temp.path().join("fixture.json"))?)?;
+        let persister = FileBackedSandboxPersister::new_for_test(temp.path().to_path_buf())
+            .with_durability(LocalStoreDurability::Sync);
+        assert_eq!(
+            persister.db().await?.get(id.to_string()).await?.unwrap(),
+            std::fs::read(temp.path().join("old-index"))?
+        );
+        for _ in 0..2 {
+            let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+            assert!(loaded
+                .iter()
+                .all(|item| item.resume_recovery_pending && !item.paused_runtime_stopped));
+            assert!(!persister.list_quarantines().await?.is_empty());
+            assert_eq!(
+                std::fs::read(FileBackedSandboxPersister::manifest_path(&old))?,
+                std::fs::read(temp.path().join("old-manifest"))?
+            );
+            assert_eq!(
+                std::fs::read(old.join("payload"))?,
+                b"previous valid checkpoint"
+            );
+            assert_eq!(
+                std::fs::read(new.join("payload"))?,
+                b"unpublished checkpoint"
+            );
+        }
+        // A pointer to an absent generation must quarantine, not panic while
+        // trying to select one of the surviving manifests.
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("old-index"))?)?;
+        index["manifestPath"] = serde_json::Value::String(
+            temp.path()
+                .join("missing/manifest.json")
+                .display()
+                .to_string(),
+        );
+        persister
+            .db()
+            .await?
+            .put(id.to_string(), serde_json::to_vec(&index)?)
+            .await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert!(loaded.iter().all(|item| item.resume_recovery_pending));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_pause_preserves_the_previous_rollback_generation() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -3206,14 +3259,13 @@ mod tests {
             .persist_paused(&metadata, Some(&second_generation), second_state.as_ref())
             .await?;
 
-        assert!(!first_generation.exists());
+        assert!(first_generation.exists());
         assert!(second_generation.exists());
         Ok(())
     }
 
     #[tokio::test]
-    async fn startup_restores_a_committed_resume_as_the_last_paused_snapshot() -> anyhow::Result<()>
-    {
+    async fn startup_marks_committed_resume_as_requiring_explicit_recovery() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -3242,6 +3294,8 @@ mod tests {
         assert_eq!(loaded[0].id, sandbox_id);
         assert_eq!(loaded[0].state, SandboxState::Paused);
         assert!(consumed_generation.exists());
+        assert!(loaded[0].resume_recovery_pending);
+        assert!(!loaded[0].paused_runtime_stopped);
         Ok(())
     }
 

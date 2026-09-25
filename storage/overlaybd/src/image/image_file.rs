@@ -192,6 +192,33 @@ impl ImageFile {
             .await
     }
 
+    /// Copy only the current upper's mapped blocks into a durable sealed layer.
+    /// The live upper is never sealed, renamed, truncated, or replaced. Any
+    /// allocation/publication failure therefore leaves the image writable.
+    pub async fn create_snapshot_copy(&self, output: &Path) -> Result<Option<LayerDescriptor>> {
+        let parent = output.parent().context("snapshot output has no parent")?;
+        tokio::fs::create_dir_all(parent).await?;
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let state = self.state.write().await;
+        let current = state
+            .base
+            .writable()
+            .context("snapshot requires a writable upper")?;
+        let output_file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::open_rw(temporary.path(), false, shared_transient_io_ring()).await?,
+        );
+        current
+            .export_upper_as_sealed(CommitArgs::new(output_file))
+            .await?;
+        temporary.as_file().sync_all()?;
+        // Never replace an existing valid layer on a retry.
+        temporary
+            .persist_noclobber(output)
+            .map_err(|error| error.error)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(None)
+    }
+
     pub async fn create_snapshot_and_restack(
         &self,
         output_layer_path: &Path,
@@ -1817,6 +1844,166 @@ mod tests {
             .expect("open snapshot lower");
         let got_snapshot = snapshot.read_at(0, 4096).await.expect("read snapshot");
         assert_eq!(got_snapshot.as_ref(), &[0x23; 4096]);
+    }
+
+    async fn snapshot_copy_fixture() -> (TempDir, ImageFile) {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        let lower_payload = vec![0x11; 4096];
+        create_sealed_lower(&lower_path, &lower_index, &lower_payload)
+            .await
+            .expect("build sealed lower");
+
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 4096)
+            .await
+            .expect("build initialized upper");
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: vec![LayerConfig {
+                file: lower_path.to_string_lossy().into_owned(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig {
+                mode: None,
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("open image");
+        image
+            .write_at(0, &[0x44; 4096])
+            .await
+            .expect("write overlay");
+        image.sync().await.expect("sync overlay");
+
+        (tmp, image)
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_copy_publication_failure_keeps_live_disk_writable() {
+        let (tmp, image) = snapshot_copy_fixture().await;
+        let snapshot_path = tmp.path().join("snapshot.commit");
+        std::fs::create_dir(&snapshot_path).expect("create conflicting directory");
+        let err = image
+            .create_snapshot_copy(&snapshot_path)
+            .await
+            .expect_err("rename conflict should fail");
+        assert!(err
+            .downcast_ref::<RestackSnapshotTerminalFailure>()
+            .is_none());
+        image
+            .write_at(0, &[0x55; 4096])
+            .await
+            .expect("failed publication must leave live disk writable");
+        image.sync().await.expect("sync after failed publication");
+        let retry = tmp.path().join("retry.commit");
+        image
+            .create_snapshot_copy(&retry)
+            .await
+            .expect("retry export");
+        assert!(retry.is_file());
+        image
+            .write_at(0, &[0x66; 4096])
+            .await
+            .expect("successful copy also leaves live disk writable");
+    }
+
+    /// Run only on the dedicated small tmpfs created by the fault-test script.
+    #[tokio::test]
+    #[ignore = "requires isolated 1 MiB tmpfs with 64 inodes in AENV_TEST_ENOSPC_DIR"]
+    async fn test_snapshot_copy_real_enospc_keeps_live_disk_writable() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::path::PathBuf::from(
+            std::env::var("AENV_TEST_ENOSPC_DIR").expect("isolated tmpfs"),
+        );
+        let path = std::ffi::CString::new(root.as_os_str().as_bytes()).unwrap();
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(
+            unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) },
+            0
+        );
+        let stats = unsafe { stats.assume_init() };
+        assert_eq!(
+            stats.f_type,
+            libc::TMPFS_MAGIC,
+            "never fill a host/data filesystem"
+        );
+        assert!(stats.f_blocks * stats.f_bsize as u64 <= 2 * 1024 * 1024);
+        assert!(stats.f_files <= 128);
+        let (_live_root, image) = snapshot_copy_fixture().await;
+        let output = tempfile::tempdir_in(&root).unwrap();
+        let previous = output.path().join("previous.commit");
+        image
+            .create_snapshot_copy(&previous)
+            .await
+            .expect("previous recovery point");
+        let previous_bytes = std::fs::read(&previous).unwrap();
+        for inode_pressure in [false, true] {
+            let fill = tempfile::tempdir_in(&root).unwrap();
+            if inode_pressure {
+                let mut exhausted = false;
+                for index in 0..128 {
+                    match std::fs::File::create(fill.path().join(index.to_string())) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                            exhausted = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(exhausted, "inode pressure actually reached ENOSPC");
+            } else {
+                let mut file = std::fs::File::create(fill.path().join("bytes")).unwrap();
+                let error = file.write_all(&vec![0u8; 2 * 1024 * 1024]).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            }
+            let candidate = output.path().join("candidate.commit");
+            let error = image
+                .create_snapshot_copy(&candidate)
+                .await
+                .expect_err("real ENOSPC must fail capture");
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind()
+                        == std::io::Error::from_raw_os_error(libc::ENOSPC).kind())
+                    || cause.downcast_ref::<nix::errno::Errno>()
+                        == Some(&nix::errno::Errno::ENOSPC)),
+                "{error:#}"
+            );
+            assert!(!candidate.exists());
+            assert_eq!(std::fs::read(&previous).unwrap(), previous_bytes);
+            image
+                .write_at(0, &[0x77; 4096])
+                .await
+                .expect("live disk writable while snapshot filesystem full");
+            image.sync().await.unwrap();
+            assert_eq!(
+                image.read_at(0, 4096).await.unwrap().as_ref(),
+                &[0x77; 4096]
+            );
+            drop(fill);
+            image
+                .create_snapshot_copy(&candidate)
+                .await
+                .expect("retry after pressure relieved");
+            std::fs::remove_file(candidate).unwrap();
+        }
     }
 
     #[tokio::test]

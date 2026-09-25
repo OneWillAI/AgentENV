@@ -394,8 +394,8 @@ impl UblkDeviceManager {
         Ok(())
     }
 
-    /// Request a restack-style snapshot of an overlaybd device's upper layer.
-    pub(crate) async fn restack_snapshot_device(
+    /// Request a non-mutating snapshot of an overlaybd device's upper layer.
+    pub(crate) async fn export_snapshot_device(
         &self,
         device: &UblkDevice,
         output_layer_path: &Path,
@@ -405,11 +405,11 @@ impl UblkDeviceManager {
         debug!(
             dev_id = device.dev_id,
             output = %output_layer_path.display(),
-            "requesting overlaybd restack snapshot"
+            "requesting overlaybd snapshot export"
         );
-        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "restack_snapshot");
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "snapshot_export");
         let result = client
-            .restack_snapshot(device.dev_id, output_layer_path)
+            .export_snapshot(device.dev_id, output_layer_path)
             .await;
         metric.finish(&result);
         match result {
@@ -420,7 +420,7 @@ impl UblkDeviceManager {
                     output = %output_layer_path.display(),
                     digest = stats.descriptor.as_ref().map(|d| d.digest.as_str()),
                     size = stats.descriptor.as_ref().map(|d| d.size),
-                    "overlaybd restack snapshot completed"
+                    "overlaybd snapshot export completed"
                 );
                 Ok(stats.descriptor)
             }
@@ -430,7 +430,7 @@ impl UblkDeviceManager {
                     .is_some()
                 {
                     return Err(SandboxCaptureError::terminal(anyhow!(format!(
-                        "restack snapshot overlaybd device {} to {} failed after mutating live runtime: {err:#}",
+                        "snapshot export overlaybd device {} to {} failed after mutating live runtime: {err:#}",
                         device.dev_id,
                         output_layer_path.display()
                     )))
@@ -438,7 +438,7 @@ impl UblkDeviceManager {
                 }
                 Err(err).with_context(|| {
                     format!(
-                        "restack snapshot overlaybd device {} to {}",
+                        "snapshot export overlaybd device {} to {}",
                         device.dev_id,
                         output_layer_path.display()
                     )

@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     if !Uid::effective().is_root() {
         anyhow::bail!("aenv-paused-recovery must be run by a host administrator (effective UID 0)");
     }
+    let _runtime_store_lock = agentenv::orchestrator::lock_runtime_store(&cli.store)?;
     let persister = FileBackedSandboxPersister::new(cli.store, VirtualizationMode::Kvm);
 
     match cli.command {
