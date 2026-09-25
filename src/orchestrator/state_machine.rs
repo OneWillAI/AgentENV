@@ -11,20 +11,19 @@ use super::types::SandboxState;
 pub(super) enum FailedLaunchStage {
     Registered,
     TransitionalPersisted,
-    RunningPersisted,
+    RoutePublished,
 }
 
 impl FailedLaunchStage {
     pub(super) fn rollback_expected_state(self, plan: &LaunchPlan) -> Option<SandboxState> {
         match self {
             Self::Registered => None,
-            Self::TransitionalPersisted => Some(plan.transitional_state()),
-            Self::RunningPersisted => Some(SandboxState::Running),
+            Self::TransitionalPersisted | Self::RoutePublished => Some(plan.transitional_state()),
         }
     }
 
     pub(super) fn should_detach_proxy_route(self) -> bool {
-        matches!(self, Self::RunningPersisted)
+        matches!(self, Self::RoutePublished)
     }
 }
 

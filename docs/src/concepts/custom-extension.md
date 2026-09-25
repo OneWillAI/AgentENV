@@ -39,7 +39,7 @@ Notes:
 - `stop` is best-effort: delivery failures are only logged, and it is also fired fire-and-forget if a started sandbox is dropped without an explicit stop.
 - `networkNamespacePath` is the host path of the sandbox's netns file (e.g. `/var/run/netns/agentenv-ns-*`), so the extension can enter the namespace (e.g. `nsenter --net=...`) to set up firewall rules or VPN interfaces.
 - `hostInteractionIp` is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.
-- Concurrent `patch-params` calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.
+- `patch-params` calls are serialized with each other and snapshot capture using the sandbox lock. A patch admitted while running completes its hook and updates both backend configuration and metadata before pause can capture them. A patch arriving after pause starts is rejected before calling the extension. Hook latency is bounded by `timeout_ms`; a failed or lost hook response may still have been applied by the extension, so extensions should persist configuration and support safe retries.
 
 ---
 

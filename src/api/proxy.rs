@@ -666,6 +666,7 @@ async fn resolve_proxy_request(
         parse_target_port_header(&parts.headers).map_err(|err| proxy_error_response(&err))?;
 
     let mut auto_resume_attempted = false;
+    let mut transitions_waited = 0;
     let target = loop {
         match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
             Ok(ProxyLookupResult::Ready(target)) => break target,
@@ -695,6 +696,24 @@ async fn resolve_proxy_request(
                 return Err(proxy_error_response(
                     &ProxyRequestError::SandboxUnavailable(sandbox_id, SandboxState::Paused),
                 ))
+            }
+            // A request arriving behind another wake-up joins the existing
+            // lifecycle transition. Waiting does not authorize or start a VM;
+            // the next lookup still enforces autoResume and secure envd auth.
+            Ok(ProxyLookupResult::Unavailable(
+                state @ (SandboxState::Pausing | SandboxState::Resuming),
+            )) if transitions_waited < 2 => {
+                api_impl
+                    .orchestrator()
+                    .wait_for_transition(sandbox_id, state)
+                    .await
+                    .map_err(|_| {
+                        proxy_error_response(&ProxyRequestError::SandboxUnavailable(
+                            sandbox_id, state,
+                        ))
+                    })?;
+                transitions_waited += 1;
+                continue;
             }
             Ok(ProxyLookupResult::Unavailable(_)) | Ok(ProxyLookupResult::RouteMissing)
                 if auto_resume_attempted =>

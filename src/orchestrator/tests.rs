@@ -1467,7 +1467,7 @@ async fn proxy_lookup_reports_paused_for_paused_sandbox() {
 }
 
 #[tokio::test]
-async fn cleanup_failed_launch_removes_created_running_metadata() {
+async fn cleanup_failed_launch_removes_created_metadata() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
     let plan = create_launch_plan_with_resources(sandbox_id);
@@ -1479,14 +1479,14 @@ async fn cleanup_failed_launch_removes_created_running_metadata() {
         .store
         .add(SandboxMetadata {
             id: sandbox_id,
-            state: SandboxState::Running,
+            state: plan.transitional_state(),
             ..Default::default()
         })
         .await
         .unwrap();
 
     orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RoutePublished)
         .await;
 
     assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
@@ -1497,17 +1497,17 @@ async fn cleanup_failed_launch_restores_resume_metadata() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
     let rollback_metadata = paused_resume_metadata(sandbox_id);
-    let mut running_metadata = rollback_metadata.clone();
-    running_metadata.state = SandboxState::Running;
+    let mut resuming_metadata = rollback_metadata.clone();
+    resuming_metadata.state = SandboxState::Resuming;
     let plan = resume_launch_plan(sandbox_id);
     let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
         MockBehavior::new(),
     )))));
 
-    orchestrator.store.add(running_metadata).await.unwrap();
+    orchestrator.store.add(resuming_metadata).await.unwrap();
 
     orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RoutePublished)
         .await;
 
     assert_eq!(
@@ -1587,7 +1587,7 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
         .await;
 
     orchestrator
-        .cleanup_failed_launch(&plan, stale_handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(&plan, stale_handle, FailedLaunchStage::RoutePublished)
         .await;
 
     let current_handle = orchestrator
