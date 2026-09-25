@@ -108,6 +108,11 @@ async fn main() -> anyhow::Result<()> {
         overlaybd_p2p.publish_address(),
     )
     .await?;
+    if !UblkDeviceManager::global().is_available() {
+        anyhow::bail!(
+            "configured ublk daemon is unavailable; refusing healthy startup without guest storage"
+        );
+    }
 
     if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
         warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");

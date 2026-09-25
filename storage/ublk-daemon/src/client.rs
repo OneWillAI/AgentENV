@@ -129,6 +129,9 @@ struct UblkDaemonClientInner {
     socket_path: PathBuf,
     /// Set to `true` when the daemon process exits (expected or unexpected).
     daemon_dead: AtomicBool,
+    /// Shutdown acknowledgement is not process-exit proof. Keep the worker
+    /// alive until its watchdog has reaped the owned daemon child.
+    daemon_exited: tokio::sync::watch::Sender<bool>,
     /// Set to `true` when `shutdown()` is called, so the watchdog task
     /// doesn't log the expected exit as an error.
     shutting_down: AtomicBool,
@@ -224,6 +227,7 @@ impl UblkDaemonClient {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path: config.socket_path,
                 daemon_dead: AtomicBool::new(false),
+                daemon_exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
                 death_reason: Mutex::new(None),
                 runtime_device_timeout: config.runtime_device_timeout,
@@ -255,12 +259,20 @@ impl UblkDaemonClient {
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                Err(_) => {
-                    std::fs::remove_file(socket_path).with_context(|| {
-                        format!("remove stale daemon socket: {}", socket_path.display())
-                    })?;
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    match std::fs::remove_file(socket_path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error).context("remove stale daemon socket"),
+                    }
                     return Ok(());
                 }
+                Err(error) => return Err(error).context("inspect existing daemon socket"),
             }
         }
     }
@@ -323,6 +335,9 @@ impl UblkDaemonClient {
 
             *inner.death_reason.lock().unwrap() = Some(reason);
             inner.daemon_dead.store(true, Ordering::Release);
+            if status.is_ok() {
+                inner.daemon_exited.send_replace(true);
+            }
         });
     }
 
@@ -517,13 +532,20 @@ impl UblkDaemonClient {
     /// Request graceful daemon shutdown.
     ///
     /// Signals the watchdog that this is an expected exit so it does not
-    /// log at error level.
+    /// log at error level. Wait for the child to exit so a replacement daemon
+    /// cannot race the old daemon's socket removal or device cleanup.
     pub async fn shutdown(&self) -> Result<()> {
+        let mut exited = self.inner.daemon_exited.subscribe();
         self.inner.shutting_down.store(true, Ordering::Release);
         // Best-effort: daemon may close connection before responding.
         let _ = self
             .call(DaemonRequest::Shutdown, Duration::from_secs(5))
             .await;
+        tracing::info!("waiting for owned ublk daemon process to exit");
+        exited
+            .wait_for(|exited| *exited)
+            .await
+            .context("wait for daemon exit proof")?;
         Ok(())
     }
 
@@ -670,6 +692,8 @@ impl UblkDaemonClient {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path,
                 daemon_dead: AtomicBool::new(daemon_dead),
+                // This constructor owns no child process to reap.
+                daemon_exited: tokio::sync::watch::channel(true).0,
                 shutting_down: AtomicBool::new(false),
                 death_reason: Mutex::new(if daemon_dead {
                     Some("test: daemon marked dead".into())
@@ -741,7 +765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_sets_shutting_down_flag() {
+    async fn shutdown_waits_for_owned_child_exit_after_socket_closes() {
         // Create a mock server that accepts one connection and returns nothing,
         // to simulate the daemon receiving shutdown and closing.
         let dir = tempfile::tempdir().unwrap();
@@ -749,6 +773,15 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
 
         let client = UblkDaemonClient::new_for_test(sock_path, false);
+        client.inner.daemon_exited.send_replace(false);
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read release"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut release = child.stdin.take().unwrap();
+        UblkDaemonClient::spawn_watchdog(Arc::clone(&client.inner), child);
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
 
         // Accept connection in background (shutdown is best-effort).
         tokio::spawn(async move {
@@ -756,11 +789,26 @@ mod tests {
             // Read the request, don't send response — simulating daemon closing.
             let _: Option<DaemonRequest> =
                 crate::protocol::recv_message(&mut stream).await.unwrap();
+            drop(stream);
+            received_tx.send(()).unwrap();
         });
 
-        // shutdown() should not return an error even if the daemon doesn't respond.
-        let result = client.shutdown().await;
-        assert!(result.is_ok());
+        let stopping = Arc::clone(&client);
+        let task = tokio::spawn(async move { stopping.shutdown().await });
+        received_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "socket close must not stand in for process exit"
+        );
         assert!(client.inner.shutting_down.load(Ordering::Acquire));
+        use tokio::io::AsyncWriteExt;
+        release.write_all(b"exit\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(*client.inner.daemon_exited.borrow());
     }
 }
