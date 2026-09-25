@@ -1,6 +1,6 @@
 use axum::{middleware, routing::get, Router};
 
-use super::{disk_branch, host_interaction, proxy, ApiImpl};
+use super::{disk_branch, host_interaction, proxy, reboot, ApiImpl};
 use crate::observability::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
@@ -28,6 +28,7 @@ where
         .merge(proxy::router(api_impl.clone()))
         .merge(disk_branch::router(api_impl.clone()))
         .merge(host_interaction::router(api_impl.clone()))
+        .merge(reboot::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
         .layer(middleware::from_fn_with_state(
             api_impl,

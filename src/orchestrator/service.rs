@@ -513,7 +513,7 @@ where
                 }
             };
             drop(guard);
-            if operation == "pause" && result.is_ok() {
+            if matches!(operation, "pause" | "reboot") && result.is_ok() {
                 let _exclusive = this.lifecycle_gate.write().await;
                 this.collect_checkpoints().await;
             }
@@ -1811,12 +1811,84 @@ where
         .await
     }
 
+    /// Apply the node's installed tools release to this sandbox's retained
+    /// disk. Product maintenance admission and initialization belong to the
+    /// caller. The selected version is also the retry identity: after capture,
+    /// retries resume the retained record instead of capturing an older disk.
+    pub async fn reboot_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<SandboxMetadata> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("reboot", sandbox_id, async move {
+            this.ensure_accepting_lifecycle_operations()?;
+            let tools_version = ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_owned();
+            loop {
+                let metadata = this
+                    .store
+                    .get(&sandbox_id)
+                    .await?
+                    .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                Self::require_resume_recovery_resolved(&metadata)?;
+                match metadata.state {
+                    SandboxState::Pausing | SandboxState::Resuming => {
+                        this.wait_for_transition(sandbox_id, metadata.state).await?;
+                        continue;
+                    }
+                    SandboxState::Paused => {
+                        if !metadata.paused_runtime_stopped {
+                            let handle = this.sandboxes.read().await.get(&sandbox_id).cloned();
+                            if let Some(handle) = handle {
+                                this.stop_and_ack_paused_runtime(
+                                    sandbox_id,
+                                    &handle,
+                                    metadata.paused_state.as_ref(),
+                                )
+                                .await?;
+                            }
+                        }
+                        Arc::clone(&this)
+                            .resume_sandbox_inner(
+                                sandbox_id,
+                                NewTimeout::EnsureMinimum(Duration::from_secs(300)),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    SandboxState::Running => {
+                        if metadata.runtime_versions.tools_drive_version == tools_version {
+                            return Ok(metadata);
+                        }
+                        this.preserve_sandbox(sandbox_id, Some(&tools_version))
+                            .await?;
+                    }
+                    state => {
+                        return Err(OrchestratorError::InvalidSandboxState { sandbox_id, state })
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     #[tracing::instrument(
         name = "pause_sandbox",
         skip(self),
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        self.preserve_sandbox(sandbox_id, None).await
+    }
+
+    // Both memory resume and disk-only cold boot use the same publication,
+    // retention and stop proof. The caller owns maintenance admission.
+    async fn preserve_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        cold_boot_tools: Option<&str>,
+    ) -> Result<()> {
         info!("pausing sandbox");
         match self.transition_to_pausing(sandbox_id).await? {
             PausePreparation::Owner => {}
@@ -1833,6 +1905,7 @@ where
                 &handle,
                 removed_proxy_route.clone(),
                 artifact_root.as_deref(),
+                cold_boot_tools,
             )
             .await?;
 
@@ -1845,6 +1918,9 @@ where
             metadata.state = SandboxState::Paused;
             metadata.paused_state = Some(paused_state.clone());
             metadata.paused_runtime_stopped = false;
+            if let Some(tools_version) = cold_boot_tools {
+                metadata.runtime_versions.tools_drive_version = tools_version.to_owned();
+            }
             metadata
         };
         if let Err(err) = self
@@ -1868,7 +1944,10 @@ where
         }
         let resources = persisted_metadata.resources;
         self.store.update(persisted_metadata).await?;
-        if let Err(error) = self.stop_and_ack_paused_runtime(sandbox_id, &handle).await {
+        if let Err(error) = self
+            .stop_and_ack_paused_runtime(sandbox_id, &handle, Some(&paused_state))
+            .await
+        {
             self.sandboxes
                 .write()
                 .await
@@ -1983,8 +2062,30 @@ where
         handle: &SandboxHandle,
         removed_proxy_route: Option<ProxyRoute>,
         artifact_root: Option<&std::path::Path>,
+        cold_boot_tools: Option<&str>,
     ) -> Result<Arc<dyn PausedSandboxState>> {
-        let pause_result = handle.lock().await.pause(artifact_root).await;
+        let pause_result = if let Some(tools_version) = cold_boot_tools {
+            let resources = self
+                .store
+                .get(&sandbox_id)
+                .await?
+                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?
+                .resources;
+            match artifact_root {
+                Some(root) => {
+                    handle
+                        .lock()
+                        .await
+                        .pause_for_cold_boot(root, tools_version, resources)
+                        .await
+                }
+                None => Err(crate::sandbox::SandboxCaptureError::recoverable(
+                    anyhow::anyhow!("retained-disk cold boot requires durable sandbox persistence"),
+                )),
+            }
+        } else {
+            handle.lock().await.pause(artifact_root).await
+        };
         let error = match pause_result {
             Ok(paused_state) => return Ok(paused_state),
             Err(error) => error,
@@ -2095,8 +2196,38 @@ where
         &self,
         sandbox_id: SandboxId,
         handle: &SandboxHandle,
+        expected_paused_state: Option<&Arc<dyn PausedSandboxState>>,
     ) -> Result<()> {
-        if let Err(error) = handle.lock().await.stop().await {
+        // Keep concurrent retries on this retained handle serialized through
+        // the durable acknowledgment. Never stop a newer resumed runtime.
+        let mut runtime = handle.lock().await;
+        let handles = self.sandboxes.read().await;
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Paused
+            || handles
+                .get(&sandbox_id)
+                .is_some_and(|current| !Arc::ptr_eq(current, handle))
+            || !metadata
+                .paused_state
+                .as_ref()
+                .zip(expected_paused_state)
+                .is_some_and(|(current, expected)| Arc::ptr_eq(current, expected))
+        {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+        Self::require_resume_recovery_resolved(&metadata)?;
+        if metadata.paused_runtime_stopped {
+            return Ok(());
+        }
+        drop(handles);
+        if let Err(error) = runtime.stop().await {
             warn!(error = ?error, "failed to stop sandbox after pausing");
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,

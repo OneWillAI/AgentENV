@@ -163,10 +163,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         artifact_root: PathBuf,
         state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
-        Ok(Arc::new(FirecrackerPausedState::decode(
-            artifact_root,
-            state,
-        )?))
+        super::cold_boot::decode_recovery_state(artifact_root, state)
     }
 
     fn build_from_paused_state(
@@ -175,6 +172,17 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
+        if let Some(cold) = state.downcast_ref::<super::cold_boot::FirecrackerColdBootState>() {
+            let mut config = cold.config.clone();
+            config.common.envd_access_token = envd_access_token.clone();
+            if let Some(mmds) = config.common.mmds_metadata.as_mut() {
+                mmds.sandbox_id = sandbox_id.to_string();
+                mmds.set_access_token(envd_access_token.as_ref());
+            }
+            return Ok(Box::new(FirecrackerSandbox::new_with_id(
+                config, sandbox_id,
+            )?));
+        }
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;

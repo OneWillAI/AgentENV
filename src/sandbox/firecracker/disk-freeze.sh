@@ -15,7 +15,7 @@ release() (
 ) 9>"$lock"
 
 case "$action" in
-    freeze)
+    freeze|freeze-stop)
         command -v fsfreeze >/dev/null
         command -v flock >/dev/null
         # A tmpfs lease remains writable while / is frozen. Reject images
@@ -27,7 +27,12 @@ case "$action" in
             printf '%s' "$token" >"$lease"
             # Also recovers a lost RPC or a server exit. Close the inherited
             # lock descriptor and streams before detaching the watchdog.
-            (sleep 60; release) </dev/null >/dev/null 2>&1 9>&- &
+            # A cold-stop capture keeps its freeze until confirmed VM stop.
+            # Its lifecycle owner must explicitly thaw on rollback; a timer
+            # must never silently permit writes during disk-only capture.
+            if test "$action" = freeze; then
+                (sleep 60; release) </dev/null >/dev/null 2>&1 9>&- &
+            fi
             if ! fsfreeze --freeze /; then
                 rm "$lease"
                 exit 1

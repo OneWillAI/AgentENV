@@ -4,6 +4,7 @@
 //! [`FirecrackerSandboxFactory`] which wires sandbox configuration from the
 //! global [`ConfigManager`][crate::cfg::ConfigManager].
 
+mod cold_boot;
 mod config;
 mod connector;
 mod factory;
@@ -16,6 +17,7 @@ mod process_vm_reader;
 mod sandbox;
 mod socket;
 
+pub(crate) use cold_boot::recovery_checkpoint_references;
 pub use config::{
     FirecrackerCommonConfig, FirecrackerRuntimePolicy, FirecrackerSandboxConfig,
     FirecrackerSnapshotConfig,

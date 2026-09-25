@@ -31,6 +31,7 @@ pub use extra_drive::{
     normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
     ExtraDrive,
 };
+pub(crate) use firecracker::recovery_checkpoint_references;
 pub use firecracker::{
     FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,

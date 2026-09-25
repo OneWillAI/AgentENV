@@ -297,6 +297,19 @@ impl FirecrackerCommonConfig {
         Ok(())
     }
 
+    pub(super) fn disk_references(&self) -> Result<Vec<PathBuf>> {
+        use crate::sandbox::checkpoint_references::image;
+        let rootfs = self
+            .rootfs_image_config
+            .as_ref()
+            .context("checkpoint rootfs config missing")?;
+        let mut paths = image(&rootfs.image_config_path)?;
+        for drive in &self.extra_drives {
+            paths.extend(image(drive.image_config_path())?);
+        }
+        Ok(paths)
+    }
+
     fn validate_persisted_artifacts(&self) -> Result<()> {
         validate_overlaybd_extra_drive_set(&self.extra_drives)?;
         if matches!(self.rootfs_virtual_size, Some(0)) {
@@ -350,7 +363,7 @@ pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<Tem
 
 // ── FirecrackerSandboxConfig ────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirecrackerSandboxConfig {
     pub common: FirecrackerCommonConfig,
     pub kernel_image: PathBuf,
@@ -360,6 +373,34 @@ pub struct FirecrackerSandboxConfig {
 }
 
 impl FirecrackerSandboxConfig {
+    /// Disk-only recovery must remain readable when launch dependencies are
+    /// temporarily unavailable. Validate those dependencies at boot instead.
+    pub(super) fn validate_persisted(&self) -> Result<()> {
+        self.common.validate_persisted_artifacts()?;
+        anyhow::ensure!(
+            self.vcpu_count > 0 && self.mem_size_mib > 0,
+            "invalid cold-boot resources"
+        );
+        anyhow::ensure!(
+            self.common.rootfs_virtual_size.is_some_and(|size| size > 0),
+            "cold-boot disk size is missing"
+        );
+        anyhow::ensure!(
+            !self.common.tools_drive_version.trim().is_empty(),
+            "cold-boot tools version is missing"
+        );
+        let rootfs = self
+            .common
+            .rootfs_image_config
+            .as_ref()
+            .context("cold-boot disk config is missing")?;
+        anyhow::ensure!(
+            rootfs.image_config_path.is_file(),
+            "cold-boot disk config is missing"
+        );
+        Ok(())
+    }
+
     pub fn new(
         firecracker_binary: PathBuf,
         kernel_image: PathBuf,
@@ -501,15 +542,7 @@ impl FirecrackerSnapshotConfig {
         use crate::sandbox::checkpoint_references::{absolute, image};
         let mut paths = vec![absolute(&self.vm_state_path)?];
         paths.extend(image(&self.mem_overlaybd_config.image_config_path)?);
-        let rootfs = self
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("checkpoint rootfs config missing")?;
-        paths.extend(image(&rootfs.image_config_path)?);
-        for drive in &self.common.extra_drives {
-            paths.extend(image(drive.image_config_path())?);
-        }
+        paths.extend(self.common.disk_references()?);
         Ok(paths)
     }
 

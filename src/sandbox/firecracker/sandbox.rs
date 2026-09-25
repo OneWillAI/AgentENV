@@ -194,6 +194,7 @@ pub struct FirecrackerSandbox {
     /// best-effort notification. `None` when no start hook was delivered (or
     /// no extension is configured).
     custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
+    cold_boot_freeze_token: Option<String>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -470,6 +471,30 @@ impl SandboxBackend for FirecrackerSandbox {
         }))
         .await;
         Ok(start_results)
+    }
+
+    async fn pause_for_cold_boot(
+        &mut self,
+        artifact_root: &Path,
+        tools_version: &str,
+        resources: crate::types::SandboxResources,
+    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        let result = self
+            .capture_cold_boot(artifact_root, tools_version, resources)
+            .await;
+        match result {
+            Ok(state) => Ok(Arc::new(state)),
+            Err(error) => {
+                if self.cold_boot_freeze_token.is_some() {
+                    if let Err(recovery) = self.resume().await {
+                        return Err(SandboxCaptureError::terminal(error.context(format!(
+                            "cold-boot capture rollback failed: {recovery:#}"
+                        ))));
+                    }
+                }
+                Err(SandboxCaptureError::recoverable(error))
+            }
+        }
     }
 
     async fn resume(&mut self) -> Result<()> {
@@ -961,9 +986,13 @@ impl FirecrackerSandbox {
     /// Resume a paused sandbox in-place.
     ///
     /// Use this when you want to keep the same sandbox instance.
-    pub async fn resume(&self) -> Result<()> {
+    pub async fn resume(&mut self) -> Result<()> {
         debug!("resuming paused sandbox in-place");
         self.fc_instance.resume().await?;
+        if let Some(token) = self.cold_boot_freeze_token.clone() {
+            self.disk_branch_freeze("thaw", &token).await?;
+            self.cold_boot_freeze_token = None;
+        }
         Ok(())
     }
 
@@ -987,6 +1016,7 @@ impl FirecrackerSandbox {
         self.fc_instance
             .stop(self.runtime_policy.socket_timeout)
             .await?;
+        self.cold_boot_freeze_token = None;
 
         // Clear envd instance
         self.envd_instance = None;
@@ -1112,6 +1142,72 @@ impl FirecrackerSandbox {
         self.work_dir.path().join(USER_ROOTFS_DRIVE_PATH)
     }
 
+    /// Capture the existing disk without RAM, leaving the VM frozen for the
+    /// ordinary durable-publication and confirmed-stop path.
+    async fn capture_cold_boot(
+        &mut self,
+        output_dir: &Path,
+        tools_version: &str,
+        resources: crate::types::SandboxResources,
+    ) -> Result<super::cold_boot::FirecrackerColdBootState> {
+        // Validate launch dependencies and headroom before freezing the guest.
+        // Writable attached drives need their own guest filesystem quiescence.
+        anyhow::ensure!(
+            self.launch
+                .common()
+                .extra_drives
+                .iter()
+                .all(ExtraDrive::read_only),
+            "cold boot with writable attached drives is not supported"
+        );
+        let source = self
+            .launch
+            .common()
+            .rootfs_image_config
+            .clone()
+            .context("cold boot requires an overlaybd-backed disk")?;
+        let mut config = FirecrackerSandboxConfig::from_global_config_with_user_image(source)?;
+        config.common = self.launch.common().clone();
+        config.common.tools_drive_version = tools_version.to_owned();
+        config.common.network_policy = self.current_network_policy.clone();
+        config.common.custom_extension_params = self.current_custom_extension_params.clone();
+        config.vcpu_count = resources.cpu_count;
+        config.mem_size_mib = resources.memory_mib;
+        config.validate()?;
+        let _capture = crate::sandbox::checkpoint_capacity::CAPTURE_LOCK
+            .lock()
+            .await;
+        if let Some(mut capacity) = self.checkpoint_capacity()? {
+            capacity.path = output_dir.to_path_buf();
+            crate::sandbox::checkpoint_capacity::check(&[capacity])?;
+        }
+        tokio::fs::create_dir_all(output_dir).await?;
+        let token = Uuid::new_v4().to_string();
+        // Record ownership before the RPC: a lost reply may still have frozen
+        // the guest. Rollback must prove thaw, otherwise retain the live VM.
+        self.cold_boot_freeze_token = Some(token.clone());
+        self.disk_branch_freeze("freeze-stop", &token).await?;
+        self.fc_instance.pause().await?;
+        let disk = self.export_user_disk(output_dir).await?;
+        super::cold_boot::prepare_writable_disk(&disk, self.snapshot_rootfs_virtual_size()?)?;
+        let source = OverlaybdConfig {
+            image_config_path: disk,
+            read_only: false,
+            runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+        };
+        config.common.ublk_config = Some(
+            crate::sandbox::UblkConfig::overlaybd_with_runtime_upper_mode(
+                source.image_config_path.clone(),
+                source.read_only,
+                source.runtime_upper_mode,
+            ),
+        );
+        config.common.rootfs_image_config = Some(source);
+        config.common.rootfs_virtual_size = Some(self.snapshot_rootfs_virtual_size()?);
+        config.common.extra_drives = self.snapshot_extra_drives(output_dir).await?;
+        super::cold_boot::FirecrackerColdBootState::new(config)
+    }
+
     /// Pause Firecracker, copy the writable overlay, then resume. Does not
     /// snapshot RAM or clone processes.
     async fn branch_user_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
@@ -1227,7 +1323,9 @@ impl FirecrackerSandbox {
 /// snapshot artifact configs.
 /// (Memory snapshot layers are remote/repository-backed, never local-only, so
 /// they are not included.)
-fn rootfs_and_extra_drive_image_config_paths(common: &FirecrackerCommonConfig) -> Vec<PathBuf> {
+pub(super) fn rootfs_and_extra_drive_image_config_paths(
+    common: &FirecrackerCommonConfig,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(rootfs) = &common.rootfs_image_config {
         paths.push(rootfs.image_config_path.clone());
@@ -1379,6 +1477,7 @@ impl FirecrackerSandbox {
             extra_drive_runtimes: Vec::new(),
             live_snapshot_root: None,
             custom_extension_hook_guard: None,
+            cold_boot_freeze_token: None,
         })
     }
 

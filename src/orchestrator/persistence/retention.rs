@@ -3,7 +3,7 @@
 //! every uncertain/incomplete generation, and their transitive path references.
 use super::codecs::{decode_record, PAUSED_MANIFEST_FILE};
 use super::paused_transactions::PersistedPausedCommitState;
-use crate::sandbox::FirecrackerSnapshotConfig;
+use crate::sandbox::recovery_checkpoint_references;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::{
@@ -80,9 +80,10 @@ pub(super) fn plan(
                     && record.metadata.id.to_string() == sandbox.file_name().to_string_lossy(),
                 "checkpoint identity differs from its managed directory"
             );
-            let snapshot: FirecrackerSnapshotConfig = serde_json::from_value(record.state.clone())
-                .context("unknown checkpoint storage schema; retaining all generations")?;
-            references.insert(root.clone(), snapshot.checkpoint_references()?);
+            references.insert(
+                root.clone(),
+                recovery_checkpoint_references(record.state.clone())?,
+            );
             if record.checkpoint_at_unix_ms.is_none()
                 || record.commit_state != PersistedPausedCommitState::Committed
                 || record.metadata.resume_recovery_pending

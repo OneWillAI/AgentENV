@@ -218,6 +218,19 @@ pub trait SandboxBackend: Send + 'static {
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>>;
 
+    /// Capture a flushed disk for cold boot, leaving the old VM paused until
+    /// the caller durably publishes the record and confirms stop as for pause.
+    async fn pause_for_cold_boot(
+        &mut self,
+        _artifact_root: &Path,
+        _tools_version: &str,
+        _resources: crate::types::SandboxResources,
+    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+            "backend does not support retained-disk cold boot"
+        )))
+    }
+
     /// Resume a paused but not-yet-stopped sandbox from its snapshot.
     ///
     /// Idempotent: calling `resume` more than once must not return an error.
