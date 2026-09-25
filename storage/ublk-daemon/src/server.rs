@@ -553,7 +553,13 @@ async fn handle_connection(
         DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path,
-        } => handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path).await,
+        } => {
+            handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path, false).await
+        }
+        DaemonRequest::ExportSnapshot {
+            dev_id,
+            output_layer_path,
+        } => handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path, true).await,
         DaemonRequest::GetFeatures => handle_get_features(&pool_state),
         DaemonRequest::NotifySandboxReady { device_key } => {
             tracing::info!(
@@ -959,6 +965,7 @@ async fn handle_restack_snapshot(
     pool_state: &Option<Arc<PoolState>>,
     dev_id: u32,
     output_layer_path: &Path,
+    preserve_live_upper: bool,
 ) -> Result<DaemonResponse> {
     let (image, image_config) = if let Some(device_ref) = devices.get(&dev_id) {
         let image = Arc::clone(&device_ref.image);
@@ -992,9 +999,17 @@ async fn handle_restack_snapshot(
         if let (Some(pool), Some(image_config)) = (pool_state.as_ref(), image_config.as_deref()) {
             let image_lock = pool.image_lock(image_config);
             let _image_guard = image_lock.write().await;
-            image.create_snapshot_and_restack(output_layer_path).await
+            if preserve_live_upper {
+                image.create_snapshot_copy(output_layer_path).await
+            } else {
+                image.create_snapshot_and_restack(output_layer_path).await
+            }
         } else {
-            image.create_snapshot_and_restack(output_layer_path).await
+            if preserve_live_upper {
+                image.create_snapshot_copy(output_layer_path).await
+            } else {
+                image.create_snapshot_and_restack(output_layer_path).await
+            }
         };
     let descriptor = descriptor.with_context(|| {
         format!(

@@ -176,6 +176,18 @@ impl fmt::Debug for CapturedSandboxSnapshot {
 /// `Arc<Mutex<Box<dyn SandboxBackend>>>` handles managed by the Orchestrator.
 #[async_trait]
 pub trait SandboxBackend: Send + 'static {
+    /// Paths a live guest may still reopen. Unknown backends disable collection.
+    fn checkpoint_references(&self) -> Result<Vec<PathBuf>> {
+        anyhow::bail!("backend does not describe checkpoint references")
+    }
+
+    /// Capacity required for a durable pause, before changing guest state.
+    fn checkpoint_capacity(
+        &self,
+    ) -> Result<Option<super::checkpoint_capacity::CheckpointCapacity>> {
+        Ok(None)
+    }
+
     /// Start the sandbox and block until readiness.
     async fn start(&mut self) -> Result<()>;
 

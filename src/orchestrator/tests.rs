@@ -117,7 +117,8 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
-        shutdown_outcome: tokio::sync::OnceCell::new(),
+        shutdown_complete: tokio::sync::Mutex::new(false),
+        lifecycle_gate: RwLock::new(()),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         create_idempotency: Mutex::new(HashMap::new()),
@@ -2399,15 +2400,23 @@ async fn pause_stop_failure_is_reported_and_keeps_stop_proof_unset() -> Result<(
     assert_eq!(paused.state, SandboxState::Paused);
     assert!(!paused.paused_runtime_stopped);
 
-    // Resource metrics are derived from metadata state. The sandbox stays
-    // visibly Paused but lifecycle operations remain fail-closed until stop
-    // absence can be proven.
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    // Unconfirmed stop keeps the owning handle and its resource reservation.
+    // Scheduling another guest into those resources would overcommit the host.
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
     Ok(())
 }
 
 #[tokio::test]
-async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
+async fn pause_terminal_failure_retains_guest_for_intervention() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -2417,7 +2426,8 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
         },
     );
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
@@ -2435,12 +2445,23 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
         }
     ));
 
-    assert!(
-        orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
-        "terminal pause failure should remove sandbox metadata"
+    let retained = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("guest retained");
+    assert!(retained.resume_recovery_pending);
+    assert!(!retained.paused_runtime_stopped);
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "failed preservation must not stop the VM"
     );
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    assert!(orchestrator.shutdown().await.is_err());
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "shutdown retry must not bypass preservation"
+    );
     Ok(())
 }
 
@@ -3860,7 +3881,7 @@ async fn pause_failure_rolls_back_to_running_and_preserves_handle() -> Result<()
 }
 
 #[tokio::test]
-async fn pause_failure_with_failed_recovery_removes_sandbox() -> Result<()> {
+async fn pause_failure_with_failed_recovery_retains_sandbox() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -3902,10 +3923,13 @@ async fn pause_failure_with_failed_recovery_removes_sandbox() -> Result<()> {
     assert!(message.contains("forced pause failure"), "{message}");
     assert!(message.contains("forced resume failure"), "{message}");
 
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert_eq!(behavior.stop_calls(), 1);
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    let retained = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("guest retained");
+    assert!(retained.resume_recovery_pending);
+    assert!(!retained.paused_runtime_stopped);
+    assert_eq!(behavior.stop_calls(), 0);
     Ok(())
 }
 
@@ -4922,6 +4946,82 @@ async fn shutdown_returns_error_after_exhausting_pause_retries() -> Result<()> {
         .expect("running sandbox metadata should remain after failed shutdown pause");
     assert_eq!(metadata.state, SandboxState::Running);
 
+    // The error must not be permanently memoized: after space is restored,
+    // the same running guest can be preserved by an explicit retry.
+    orchestrator.shutdown().await?;
+    let saved = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("guest preserved");
+    assert!(saved.paused_runtime_stopped);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_partial_failure_keeps_failed_guest_live_and_successful_guest_recoverable(
+) -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    // Shutdown visits both guests on its first pass, then retries only the
+    // failed guest. Do not depend on which randomly assigned ID comes first.
+    for action in [
+        MockAction::Fail {
+            message: "first guest cannot checkpoint".into(),
+        },
+        MockAction::Succeed,
+        MockAction::Fail {
+            message: "retry still out of space".into(),
+        },
+        MockAction::Fail {
+            message: "final retry still out of space".into(),
+        },
+    ] {
+        behavior.push_action(MockOperation::Pause, action);
+    }
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    for _ in 0..2 {
+        orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+    }
+    assert!(orchestrator.shutdown().await.is_err());
+    let guests = orchestrator.list_sandboxes().await?;
+    assert_eq!(guests.len(), 2);
+    assert_eq!(
+        guests
+            .iter()
+            .filter(|guest| guest.state == SandboxState::Running)
+            .count(),
+        1
+    );
+    assert_eq!(
+        guests
+            .iter()
+            .filter(|guest| guest.state == SandboxState::Paused
+                && guest.paused_runtime_stopped
+                && !guest.resume_recovery_pending)
+            .count(),
+        1
+    );
+    assert_eq!(
+        behavior.stop_calls(),
+        1,
+        "only the successfully preserved guest may stop"
+    );
+    orchestrator.shutdown().await?;
+    assert!(orchestrator
+        .list_sandboxes()
+        .await?
+        .iter()
+        .all(|guest| guest.paused_runtime_stopped));
+    assert_eq!(
+        behavior.stop_calls(),
+        2,
+        "retry must not duplicate the successful stop"
+    );
     Ok(())
 }
 
@@ -5786,5 +5886,85 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
 
     orchestrator.delete_sandbox(child.id).await?;
     orchestrator.delete_sandbox(source.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn insufficient_checkpoint_capacity_stops_no_guests() -> anyhow::Result<()> {
+    setup();
+    for inodes in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let stats = nix::sys::statvfs::statvfs(temp.path())?;
+        let behavior = Arc::new(MockBehavior::new());
+        let orchestrator = make_orchestrator_with_factory(MockBackendFactory::with_behavior(
+            Arc::clone(&behavior),
+        ))
+        .await;
+        let first = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        let second = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        behavior.set_checkpoint_capacity(crate::sandbox::checkpoint_capacity::CheckpointCapacity {
+            path: temp.path().to_path_buf(),
+            bytes: if inodes {
+                0
+            } else {
+                stats.blocks_available() * stats.fragment_size() + 1
+            },
+            inodes: if inodes {
+                stats.files_available() + 1
+            } else {
+                0
+            },
+        });
+        let error = orchestrator
+            .shutdown()
+            .await
+            .expect_err("capacity must block shutdown");
+        assert!(error.to_string().contains("before stopping guests"));
+        assert_eq!(behavior.stop_calls(), 0);
+        for guest in [first.id, second.id] {
+            assert_eq!(
+                orchestrator.get_sandbox(&guest).await?.unwrap().state,
+                SandboxState::Running
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn normal_pause_collects_before_concurrent_resume_can_reopen_files() -> anyhow::Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let guest = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let (entered, release) = persister.block_next_collection();
+    let pausing = Arc::clone(&orchestrator);
+    let pause = tokio::spawn(async move { pausing.pause_sandbox(guest.id).await });
+    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+        .await??
+        .forget();
+    assert!(persister.loaded_sandboxes()[0].paused_runtime_stopped);
+    let resuming = Arc::clone(&orchestrator);
+    let mut resume = tokio::spawn(async move {
+        resuming
+            .resume_sandbox(guest.id, NewTimeout::Set(Duration::from_secs(60)))
+            .await
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut resume)
+        .await
+        .is_err());
+    release.add_permits(1);
+    pause.await??;
+    assert_eq!(resume.await??.state, SandboxState::Running);
     Ok(())
 }

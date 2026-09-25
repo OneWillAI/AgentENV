@@ -347,6 +347,8 @@ EnvironmentFile=${ENV_FILE}
 ExecStart=${INSTALL_DIR}/server
 RuntimeDirectory=aenv
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Environment=AENV_PRESERVATION_SOCKET=/run/aenv/preservation.sock
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 NoNewPrivileges=true
@@ -359,7 +361,8 @@ RestartSec=5
 # exiting. The default control-group mode would SIGKILL all Firecracker child
 # processes immediately, losing in-memory sandbox state.
 KillMode=process
-TimeoutStopSec=30
+TimeoutStopSec=infinity
+SendSIGKILL=no
 
 [Install]
 WantedBy=multi-user.target

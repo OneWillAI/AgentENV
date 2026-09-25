@@ -12,6 +12,7 @@ full = [
 ]
 
 [dependencies]
+tempfile = "3"
 storage-util = { path = "../util" }
 tokio = { version = "1.44.2", features = ["full"] }
 async-trait = "0.1.88"
@@ -45,7 +46,6 @@ object-store-operator = { path = "../../crates/object-store-operator", optional 
 
 [dev-dependencies]
 rand = "0.10"
-tempfile = "3"
 axum = "0.8.6"
 clap = { version = "4.5.38", features = ["derive"] }
 agentenv-test-support = { path = "../../crates/test-support" }

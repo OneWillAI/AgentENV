@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use futures::FutureExt;
-use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
@@ -51,29 +51,6 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 /// never completes (e.g. the task holding the state panics without rolling back).
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
-
-#[derive(Clone, Debug)]
-enum ShutdownOutcome {
-    Success,
-    Failed(String),
-}
-
-impl ShutdownOutcome {
-    fn from_result(result: Result<()>) -> Self {
-        match result {
-            Ok(()) => Self::Success,
-            Err(OrchestratorError::InternalError(message)) => Self::Failed(message),
-            Err(err) => Self::Failed(err.to_string()),
-        }
-    }
-
-    fn as_result(&self) -> Result<()> {
-        match self {
-            Self::Success => Ok(()),
-            Self::Failed(message) => Err(OrchestratorError::InternalError(message.clone())),
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CreateIdempotencyState {
@@ -161,7 +138,8 @@ pub struct Orchestrator<
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
-    shutdown_outcome: OnceCell<ShutdownOutcome>,
+    shutdown_complete: Mutex<bool>,
+    lifecycle_gate: RwLock<()>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     create_idempotency: Mutex<HashMap<String, Arc<CreateIdempotencyEntry>>>,
@@ -259,7 +237,8 @@ where
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
-            shutdown_outcome: OnceCell::new(),
+            shutdown_complete: Mutex::new(false),
+            lifecycle_gate: RwLock::new(()),
             image_refs,
             access_tokens,
             create_idempotency: Mutex::new(create_idempotency),
@@ -521,8 +500,23 @@ where
         T: Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
+        let this = Arc::clone(self);
         tokio::spawn(async move {
-            let result = future.await;
+            let guard = this.lifecycle_gate.read().await;
+            let result = match this.ensure_accepting_lifecycle_operations() {
+                Ok(()) => future.await,
+                Err(error) => {
+                    if operation == "create" {
+                        this.counters.record_create_fail(1);
+                    }
+                    Err(error)
+                }
+            };
+            drop(guard);
+            if operation == "pause" && result.is_ok() {
+                let _exclusive = this.lifecycle_gate.write().await;
+                this.collect_checkpoints().await;
+            }
             if tx.send(result).is_err() {
                 debug!(
                     sandbox_id = %sandbox_id,
@@ -1774,32 +1768,29 @@ where
         Ok(())
     }
 
-    /// Stops every known sandbox and tears down in-memory runtime state.
-    ///
-    /// This is single-flight: the first caller performs cleanup and subsequent
-    /// callers wait for the same outcome rather than starting duplicate work.
-    ///
-    /// Cleanup itself is still best-effort: the executor keeps attempting
-    /// remaining sandboxes even if individual deletions fail, then returns an
-    /// error if any sandbox could not be cleaned up after several passes.
+    /// Preserve guests before allowing process exit. Successful preparation is
+    /// latched; a failed attempt keeps the API and background tasks available
+    /// and can be retried after the operator resolves the failure.
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
-        let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);
-        let _ = self.shutdown_tx.send_replace(true);
-
-        if !was_already_shutting_down {
-            info!("orchestrator shutdown requested; stopping all sandboxes");
+        let mut complete = self.shutdown_complete.lock().await;
+        if *complete {
+            return Ok(());
         }
-
-        let this = Arc::clone(self);
-        let outcome = self
-            .shutdown_outcome
-            .get_or_init(|| async move {
-                ShutdownOutcome::from_result(this.run_shutdown_cleanup().await)
-            })
-            .await;
-
-        outcome.as_result()
+        self.is_shutting_down.store(true, Ordering::Release);
+        let _exclusive = self.lifecycle_gate.write().await;
+        match self.run_shutdown_cleanup().await {
+            Ok(()) => {
+                *complete = true;
+                let _ = self.shutdown_tx.send_replace(true);
+                Ok(())
+            }
+            Err(error) => {
+                self.is_shutting_down.store(false, Ordering::Release);
+                warn!(error = %error, "shutdown blocked; keeping server and storage alive");
+                Err(error)
+            }
+        }
     }
 
     /// Pauses a running sandbox by taking a snapshot and stopping its VM.
@@ -1872,8 +1863,13 @@ where
         }
         let resources = persisted_metadata.resources;
         self.store.update(persisted_metadata).await?;
-        self.stop_and_ack_paused_runtime(sandbox_id, &handle)
-            .await?;
+        if let Err(error) = self.stop_and_ack_paused_runtime(sandbox_id, &handle).await {
+            self.sandboxes
+                .write()
+                .await
+                .insert(sandbox_id, Arc::clone(&handle));
+            return Err(error);
+        }
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
 
@@ -1991,16 +1987,23 @@ where
 
         warn!(error = ?error, "failed to pause sandbox");
         if error.is_terminal() {
-            let stop_result = handle.lock().await.stop().await;
-            if let Err(stop_error) = stop_result {
-                warn!(error = ?stop_error, "failed to stop sandbox after terminal pause failure");
-            }
-            self.store.remove(&sandbox_id).await?;
+            // Retain ownership: dropping this handle kills Firecracker. An
+            // ambiguous capture requires intervention, never destructive cleanup.
+            self.retain_failed_pause(sandbox_id, handle).await?;
         } else {
             self.sandboxes
                 .write()
                 .await
                 .insert(sandbox_id, Arc::clone(handle));
+            if let Some(root) = artifact_root {
+                if let Err(cleanup_error) = self
+                    .persister
+                    .discard_empty_capture(&sandbox_id, root)
+                    .await
+                {
+                    warn!(error = %cleanup_error, "retaining failed capture directory after empty-directory cleanup failed");
+                }
+            }
             self.restore_proxy_route(sandbox_id, removed_proxy_route)
                 .await;
             let _ = self
@@ -2033,23 +2036,17 @@ where
             if let Err(store_error) = self.store.update(recovery_metadata).await {
                 warn!(error = ?store_error, "failed to mark uncertain paused sandbox recovery-pending");
             }
-            let stop_result = handle.lock().await.stop().await;
-            if let Err(stop_error) = stop_result {
-                warn!(error = ?stop_error, "failed to stop sandbox after uncertain paused-state commit");
-            }
+            self.sandboxes
+                .write()
+                .await
+                .insert(sandbox_id, Arc::clone(handle));
             return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
         }
 
         let resume_result = handle.lock().await.resume().await;
         if let Err(resume_error) = resume_result {
             warn!(error = ?resume_error, "failed to resume sandbox after pause failure");
-            let stop_result = handle.lock().await.stop().await;
-            if let Err(stop_error) = stop_result {
-                warn!(error = ?stop_error, "failed to stop sandbox after pause failure");
-            }
-            if let Err(store_error) = self.store.remove(&sandbox_id).await {
-                warn!(error = ?store_error, "failed to remove sandbox after pause failure");
-            }
+            self.retain_failed_pause(sandbox_id, handle).await?;
         } else {
             self.sandboxes
                 .write()
@@ -2067,6 +2064,26 @@ where
         Err(OrchestratorError::InternalError(format!(
             "failed to persist paused sandbox state: {error:#}"
         )))
+    }
+
+    async fn retain_failed_pause(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+    ) -> Result<()> {
+        self.sandboxes
+            .write()
+            .await
+            .insert(sandbox_id, Arc::clone(handle));
+        self.store
+            .update_if_state(&sandbox_id, &[SandboxState::Pausing], |metadata| {
+                metadata.state = SandboxState::Paused;
+                metadata.paused_runtime_stopped = false;
+                metadata.resume_recovery_pending = true;
+            })
+            .await?;
+        warn!(%sandbox_id, "preservation requires intervention; VM and storage retained, stop forbidden");
+        Ok(())
     }
 
     async fn stop_and_ack_paused_runtime(
@@ -2598,11 +2615,21 @@ where
     /// consistent with the orchestrator's current set of sandboxes.
     pub async fn metrics_snapshot(&self) -> Result<OrchestratorMetrics> {
         let mut metrics = OrchestratorMetrics::default();
+        let owned: std::collections::HashSet<_> =
+            self.sandboxes.read().await.keys().copied().collect();
         self.store
             .list_with_callback(|metadata| {
                 aggregate_resource_metrics(
                     &mut metrics,
-                    SandboxContribution::new(metadata.state, metadata.resources),
+                    SandboxContribution::new(
+                        if metadata.state == SandboxState::Paused && owned.contains(&metadata.id) {
+                            // An unproven/failed stop still owns VM resources.
+                            SandboxState::Pausing
+                        } else {
+                            metadata.state
+                        },
+                        metadata.resources,
+                    ),
                 );
             })
             .await?;
@@ -2766,8 +2793,8 @@ where
                 continue;
             }
             if let Err(err) = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => self.pause_sandbox_inner(metadata.id).await,
-                SandboxTimeoutAction::Delete => self.delete_sandbox_inner(metadata.id).await,
+                SandboxTimeoutAction::Pause => self.pause_sandbox(metadata.id).await,
+                SandboxTimeoutAction::Delete => self.delete_sandbox(metadata.id).await,
             } {
                 warn!(
                     sandbox_id = %metadata.id,
@@ -3398,9 +3425,43 @@ where
         (handle, removed_route)
     }
 
+    /// Caller holds lifecycle_gate exclusively: no capture, resume, fork or
+    /// deletion can change references while the collection plan is applied.
+    async fn collect_checkpoints(&self) {
+        let result = async {
+            let mut protected = Vec::new();
+            for handle in self.sandboxes.read().await.values() {
+                protected.extend(handle.lock().await.checkpoint_references()?);
+            }
+            self.persister.collect_checkpoints(&protected).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            warn!(%error, "checkpoint collection skipped; retaining recovery artifacts");
+        }
+    }
+
     async fn run_shutdown_cleanup(self: &Arc<Self>) -> Result<()> {
         const MAX_SHUTDOWN_PASSES: usize = 3;
         let mut last_failures = Vec::new();
+
+        // Account for all concurrent/serial output coexistence before stopping
+        // the first guest. Each backend rechecks just before its own capture.
+        let handles: Vec<_> = self.sandboxes.read().await.values().cloned().collect();
+        let mut requirements = Vec::new();
+        for handle in handles {
+            if let Some(requirement) = handle
+                .lock()
+                .await
+                .checkpoint_capacity()
+                .map_err(|error| OrchestratorError::InternalError(error.to_string()))?
+            {
+                requirements.push(requirement);
+            }
+        }
+        crate::sandbox::checkpoint_capacity::check(&requirements)
+            .map_err(|error| OrchestratorError::InternalError(error.to_string()))?;
 
         // Preserve recoverable sandboxes by pausing running VMs before process exit.
         for pass in 1..=MAX_SHUTDOWN_PASSES {
@@ -3474,6 +3535,33 @@ where
                 last_failures.join(", ")
             )));
         }
+
+        // Paused alone is not proof of preservation: publication or runtime
+        // stop acknowledgement may have failed after the state transition.
+        for metadata in self
+            .store
+            .list_filtered(SandboxListFilter {
+                states: None,
+                excluded_states: None,
+                user_metadata: None,
+            })
+            .await?
+        {
+            if metadata.state != SandboxState::Paused
+                || metadata.resume_recovery_pending
+                || !metadata.paused_runtime_stopped
+            {
+                return Err(OrchestratorError::InternalError(format!(
+                    "shutdown blocked: guest {} state={} stopped={} recovery_pending={}",
+                    metadata.id,
+                    metadata.state,
+                    metadata.paused_runtime_stopped,
+                    metadata.resume_recovery_pending,
+                )));
+            }
+        }
+
+        self.collect_checkpoints().await;
 
         // Clean up remaining network resources.
         if let Some(manager) = crate::sandbox::NetworkManager::global_if_initialized() {

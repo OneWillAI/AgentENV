@@ -60,6 +60,7 @@ pub(crate) struct RecordingPersister {
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
     uncertain_failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
     manual_recovery_failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
+    next_collection_barrier: Arc<Mutex<Option<RecordingPersistBarrier>>>,
     next_create_idempotency_persist_barrier: Arc<Mutex<Option<RecordingPersistBarrier>>>,
 }
 
@@ -70,6 +71,15 @@ struct RecordingPersistBarrier {
 }
 
 impl RecordingPersister {
+    pub(crate) fn block_next_collection(&self) -> (Arc<Semaphore>, Arc<Semaphore>) {
+        let barrier = RecordingPersistBarrier {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        };
+        *self.next_collection_barrier.lock().unwrap() = Some(barrier.clone());
+        (barrier.entered, barrier.release)
+    }
+
     pub(crate) fn with_loaded(loaded: Vec<SandboxMetadata>) -> Self {
         Self {
             loaded: Arc::new(Mutex::new(loaded)),
@@ -178,6 +188,15 @@ impl RecordingPersister {
 
 #[async_trait]
 impl SandboxPersister for RecordingPersister {
+    async fn collect_checkpoints(&self, _protected: &[PathBuf]) -> PersistenceResult<()> {
+        let barrier = self.next_collection_barrier.lock().unwrap().take();
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier.release.acquire().await.unwrap().forget();
+        }
+        Ok(())
+    }
+
     async fn load_all<F>(&self, _factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
     where
         F: crate::sandbox::SandboxBackendFactory,

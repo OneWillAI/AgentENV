@@ -28,6 +28,9 @@ pub(super) struct PersistedPausedRecord {
     pub(super) version: u32,
     pub(super) commit_state: PersistedPausedCommitState,
     pub(super) lifecycle: PersistedPausedLifecycle,
+    /// Immutable capture publication time. Older formats have unknown age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) checkpoint_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) resuming_boot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

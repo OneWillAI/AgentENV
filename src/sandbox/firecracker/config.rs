@@ -497,6 +497,22 @@ pub struct FirecrackerSnapshotConfig {
 }
 
 impl FirecrackerSnapshotConfig {
+    pub(crate) fn checkpoint_references(&self) -> Result<Vec<PathBuf>> {
+        use crate::sandbox::checkpoint_references::{absolute, image};
+        let mut paths = vec![absolute(&self.vm_state_path)?];
+        paths.extend(image(&self.mem_overlaybd_config.image_config_path)?);
+        let rootfs = self
+            .common
+            .rootfs_image_config
+            .as_ref()
+            .context("checkpoint rootfs config missing")?;
+        paths.extend(image(&rootfs.image_config_path)?);
+        for drive in &self.common.extra_drives {
+            paths.extend(image(drive.image_config_path())?);
+        }
+        Ok(paths)
+    }
+
     pub fn from_runnable_snapshot(snapshot: &RunnableSnapshot) -> Result<Self> {
         let mut base_common =
             FirecrackerCommonConfig::from_global_config().context("load sandbox common config")?;

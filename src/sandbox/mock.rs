@@ -73,11 +73,19 @@ pub struct MockBehavior {
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
+    checkpoint_capacity: Mutex<Option<super::checkpoint_capacity::CheckpointCapacity>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
 
 impl MockBehavior {
+    pub fn set_checkpoint_capacity(
+        &self,
+        capacity: super::checkpoint_capacity::CheckpointCapacity,
+    ) {
+        *self.checkpoint_capacity.lock().unwrap() = Some(capacity);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -263,6 +271,16 @@ impl MockSandboxBackend {
 
 #[async_trait]
 impl SandboxBackend for MockSandboxBackend {
+    fn checkpoint_references(&self) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint_capacity(
+        &self,
+    ) -> Result<Option<super::checkpoint_capacity::CheckpointCapacity>> {
+        Ok(self.behavior.checkpoint_capacity.lock().unwrap().clone())
+    }
+
     async fn start(&mut self) -> Result<()> {
         self.behavior.apply_async(MockOperation::Start).await
     }

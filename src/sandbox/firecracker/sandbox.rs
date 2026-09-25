@@ -231,6 +231,9 @@ impl FirecrackerPausedState {
 
 impl PausedSandboxState for FirecrackerPausedState {
     fn encode(&self) -> Result<serde_json::Value> {
+        self.snapshot_config
+            .validate_persisted()
+            .context("validate checkpoint artifacts before publication")?;
         serde_json::to_value(&self.snapshot_config).context("serialize Firecracker paused state")
     }
 
@@ -259,6 +262,87 @@ impl FirecrackerCapturedSnapshot {
 
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
+    fn checkpoint_references(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = match &self.launch {
+            LaunchMode::Resume(config) => config.checkpoint_references()?,
+            LaunchMode::Fresh(_) => Vec::new(),
+        };
+        if let Some(rootfs) = &self.rootfs_runtime {
+            paths.extend(crate::sandbox::checkpoint_references::image(
+                &rootfs.image_config_path,
+            )?);
+        }
+        for drive in &self.extra_drive_runtimes {
+            paths.extend(crate::sandbox::checkpoint_references::image(
+                &drive.image_config_path,
+            )?);
+        }
+        Ok(paths)
+    }
+
+    fn checkpoint_capacity(
+        &self,
+    ) -> Result<Option<crate::sandbox::checkpoint_capacity::CheckpointCapacity>> {
+        let memory = match &self.launch {
+            LaunchMode::Fresh(config) => u64::from(config.mem_size_mib) * (1 << 20),
+            LaunchMode::Resume(config) => config.mem_virtual_size,
+        };
+        // Only runtime-owned raw layers participate in compaction. Image/cache
+        // base layers remain shared. File lengths bound their mapped bytes;
+        // cap at virtual size because export discards overwritten extents.
+        let disk_estimate = |path: &Path, virtual_size: u64| -> Result<u64> {
+            let image = overlaybd::config::load_image_config(path)?;
+            let mut bytes = if image.upper.data.is_empty() {
+                0
+            } else {
+                std::fs::metadata(&image.upper.data)?.len()
+            };
+            let roots = [
+                managed_snapshot_base(),
+                ConfigManager::global_config()
+                    .orchestrator
+                    .persisted_sandbox_store_path
+                    .clone(),
+            ];
+            for layer in &image.lowers {
+                let path = Path::new(&layer.file);
+                if roots.iter().any(|root| path.starts_with(root)) {
+                    bytes = bytes
+                        .checked_add(std::fs::metadata(path)?.len())
+                        .context("checkpoint layer size overflow")?;
+                }
+            }
+            Ok(bytes.min(virtual_size))
+        };
+        let rootfs = self
+            .rootfs_runtime
+            .as_ref()
+            .context("checkpoint rootfs runtime unavailable")?;
+        let mut disk = disk_estimate(
+            &rootfs.image_config_path,
+            self.snapshot_rootfs_virtual_size()?,
+        )?;
+        for drive in &self.extra_drive_runtimes {
+            disk = disk
+                .checked_add(disk_estimate(
+                    &drive.image_config_path,
+                    drive.actual_virtual_size,
+                )?)
+                .context("checkpoint disk size overflow")?;
+        }
+        Ok(Some(
+            crate::sandbox::checkpoint_capacity::CheckpointCapacity::new(
+                ConfigManager::global_config()
+                    .orchestrator
+                    .persisted_sandbox_store_path
+                    .clone(),
+                disk,
+                memory,
+                1 + self.extra_drive_runtimes.len() as u64,
+            )?,
+        ))
+    }
+
     async fn start(&mut self) -> Result<()> {
         FirecrackerSandbox::start(self).await
     }
@@ -679,6 +763,13 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        let _capture = crate::sandbox::checkpoint_capacity::CAPTURE_LOCK
+            .lock()
+            .await;
+        if let Some(mut capacity) = self.checkpoint_capacity()? {
+            capacity.path = snapshot_dir.to_path_buf();
+            crate::sandbox::checkpoint_capacity::check(&[capacity])?;
+        }
         self.fc_instance.pause().await?;
 
         tokio::fs::create_dir_all(snapshot_dir)
@@ -689,7 +780,12 @@ impl FirecrackerSandbox {
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
-                Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
+                // Exports never change live layers. No recovery record has
+                // been published yet, so this private generation is disposable.
+                if let Err(cleanup) = tokio::fs::remove_dir_all(snapshot_dir).await {
+                    warn!(path = %snapshot_dir.display(), error = %cleanup,
+                        "incomplete snapshot cleanup failed; retained for inspection");
+                }
                 Err(err)
             }
         }
@@ -1123,23 +1219,6 @@ impl FirecrackerSandbox {
         root.prepare().await?;
         self.live_snapshot_root = Some(Arc::clone(&root));
         Ok(root)
-    }
-
-    /// Best-effort cleanup of a caller-managed snapshot directory after a failed pause.
-    ///
-    /// Removes the directory contents so the caller isn't left with a partially-written snapshot.
-    async fn cleanup_failed_snapshot_dir(path: &Path) {
-        match tokio::fs::remove_dir_all(path).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                warn!(
-                    snapshot_dir = %path.display(),
-                    error = %err,
-                    "failed to clean up incomplete snapshot directory"
-                );
-            }
-        }
     }
 }
 
