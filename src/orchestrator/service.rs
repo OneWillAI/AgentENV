@@ -2124,6 +2124,28 @@ where
         }
     }
 
+    async fn protect_pause_artifacts(&self, sandbox_id: SandboxId) -> Result<()> {
+        let runtime_artifacts = match self.sandboxes.read().await.get(&sandbox_id).cloned() {
+            Some(handle) => handle.lock().await.runtime_info().runtime_artifacts,
+            None => RuntimeArtifactSet::empty(),
+        };
+        let result = self
+            .protect_image_refs(
+                RuntimeImageOwner::PausedSandbox(sandbox_id),
+                runtime_artifacts,
+                "paused sandbox",
+            )
+            .await;
+        if let Err(error) = result {
+            warn!(error = %error, "failed to protect paused runtime artifacts; keeping sandbox Running");
+            let _ = self
+                .store
+                .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
 
     async fn allocate_pause_artifact_root(
         &self,
@@ -3550,6 +3572,25 @@ where
         (handle, removed_route)
     }
 
+    /// Caller holds lifecycle_gate exclusively: no capture, resume, fork or
+    /// deletion can change references while the collection plan is applied.
+    async fn collect_checkpoints(&self) {
+        let result = async {
+            let mut protected = Vec::new();
+            for handle in self.sandboxes.read().await.values() {
+                protected.extend(handle.lock().await.checkpoint_references()?);
+            }
+            if let Some(manager) = self.volume_manager.as_ref() {
+                protected.extend(manager.checkpoint_references().await?);
+            }
+            self.persister.collect_checkpoints(&protected).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            warn!(%error, "checkpoint collection skipped; retaining recovery artifacts");
+        }
+    }
 
     async fn run_shutdown_cleanup(self: &Arc<Self>) -> Result<()> {
         const MAX_SHUTDOWN_PASSES: usize = 3;

@@ -344,7 +344,86 @@ fn snapshot_config_for_fork(
 
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
+    fn checkpoint_references(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = match &self.launch {
+            LaunchMode::Resume(config) => config.checkpoint_references()?,
+            LaunchMode::Fresh(_) => Vec::new(),
+        };
+        if let Some(rootfs) = &self.rootfs_runtime {
+            paths.extend(crate::sandbox::checkpoint_references::image(
+                &rootfs.image_config_path,
+            )?);
+        }
+        for drive in &self.extra_drive_runtimes {
+            paths.extend(crate::sandbox::checkpoint_references::image(
+                &drive.image_config_path,
+            )?);
+        }
+        Ok(paths)
+    }
 
+    fn checkpoint_capacity(
+        &self,
+    ) -> Result<Option<crate::sandbox::checkpoint_capacity::CheckpointCapacity>> {
+        let memory = match &self.launch {
+            LaunchMode::Fresh(config) => u64::from(config.mem_size_mib) * (1 << 20),
+            LaunchMode::Resume(config) => config.mem_virtual_size,
+        };
+        // Only runtime-owned raw layers participate in compaction. Image/cache
+        // base layers remain shared. File lengths bound their mapped bytes;
+        // cap at virtual size because export discards overwritten extents.
+        let disk_estimate = |path: &Path, virtual_size: u64| -> Result<u64> {
+            let image = overlaybd::config::load_image_config(path)?;
+            let mut bytes = if image.upper.data.is_empty() {
+                0
+            } else {
+                std::fs::metadata(&image.upper.data)?.len()
+            };
+            let roots = [
+                managed_snapshot_base(),
+                ConfigManager::global_config()
+                    .orchestrator
+                    .persisted_sandbox_store_path
+                    .clone(),
+            ];
+            for layer in &image.lowers {
+                let path = Path::new(&layer.file);
+                if roots.iter().any(|root| path.starts_with(root)) {
+                    bytes = bytes
+                        .checked_add(std::fs::metadata(path)?.len())
+                        .context("checkpoint layer size overflow")?;
+                }
+            }
+            Ok(bytes.min(virtual_size))
+        };
+        let rootfs = self
+            .rootfs_runtime
+            .as_ref()
+            .context("checkpoint rootfs runtime unavailable")?;
+        let mut disk = disk_estimate(
+            &rootfs.image_config_path,
+            self.snapshot_rootfs_virtual_size()?,
+        )?;
+        for drive in &self.extra_drive_runtimes {
+            disk = disk
+                .checked_add(disk_estimate(
+                    &drive.image_config_path,
+                    drive.actual_virtual_size,
+                )?)
+                .context("checkpoint disk size overflow")?;
+        }
+        Ok(Some(
+            crate::sandbox::checkpoint_capacity::CheckpointCapacity::new(
+                ConfigManager::global_config()
+                    .orchestrator
+                    .persisted_sandbox_store_path
+                    .clone(),
+                disk,
+                memory,
+                1 + self.extra_drive_runtimes.len() as u64,
+            )?,
+        ))
+    }
 
     fn metrics_sample(
         &self,

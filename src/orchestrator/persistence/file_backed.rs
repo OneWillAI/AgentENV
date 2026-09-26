@@ -2235,6 +2235,47 @@ impl SandboxPersister for FileBackedSandboxPersister {
         self.put_record(&record).await
     }
 
+    async fn collect_checkpoints(&self, protected: &[PathBuf]) -> PersistenceResult<()> {
+        if !self.stored_quarantines().await?.is_empty() {
+            warn!("retention skipped: quarantine requires review");
+            return Ok(());
+        }
+        let entries = self.db().await?.entries().await.map_err(|source| {
+            SandboxPersistenceError::store("read checkpoint roots for retention", source)
+        })?;
+        let mut current = Vec::new();
+        for (_, bytes) in entries {
+            let index = decode_paused_index(&bytes)?;
+            let record = self.get_record(&index.sandbox_id).await?;
+            if record.commit_state != PersistedPausedCommitState::Committed
+                || record.metadata.resume_recovery_pending
+            {
+                return Err(SandboxPersistenceError::InvalidRecord {
+                    reason: "retention refused: checkpoint publication is uncertain".into(),
+                    source: None,
+                });
+            }
+            current.push(record.artifact_root);
+        }
+        let artifacts = self.artifacts_root();
+        if !artifacts.exists() {
+            return Ok(());
+        }
+        let protected = protected.to_vec();
+        tokio::task::spawn_blocking(move || {
+            super::retention::collect(&artifacts, &current, &protected)
+        })
+        .await
+        .map_err(|error| SandboxPersistenceError::InvalidRecord {
+            reason: "retention task failed".into(),
+            source: Some(error.into()),
+        })?
+        .map_err(|error| SandboxPersistenceError::InvalidRecord {
+            reason: "checkpoint retention failed safely".into(),
+            source: Some(error),
+        })?;
+        Ok(())
+    }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "marking paused sandbox as resuming");

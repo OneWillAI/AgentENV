@@ -6312,6 +6312,51 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn insufficient_checkpoint_capacity_stops_no_guests() -> anyhow::Result<()> {
+    setup();
+    for inodes in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let stats = nix::sys::statvfs::statvfs(temp.path())?;
+        let behavior = Arc::new(MockBehavior::new());
+        let orchestrator = make_orchestrator_with_factory(MockBackendFactory::with_behavior(
+            Arc::clone(&behavior),
+        ))
+        .await;
+        let first = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        let second = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        behavior.set_checkpoint_capacity(crate::sandbox::checkpoint_capacity::CheckpointCapacity {
+            path: temp.path().to_path_buf(),
+            bytes: if inodes {
+                0
+            } else {
+                stats.blocks_available() * stats.fragment_size() + 1
+            },
+            inodes: if inodes {
+                stats.files_available() + 1
+            } else {
+                0
+            },
+        });
+        let error = orchestrator
+            .shutdown()
+            .await
+            .expect_err("capacity must block shutdown");
+        assert!(error.to_string().contains("before stopping guests"));
+        assert_eq!(behavior.stop_calls(), 0);
+        for guest in [first.id, second.id] {
+            assert_eq!(
+                orchestrator.get_sandbox(&guest).await?.unwrap().state,
+                SandboxState::Running
+            );
+        }
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn normal_pause_collects_before_concurrent_resume_can_reopen_files() -> anyhow::Result<()> {
