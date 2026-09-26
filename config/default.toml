@@ -314,6 +314,10 @@ read_only = false
 # Writable upper format for new images: "logStructured",
 # "hybridLogStructured", or "sparse". Existing uppers retain their format.
 runtime_upper_mode = "hybridLogStructured"
+# Explicit migration policy for MEMORY restore of immutable pure-log checkpoints.
+# Changes only the format of the new rootfs upper; requires full preserve/stop.
+# Does not convert open uppers, cold reboot, or change the tools release.
+restore_log_upper_as_hybrid = false
 # Permit cold-start shrink. Explicit sizes are MiB and must be divisible by
 # 1024. Growth is always allowed; snapshot resume never resizes.
 allow_shrink = false
