@@ -43,6 +43,11 @@ pub enum DaemonRequest {
     Delete {
         dev_id: u32,
     },
+    /// Non-mutating snapshot export; safe to fail under storage pressure.
+    ExportSnapshot {
+        dev_id: u32,
+        output_layer_path: PathBuf,
+    },
     RestackSnapshot {
         dev_id: u32,
         output_layer_path: PathBuf,

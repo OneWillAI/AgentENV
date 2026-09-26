@@ -704,11 +704,13 @@ mod client_tests {
                     device_path: PathBuf::from("/dev/ublkb10"),
                 },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
-                DaemonRequest::RestackSnapshot { .. } => DaemonResponse::RestackSnapshotCreated {
-                    descriptor: None,
-                    data_stat: None,
-                    ext4_used_bytes: None,
-                },
+                DaemonRequest::RestackSnapshot { .. } | DaemonRequest::ExportSnapshot { .. } => {
+                    DaemonResponse::RestackSnapshotCreated {
+                        descriptor: None,
+                        data_stat: None,
+                        ext4_used_bytes: None,
+                    }
+                }
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
@@ -747,8 +749,12 @@ mod client_tests {
             .restack_snapshot(40, Path::new("/snap/output"))
             .await
             .unwrap();
+        client
+            .export_snapshot(50, Path::new("/snap/copy"))
+            .await
+            .unwrap();
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
 
         assert!(requests[0].contains("CreateOverlaybd"));
         assert!(requests[0].contains("img.json"));
@@ -761,6 +767,9 @@ mod client_tests {
         assert!(requests[2].contains("RestackSnapshot"));
         assert!(requests[2].contains("40"));
         assert!(requests[2].contains("output"));
+        assert!(requests[3].contains("ExportSnapshot"));
+        assert!(requests[3].contains("50"));
+        assert!(requests[3].contains("copy"));
     }
 }
 
