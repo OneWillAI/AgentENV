@@ -4499,7 +4499,7 @@ async fn pause_failure_rolls_back_to_running_and_preserves_handle() -> Result<()
 }
 
 #[tokio::test]
-async fn pause_failure_with_failed_recovery_removes_sandbox() -> Result<()> {
+async fn pause_failure_with_failed_recovery_retains_sandbox() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -4541,10 +4541,13 @@ async fn pause_failure_with_failed_recovery_removes_sandbox() -> Result<()> {
     assert!(message.contains("forced pause failure"), "{message}");
     assert!(message.contains("forced resume failure"), "{message}");
 
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert_eq!(behavior.stop_calls(), 1);
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    let retained = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("guest retained");
+    assert!(retained.resume_recovery_pending);
+    assert!(!retained.paused_runtime_stopped);
+    assert_eq!(behavior.stop_calls(), 0);
     Ok(())
 }
 
@@ -4962,6 +4965,52 @@ async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn uncertain_resume_rollback_marks_metadata_recovery_pending() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "uncertain-resume-rollback")],
+        ))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+    persister.fail_next_uncertain(RecordingCall::RollbackResuming);
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::Fail {
+            message: "forced resume wait failure".to_string(),
+        },
+    );
+
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect_err(
+            "resume launch failure should retain an uncertain rollback as recovery-pending",
+        );
+
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+    );
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("metadata should remain after uncertain resume rollback");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(metadata.resume_recovery_pending);
+    assert!(!metadata.paused_runtime_stopped);
+    Ok(())
+}
 
 
 #[tokio::test]

@@ -2268,6 +2268,14 @@ where
 
 
 
+    fn require_resume_recovery_resolved(metadata: &SandboxMetadata) -> Result<()> {
+        if metadata.resume_recovery_pending {
+            return Err(OrchestratorError::SandboxRecoveryRequired {
+                sandbox_id: metadata.id,
+            });
+        }
+        Ok(())
+    }
 
     /// Resumes a paused sandbox from its snapshot.
     ///
