@@ -190,6 +190,18 @@ impl fmt::Debug for CapturedSandboxSnapshot {
 /// `Arc<Mutex<Box<dyn SandboxBackend>>>` handles managed by the Orchestrator.
 #[async_trait]
 pub trait SandboxBackend: Send + 'static {
+    /// Paths a live guest may still reopen. Unknown backends disable collection.
+    fn checkpoint_references(&self) -> Result<Vec<PathBuf>> {
+        anyhow::bail!("backend does not describe checkpoint references")
+    }
+
+    /// Capacity required for a durable pause, before changing guest state.
+    fn checkpoint_capacity(
+        &self,
+    ) -> Result<Option<super::checkpoint_capacity::CheckpointCapacity>> {
+        Ok(None)
+    }
+
     /// Capture an owned sampling future under the runtime lock, then poll it
     /// after releasing the lock. Unsupported backends return None.
     fn metrics_sample(
@@ -227,6 +239,19 @@ pub trait SandboxBackend: Send + 'static {
         &mut self,
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>>;
+
+    /// Capture a flushed disk for cold boot, leaving the old VM paused until
+    /// the caller durably publishes the record and confirms stop as for pause.
+    async fn pause_for_cold_boot(
+        &mut self,
+        _artifact_root: &Path,
+        _tools_version: &str,
+        _resources: crate::types::SandboxResources,
+    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+            "backend does not support retained-disk cold boot"
+        )))
+    }
 
     /// Resume a paused but not-yet-stopped sandbox from its snapshot.
     ///
@@ -315,6 +340,11 @@ pub trait SandboxBackend: Send + 'static {
     /// patch-params hook is invoked by the caller (orchestrator layer), not
     /// by the backend. Cannot fail.
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>);
+
+    /// Copy the writable disk into `output_dir` and return an overlaybd image
+    /// config the next cold-create can boot. This must not copy RAM or
+    /// processes. The source sandbox stays running.
+    async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf>;
 }
 
 /// Factory interface for creating and restoring sandbox backend instances.
@@ -366,6 +396,21 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
 /// are `!Sync`), so the generated futures are not required to be `Send`.
 #[async_trait(?Send)]
 pub trait SandboxExecutor: Send {
+    /// Host-verified identities of the kernel and VMM used by this runtime.
+    fn runtime_digests(&self) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
+
+    /// Actual launched VMM and tools release, when supplied by the backend.
+    fn runtime_version_inputs(&self) -> Option<(std::path::PathBuf, String)> {
+        None
+    }
+
+    /// Backend logs to include when a template build fails.
+    fn diagnostic_log_paths(&self) -> Vec<(&'static str, std::path::PathBuf)> {
+        Vec::new()
+    }
+
     /// Obtain a process executor backed by this sandbox's envd connection.
     ///
     /// Returns an error if the sandbox is not running.

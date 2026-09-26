@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -6,7 +7,8 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
-use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
+use futures::FutureExt;
+use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
@@ -28,12 +30,18 @@ use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
-use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
+use super::persistence::{
+    CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister,
+    FileBackedSandboxPersister, SandboxPersistenceError, SandboxPersister,
+};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
+use super::state_machine::{
+    DeleteTransition, FailedLaunchStage, PausePreparation, ResumePreparation,
+};
 use super::store::*;
 use super::types::{
-    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    CreateSandboxIdempotency, CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource,
+    SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -61,13 +69,14 @@ enum DeleteProgress {
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-#[derive(Clone, Debug)]
-enum ShutdownOutcome {
-    Success,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreateIdempotencyState {
+    Creating,
+    Succeeded,
     Failed(String),
+    Deleting,
 }
 
-impl ShutdownOutcome {
     fn from_result(result: Result<()>) -> Self {
         match result {
             Ok(()) => Self::Success,
@@ -75,23 +84,22 @@ impl ShutdownOutcome {
             Err(err) => Self::Failed(err.to_string()),
         }
     }
-
     fn as_result(&self) -> Result<()> {
         match self {
             Self::Success => Ok(()),
             Self::Failed(message) => Err(OrchestratorError::InternalError(message.clone())),
         }
     }
+#[derive(Debug)]
+struct CreateIdempotencyEntry {
+    sandbox_id: SandboxId,
+    request_fingerprint: String,
+    state: watch::Sender<CreateIdempotencyState>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FailedLaunchStage {
-    Registered,
-    TransitionalPersisted,
-    RunningPersisted,
+impl CreateIdempotencyEntry {
 }
 
-impl FailedLaunchStage {
     fn rollback_expected_state(self, plan: &LaunchPlan) -> Option<SandboxState> {
         match self {
             Self::Registered => None,
@@ -99,10 +107,27 @@ impl FailedLaunchStage {
             Self::RunningPersisted => Some(SandboxState::Running),
         }
     }
+/// Ensures an unexpected panic/abort cannot leave in-process replays waiting on
+/// `Creating` forever. The durable journal remains `Creating` in that case and
+/// startup converts it to a fail-closed tombstone.
+struct CreateIdempotencyCompletionGuard {
+    entry: Arc<CreateIdempotencyEntry>,
+    armed: bool,
+}
 
     fn should_detach_proxy_route(self) -> bool {
         matches!(self, Self::RunningPersisted)
     }
+impl CreateIdempotencyCompletionGuard {
+
+}
+
+impl Drop for CreateIdempotencyCompletionGuard {
+}
+
+enum CreateIdempotencyClaim {
+    Owner(Arc<CreateIdempotencyEntry>),
+    Replay(Arc<CreateIdempotencyEntry>),
 }
 
 pub struct Orchestrator<
@@ -124,9 +149,11 @@ pub struct Orchestrator<
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
-    shutdown_outcome: OnceCell<ShutdownOutcome>,
+    shutdown_complete: Mutex<bool>,
+    lifecycle_gate: RwLock<()>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
+    create_idempotency: Mutex<HashMap<String, Arc<CreateIdempotencyEntry>>>,
     volume_manager: Option<Arc<VolumeManager>>,
 }
 
@@ -281,6 +308,13 @@ where
         Ok(orchestrator)
     }
 
+
+
+
+
+
+
+
     async fn run_cancellation_safe<T>(
         self: &Arc<Self>,
         operation: &'static str,
@@ -429,6 +463,7 @@ where
         .await
     }
 
+
     pub(crate) async fn create_template_builder(
         self: &Arc<Self>,
         build_id: SandboxId,
@@ -440,6 +475,11 @@ where
         })
         .await
     }
+
+
+
+
+
 
     #[tracing::instrument(
         name = "create_sandbox",
@@ -666,6 +706,8 @@ where
         .await
     }
 
+
+
     #[tracing::instrument(
         name = "fork_sandbox",
         skip(self, child_specs),
@@ -846,6 +888,7 @@ where
             .record_create_fail(u64::from(count) - successes);
         Ok(outcomes)
     }
+
 
     fn fork_child_error(sandbox_id: SandboxId, source: anyhow::Error) -> OrchestratorError {
         OrchestratorError::SandboxOperationFailed {
@@ -1176,6 +1219,7 @@ where
             .await
     }
 
+
     async fn claim_expired_running_sandbox(
         &self,
         sandbox_id: SandboxId,
@@ -1355,6 +1399,15 @@ where
         Ok(())
     }
 
+
+
+
+
+
+
+
+
+
     /// Stops every known sandbox and tears down in-memory runtime state.
     ///
     /// This is single-flight: the first caller performs cleanup and subsequent
@@ -1395,6 +1448,7 @@ where
         })
         .await
     }
+
 
     #[tracing::instrument(
         name = "pause_sandbox",
@@ -1621,6 +1675,17 @@ where
         Ok(())
     }
 
+
+
+
+
+
+
+
+
+
+
+
     /// Resumes a paused sandbox from its snapshot.
     ///
     /// If another `resume_sandbox` call is already in progress (`Resuming`
@@ -1762,6 +1827,9 @@ where
         resumed
     }
 
+
+
+
     /// Captures a snapshot of a running sandbox.
     pub async fn capture_snapshot(
         self: &Arc<Self>,
@@ -1808,6 +1876,7 @@ where
         self.store.remove(&sandbox_id).await?;
         Err(OrchestratorError::SandboxNotFound(sandbox_id))
     }
+
 
     async fn fail_snapshot_operation<T>(
         &self,
@@ -2392,6 +2461,7 @@ where
         });
     }
 
+
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
@@ -2565,6 +2635,12 @@ where
         Ok(final_metadata)
     }
 
+
+
+
+
+
+
     fn build_sandbox(&self, plan: &LaunchPlan) -> Result<Box<dyn SandboxBackend>> {
         let build_result = match plan {
             LaunchPlan::Create(plan) => match &plan.source {
@@ -2656,6 +2732,7 @@ where
             }
         }
     }
+
 
     async fn detach_launch_runtime_if_current(
         &self,
@@ -2780,6 +2857,7 @@ where
         drop(sandboxes);
         (handle, removed_route)
     }
+
 
     async fn run_shutdown_cleanup(self: &Arc<Self>) -> Result<()> {
         const MAX_SHUTDOWN_PASSES: usize = 3;

@@ -1,8 +1,17 @@
+mod artifact_cleanup;
+mod codecs;
+pub(crate) mod durable_storage;
 mod file_backed;
+mod managed_paths;
 #[cfg(test)]
 mod mock;
+mod operation_journal;
+mod paused_transactions;
+mod recovery;
+mod retention;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::orchestrator::store::SandboxMetadata;
@@ -12,8 +21,33 @@ use crate::types::SandboxId;
 pub use file_backed::FileBackedSandboxPersister;
 #[cfg(test)]
 pub(crate) use mock::{RecordingCall, RecordingPersister};
+pub use recovery::{PausedSandboxQuarantine, PausedSandboxRecoveryReport};
 
 pub type PersistenceResult<T> = std::result::Result<T, SandboxPersistenceError>;
+
+/// Durable state for one node-local sandbox-create idempotency claim.
+///
+/// Records are written before a runtime is started and are retained on every
+/// uncertain failure. `Deleting` is written only after the runtime has been
+/// positively stopped; startup may therefore finish deleting its paused
+/// record and release the key without risking a live orphan.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateIdempotencyRecordState {
+    Creating,
+    Succeeded,
+    Failed,
+    Deleting,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateIdempotencyRecord {
+    pub key: String,
+    pub request_fingerprint: String,
+    pub sandbox_id: SandboxId,
+    pub state: CreateIdempotencyRecordState,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxPersistenceError {
@@ -38,6 +72,26 @@ pub enum SandboxPersistenceError {
         #[source]
         source: anyhow::Error,
     },
+    /// A durable write may have reached storage even though the caller saw an
+    /// error.  Callers must leave the snapshot in place and route the sandbox
+    /// through recovery rather than attempting a resume or cleanup.
+    #[error("paused sandbox persistence commit is uncertain for {sandbox_id}: {reason}")]
+    UncertainCommit {
+        sandbox_id: SandboxId,
+        reason: String,
+        #[source]
+        source: Option<anyhow::Error>,
+    },
+    /// The paused tree is preserved in the host-local quarantine. Automatic
+    /// delete/startup cleanup must not erase it, and startup must not treat
+    /// this as a reason to refuse to boot the worker.
+    #[error("paused sandbox {sandbox_id} requires host-local recovery: {reason}")]
+    ManualRecoveryRequired {
+        sandbox_id: SandboxId,
+        reason: String,
+        #[source]
+        source: Option<anyhow::Error>,
+    },
 }
 
 impl SandboxPersistenceError {
@@ -55,6 +109,26 @@ impl SandboxPersistenceError {
 
     pub(super) fn store(operation: &'static str, source: anyhow::Error) -> Self {
         Self::Store { operation, source }
+    }
+
+    pub fn is_uncertain_commit(&self) -> bool {
+        matches!(self, Self::UncertainCommit { .. })
+    }
+
+    pub fn requires_explicit_purge(&self) -> bool {
+        matches!(self, Self::ManualRecoveryRequired { .. })
+    }
+
+    pub(super) fn manual_recovery(
+        sandbox_id: SandboxId,
+        reason: impl Into<String>,
+        source: Option<anyhow::Error>,
+    ) -> Self {
+        Self::ManualRecoveryRequired {
+            sandbox_id,
+            reason: reason.into(),
+            source,
+        }
     }
 }
 
@@ -75,6 +149,16 @@ pub trait SandboxPersister: Send + Sync {
         sandbox_id: &SandboxId,
     ) -> PersistenceResult<Option<PathBuf>>;
 
+    /// Remove only the empty directory allocated for this failed capture.
+    /// Any payload or uncertain publication must remain for recovery review.
+    async fn discard_empty_capture(
+        &self,
+        _sandbox_id: &SandboxId,
+        _artifact_root: &Path,
+    ) -> PersistenceResult<()> {
+        Ok(())
+    }
+
     /// Persist metadata and runtime state for a paused sandbox.
     async fn persist_paused(
         &self,
@@ -82,6 +166,22 @@ pub trait SandboxPersister: Send + Sync {
         artifact_root: Option<&Path>,
         paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()>;
+
+    /// Durably record that the live runtime was positively stopped after its
+    /// paused state was persisted. Existing persisters fail closed until they
+    /// implement this proof transition.
+    async fn mark_paused_runtime_stopped(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        Err(SandboxPersistenceError::InvalidRecord {
+            reason: "paused runtime stop proof is not supported by this persister".to_string(),
+            source: None,
+        })
+    }
+
+    /// Lifecycle changes are excluded by the caller. Live guest references
+    /// are additional roots; current persisted checkpoints are always roots.
+    async fn collect_checkpoints(&self, _protected: &[PathBuf]) -> PersistenceResult<()> {
+        Ok(())
+    }
 
     /// Mark a paused sandbox as resuming.
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
@@ -94,6 +194,37 @@ pub trait SandboxPersister: Send + Sync {
 
     /// Delete the persistence record and all associated artifacts.
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+
+    /// Load the durable create-idempotency journal.
+    ///
+    /// The default keeps existing third-party persister implementations source
+    /// compatible. Such implementations fail closed when an idempotent create
+    /// is attempted until they provide durable journal storage.
+    async fn load_create_idempotency_records(
+        &self,
+    ) -> PersistenceResult<Vec<CreateIdempotencyRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically persist one create-idempotency record before acknowledging
+    /// its state transition.
+    async fn persist_create_idempotency_record(
+        &self,
+        _record: &CreateIdempotencyRecord,
+    ) -> PersistenceResult<()> {
+        Err(SandboxPersistenceError::InvalidRecord {
+            reason: "create idempotency persistence is not supported by this persister".to_string(),
+            source: None,
+        })
+    }
+
+    /// Durably release an idempotency key after deletion is proven complete.
+    async fn delete_create_idempotency_record(&self, _key: &str) -> PersistenceResult<()> {
+        Err(SandboxPersistenceError::InvalidRecord {
+            reason: "create idempotency persistence is not supported by this persister".to_string(),
+            source: None,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -124,6 +255,10 @@ impl SandboxPersister for DisabledSandboxPersister {
         Ok(())
     }
 
+    async fn mark_paused_runtime_stopped(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        Ok(())
+    }
+
     async fn mark_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         Ok(())
     }
@@ -139,4 +274,31 @@ impl SandboxPersister for DisabledSandboxPersister {
     async fn delete_record_and_artifacts(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         Ok(())
     }
+
+    async fn persist_create_idempotency_record(
+        &self,
+        _record: &CreateIdempotencyRecord,
+    ) -> PersistenceResult<()> {
+        Ok(())
+    }
+
+    async fn delete_create_idempotency_record(&self, _key: &str) -> PersistenceResult<()> {
+        Ok(())
+    }
+}
+
+/// Exclusive process-lifetime ownership of a persisted-sandbox store. Recovery
+/// tools take the same lock so they cannot purge artifacts from a live runtime.
+pub fn lock_runtime_store(root: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(root)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".runtime-owner.lock"))?;
+    lock.try_lock().map_err(|error| {
+        anyhow::anyhow!("runtime store is in use; stop/inspect the owner before recovery: {error}")
+    })?;
+    Ok(lock)
 }

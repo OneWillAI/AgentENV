@@ -1,13 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -41,7 +42,7 @@ use crate::sandbox::extra_drive::{
     USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX,
 };
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
-use crate::sandbox::process::Executor;
+use crate::sandbox::process::{Executor, ProcessOpts};
 use crate::sandbox::ublk::{
     OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow,
     SharedReadOnlyDevice, UblkBackend, UblkCreateSpec, UblkDevice, UblkDeviceManager,
@@ -209,6 +210,7 @@ pub struct FirecrackerSandbox {
     /// best-effort notification. `None` when no start hook was delivered (or
     /// no extension is configured).
     custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
+    cold_boot_freeze_token: Option<String>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -342,6 +344,8 @@ fn snapshot_config_for_fork(
 
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
+
+
     fn metrics_sample(
         &self,
     ) -> Option<futures::future::BoxFuture<'static, Result<crate::sandbox::SandboxMetric>>> {
@@ -502,6 +506,7 @@ impl SandboxBackend for FirecrackerSandbox {
         Ok(start_results)
     }
 
+
     async fn resume(&mut self) -> Result<()> {
         FirecrackerSandbox::resume(self).await
     }
@@ -615,6 +620,7 @@ impl SandboxBackend for FirecrackerSandbox {
         }
     }
 
+
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
         self.current_custom_extension_params = params;
     }
@@ -624,6 +630,9 @@ impl SandboxBackend for FirecrackerSandbox {
 
 #[async_trait(?Send)]
 impl SandboxExecutor for FirecrackerSandbox {
+
+
+
     fn executor(&self) -> Result<Executor> {
         let envd = self
             .envd_instance
@@ -1453,6 +1462,9 @@ impl FirecrackerSandbox {
             .map(|slot| slot.host_interaction_ip)
     }
 
+
+
+
     /// Resolve the Firecracker stdout log path (created only when capture is enabled).
     pub fn firecracker_stdout_path(&self) -> PathBuf {
         self.launch
@@ -1517,6 +1529,10 @@ impl FirecrackerSandbox {
         self.work_dir.path().join(USER_ROOTFS_DRIVE_PATH)
     }
 
+
+
+
+
     fn new_managed_persistent_snapshot_root(&self) -> Arc<PersistentSnapshotRootGuard> {
         let sandbox_dir = self.id.to_string();
         let root = managed_snapshot_base().join(sandbox_dir);
@@ -1535,7 +1551,6 @@ impl FirecrackerSandbox {
         self.live_snapshot_root = Some(Arc::clone(&root));
         Ok(root)
     }
-
     /// Best-effort cleanup of a caller-managed snapshot directory after a failed pause.
     ///
     /// Removes the directory contents so the caller isn't left with a partially-written snapshot.

@@ -1,5 +1,7 @@
 mod access;
 mod backend;
+pub mod checkpoint_capacity;
+pub(crate) mod checkpoint_references;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
@@ -32,6 +34,7 @@ pub use extra_drive::{
     validate_sub_path, ExtraDrive,
 };
 pub(crate) use firecracker::record_startup_pack;
+pub(crate) use firecracker::recovery_checkpoint_references;
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,

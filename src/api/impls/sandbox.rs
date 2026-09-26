@@ -14,8 +14,9 @@ use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
-    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxIdempotency, CreateSandboxRequest, NewTimeout, OrchestratorError,
+    SandboxForkChildSpec, SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState,
+    SandboxTimeoutAction,
 };
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -447,6 +448,21 @@ impl From<SandboxMetadata> for models::SandboxDetail {
     }
 }
 
+enum CreatePreflight {
+    Start(Option<CreateSandboxIdempotency>),
+    Replay(Box<SandboxMetadata>),
+}
+
+enum CreateRequestError {
+    BadRequest(models::Error),
+    ServerError(models::Error),
+}
+
+impl CreateRequestError {
+
+
+}
+
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
         let traffic_access_token = (!metadata.network_policy.allow_public_traffic)
@@ -481,6 +497,7 @@ impl ApiImpl {
             .map(|domain| Nullable::Present(domain.clone()));
         sandbox
     }
+
 }
 
 fn parse_metadata_filter(raw: &Option<String>) -> Option<HashMap<String, String>> {
@@ -499,6 +516,9 @@ fn parse_metadata_filter(raw: &Option<String>) -> Option<HashMap<String, String>
 fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
+
+
+
 
 fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
     let config = ConfigManager::global_config();
@@ -658,6 +678,15 @@ fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()
     }
     Ok(())
 }
+
+impl ApiImpl {
+
+}
+
+
+
+
+
 
 #[async_trait]
 impl Sandboxes<()> for ApiImpl {
@@ -2401,4 +2430,7 @@ mod metrics_contract_tests {
         assert!(!valid_metrics_interval(Some(u64::MAX), None));
         assert!(!valid_metrics_interval(Some(2), Some(1)));
     }
+}
+
+impl ApiImpl {
 }

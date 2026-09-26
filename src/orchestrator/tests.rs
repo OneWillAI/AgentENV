@@ -2,20 +2,21 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
-    DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
+    CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister, RecordingCall,
+    RecordingPersister, SandboxPersister,
 };
 use super::super::types::SandboxLaunchSource;
 use super::sandbox_metrics::metrics_concurrency;
@@ -169,6 +170,7 @@ impl StoreListGate {
 #[derive(Default)]
 struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
+    remove_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
     claim_gate: StdMutex<Option<StoreClaimGate>>,
@@ -776,6 +778,19 @@ fn managed_seed_continuity_only_applies_to_token_protected_sandboxes() {
     assert!(persisted_sandboxes_require_managed_seed(&[private]));
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 #[tokio::test]
 async fn new_returns_error_when_loading_persisted_sandboxes_fails() {
     setup();
@@ -1182,6 +1197,13 @@ fn create_request(
         secure: false,
     }
 }
+
+
+
+
+
+
+
 
 fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size: u64) {
     std::fs::create_dir_all(path.parent().expect("image config parent"))
@@ -1691,6 +1713,7 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
+
 
 #[tokio::test]
 async fn pause_removes_handle_less_running_sandbox_and_releases_metrics() -> Result<()> {
@@ -4213,6 +4236,7 @@ async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> 
     Ok(())
 }
 
+
 #[tokio::test]
 async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
     setup();
@@ -4294,6 +4318,8 @@ async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
+
+
 
 #[tokio::test]
 async fn delete_when_stop_fails_returns_error_and_allows_retry() -> Result<()> {
@@ -4643,6 +4669,7 @@ async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
     Ok(())
 }
 
+
 #[tokio::test]
 async fn shutdown_retries_pause_failures_and_preserves_sandbox_on_success() -> Result<()> {
     setup();
@@ -4756,6 +4783,7 @@ async fn shutdown_reuses_recorded_success_instead_of_running_cleanup_again() -> 
 
     Ok(())
 }
+
 
 #[tokio::test]
 async fn launch_sandbox_rejects_when_orchestrator_is_already_shutting_down() -> Result<()> {
@@ -5587,6 +5615,9 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
     orchestrator.delete_sandbox(source.id).await?;
     Ok(())
 }
+
+
+
 fn sandbox_metric_sample(timestamp: i64) -> SandboxMetric {
     SandboxMetric {
         timestamp: chrono::DateTime::from_timestamp(timestamp, 0).unwrap(),
@@ -5806,3 +5837,8 @@ async fn sandbox_metrics_failure_is_not_zero_and_paused_guests_are_not_polled() 
     assert_eq!(metadata.state, SandboxState::Paused);
     assert_eq!(metadata.expires_at, expiration);
 }
+
+
+
+
+

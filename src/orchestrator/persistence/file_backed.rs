@@ -1,42 +1,44 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::fs as stdfs;
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use base64::Engine as _;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::codecs::{
+    decode_paused_index, decode_record, sha256_hex, ManifestEntry, PersistedPausedIndex,
+    PersistedPausedRecord, PAUSED_INDEX_VERSION, PAUSED_MANIFEST_FILE, PAUSED_MANIFEST_VERSION,
+    PAUSED_RECOVERY_MARKER_FILE, QUARANTINE_VERSION,
+};
+use super::paused_transactions::{
+    PersistedPausedCommitState, PersistedPausedLifecycle, StopProofReconciliation,
+};
+use super::recovery::{
+    ManifestReconciliation, PausedRecoveryBlocks, PausedSandboxQuarantine,
+    PausedSandboxRecoveryReport, PersistedRecordLoad, PurgeableArtifactTarget,
+    QuarantinePurgeAction, StoredPausedSandboxQuarantine,
+};
+use super::{
+    CreateIdempotencyRecord, PersistenceResult, SandboxPersistenceError, SandboxPersister,
+};
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
-use crate::orchestrator::{store::SandboxMetadata, SandboxState};
+use crate::orchestrator::store::SandboxMetadata;
+#[cfg(test)]
+use crate::orchestrator::SandboxState;
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
-const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
+const QUARANTINE_DB_DIR: &str = "quarantine.db";
+const CREATE_IDEMPOTENCY_DB_DIR: &str = "create-idempotency.db";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PersistedPausedLifecycle {
-    Paused,
-    Resuming,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistedPausedRecord {
-    version: u32,
-    lifecycle: PersistedPausedLifecycle,
-    metadata: SandboxMetadata,
-    artifact_root: PathBuf,
-    state: Value,
-}
-
-impl PersistedPausedRecord {
     fn into_metadata<F>(mut self, factory: &F) -> PersistenceResult<SandboxMetadata>
     where
         F: SandboxBackendFactory,
@@ -54,14 +56,11 @@ impl PersistedPausedRecord {
 
         Ok(self.metadata)
     }
-
     fn into_metadata_without_runtime_state(mut self) -> SandboxMetadata {
         self.metadata.state = SandboxState::Paused;
         self.metadata.paused_state = None;
         self.metadata
     }
-}
-
 fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
     let record: PersistedPausedRecord =
         serde_json::from_slice(bytes).map_err(|source| SandboxPersistenceError::InvalidRecord {
@@ -71,7 +70,6 @@ fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
     ensure_supported_version(record.version)?;
     Ok(record)
 }
-
 fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
     if version == RECORD_VERSION {
         Ok(())
@@ -88,6 +86,8 @@ pub struct FileBackedSandboxPersister {
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
     db: OnceCell<LocalKvStore>,
+    quarantine_db: OnceCell<LocalKvStore>,
+    create_idempotency_db: OnceCell<LocalKvStore>,
 }
 
 impl FileBackedSandboxPersister {
@@ -97,6 +97,8 @@ impl FileBackedSandboxPersister {
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
             db: OnceCell::new(),
+            quarantine_db: OnceCell::new(),
+            create_idempotency_db: OnceCell::new(),
         }
     }
 
@@ -113,6 +115,8 @@ impl FileBackedSandboxPersister {
     fn records_db_path(&self) -> PathBuf {
         self.root.join(RECORD_DB_DIR)
     }
+
+
 
     fn artifacts_root(&self) -> PathBuf {
         self.root.join("artifacts")
@@ -133,6 +137,70 @@ impl FileBackedSandboxPersister {
             .cloned()
     }
 
+
+
+    fn manifest_path(artifact_root: &Path) -> PathBuf {
+        artifact_root.join(PAUSED_MANIFEST_FILE)
+    }
+
+    fn recovery_marker_path(artifact_root: &Path) -> PathBuf {
+        artifact_root.join(PAUSED_RECOVERY_MARKER_FILE)
+    }
+
+    fn validated_managed_artifact_path(&self, path: &Path) -> Option<PathBuf> {
+        super::managed_paths::validated_artifact_path(
+            &self.root,
+            &self.records_db_path(),
+            &self.quarantine_db_path(),
+            &self.create_idempotency_db_path(),
+            path,
+        )
+    }
+
+    fn path_is_managed_artifact(&self, path: &Path) -> bool {
+        self.validated_managed_artifact_path(path).is_some()
+    }
+
+    fn validated_managed_generation_path(
+        &self,
+        sandbox_id: &SandboxId,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        super::managed_paths::validated_generation_path(&self.root, sandbox_id, path)
+    }
+
+    fn path_is_managed_generation(&self, sandbox_id: &SandboxId, path: &Path) -> bool {
+        self.validated_managed_generation_path(sandbox_id, path)
+            .is_some()
+    }
+
+    /// The leftover `<store>/artifacts/<sandbox-id>` directory after the index
+    /// is gone. Purge may remove that exact tree; it still refuses `..` and
+    /// anything that is not this sandbox's managed root.
+    fn validated_managed_sandbox_root_path(
+        &self,
+        sandbox_id: &SandboxId,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        super::managed_paths::validated_sandbox_root_path(&self.root, sandbox_id, path)
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     async fn get_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<PersistedPausedRecord> {
         let bytes = self
             .db()
@@ -146,6 +214,12 @@ impl FileBackedSandboxPersister {
             })?;
         decode_record(&bytes)
     }
+
+
+
+
+
+
 
     async fn put_record(&self, record: &PersistedPausedRecord) -> PersistenceResult<()> {
         let bytes = serde_json::to_vec(record).map_err(|source| {
@@ -173,6 +247,7 @@ impl FileBackedSandboxPersister {
                 SandboxPersistenceError::store("remove paused sandbox record", source)
             })
     }
+
 
     async fn remove_artifact_root(path: &Path) -> PersistenceResult<()> {
         match fs::remove_dir_all(path).await {
@@ -244,6 +319,29 @@ impl FileBackedSandboxPersister {
 
         Ok(())
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
 
 #[async_trait]
@@ -333,6 +431,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Ok(Some(artifact_root))
     }
 
+
     async fn persist_paused(
         &self,
         metadata: &SandboxMetadata,
@@ -371,6 +470,8 @@ impl SandboxPersister for FileBackedSandboxPersister {
         result
     }
 
+
+
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "marking paused sandbox as resuming");
         let mut record = self.get_record(sandbox_id).await?;
@@ -396,11 +497,15 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
         Ok(())
     }
+
+
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::persistence::CreateIdempotencyRecordState;
     use crate::sandbox::{
         mock::{MockBackendFactory, MockSnapshot},
         FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
@@ -473,6 +578,7 @@ mod tests {
             .with_durability(LocalStoreDurability::Memory)
     }
 
+
     async fn persist_test_record(
         persister: &FileBackedSandboxPersister,
         snapshot_root: &Path,
@@ -530,6 +636,12 @@ mod tests {
             .is_some());
         Ok(())
     }
+
+
+
+
+
+
 
     #[tokio::test]
     async fn paused_record_from_other_mode_is_visible_but_not_resumable() -> anyhow::Result<()> {
@@ -654,6 +766,7 @@ mod tests {
         Ok(())
     }
 
+
     #[tokio::test]
     async fn persist_paused_accepts_backend_agnostic_state() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -691,6 +804,7 @@ mod tests {
         assert!(!snapshot_root.exists());
         Ok(())
     }
+
 
     #[tokio::test]
     async fn mark_resuming_and_rollback_preserve_loadability() -> anyhow::Result<()> {
@@ -744,6 +858,11 @@ mod tests {
         assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
         Ok(())
     }
+
+
+
+
+
 
     #[tokio::test]
     async fn load_all_keeps_artifacts_for_valid_paused_record() -> anyhow::Result<()> {
@@ -825,7 +944,6 @@ mod tests {
         assert!(!has_record(&persister, &sandbox_id).await?);
         Ok(())
     }
-
     #[tokio::test]
     async fn load_all_discards_invalid_record() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -843,7 +961,6 @@ mod tests {
         assert!(!has_record(&persister, &sandbox_id).await?);
         Ok(())
     }
-
     #[tokio::test]
     async fn load_all_discards_unusable_record_and_artifacts() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
