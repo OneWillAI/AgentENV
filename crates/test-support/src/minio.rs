@@ -28,7 +28,12 @@ impl MinioFixture {
     pub async fn start() -> Result<Self> {
         // Current MinIO images print the startup banner (including the "API:"
         // line) to stderr, so readiness must watch stderr, not stdout.
-        let container = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
+        // Permit an operator-built mirror when the public registry is
+        // unavailable. Keep the release tag fixed; callers must build from
+        // that exact upstream release and record the resulting image identity.
+        let image =
+            std::env::var("AENV_TEST_MINIO_IMAGE").unwrap_or_else(|_| MINIO_IMAGE.to_owned());
+        let container = GenericImage::new(image.as_str(), MINIO_TAG)
             .with_wait_for(WaitFor::message_on_stderr("API:"))
             .with_env_var("MINIO_ROOT_USER", MINIO_USER)
             .with_env_var("MINIO_ROOT_PASSWORD", MINIO_PASS)

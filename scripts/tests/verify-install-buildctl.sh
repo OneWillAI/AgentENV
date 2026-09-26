@@ -7,6 +7,9 @@ trap 'rm -rf "$work"' EXIT
 export INSTALL_TEST_ROOT="$work"
 INSTALL_TEST_MV="$(command -v mv)"
 export INSTALL_TEST_MV
+INSTALL_TEST_UID="$(id -u)"
+INSTALL_TEST_GID="$(id -g)"
+export INSTALL_TEST_UID INSTALL_TEST_GID
 version="$(<"$repo_root/config/buildkit-version")"
 export INSTALL_TEST_BUILDKIT_VERSION="$version"
 mkdir -p "$work/bin" "$work/assets" "$work/upstream/bin"
@@ -40,7 +43,20 @@ case "${0##*/}" in
   sudo)
     [[ "${1:-}" == -v ]] && exit 0
     args=()
-    for arg in "$@"; do args+=("${arg//\/usr\/local\/bin/$INSTALL_TEST_ROOT/full-install}"); done
+    for arg in "$@"; do
+      arg="${arg//\/usr\/local\/bin/$INSTALL_TEST_ROOT/full-install}"
+      args+=("${arg//\/usr\/local\/sbin/$INSTALL_TEST_ROOT/full-sbin}")
+    done
+    # This fixture tests CLI packaging without root or host writes. Actual
+    # recovery ownership/mode is checked by verify-paused-recovery-boundary.sh.
+    if [[ "${args[0]}" == install ]]; then
+      for ((i=1; i<${#args[@]}-1; i++)); do
+        case "${args[i]}" in
+          -o) args[i+1]="$INSTALL_TEST_UID";;
+          -g) args[i+1]="$INSTALL_TEST_GID";;
+        esac
+      done
+    fi
     exec "${args[@]}";;
   curl)
     url="" dest=""
