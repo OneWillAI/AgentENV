@@ -16,6 +16,7 @@ mod process_vm_reader;
 mod sandbox;
 mod socket;
 mod startup_pack;
+mod upper_mode_policy;
 
 pub(crate) use cold_boot::recovery_checkpoint_references;
 pub use config::{

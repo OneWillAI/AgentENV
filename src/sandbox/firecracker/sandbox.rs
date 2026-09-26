@@ -2022,7 +2022,16 @@ impl Drop for FirecrackerSandbox {
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 impl FirecrackerSandbox {
-    fn build(id: SandboxId, launch: LaunchMode) -> Result<Self> {
+    fn build(id: SandboxId, mut launch: LaunchMode) -> Result<Self> {
+        if let LaunchMode::Resume(snapshot) = &mut launch {
+            let enabled = ConfigManager::global_config()
+                .ublk
+                .overlaybd
+                .restore_log_upper_as_hybrid;
+            if super::upper_mode_policy::migrate_restored_log_upper(snapshot, enabled)? {
+                info!(sandbox_id = %id, "memory restore will create a fresh hybrid rootfs upper");
+            }
+        }
         let work_dir =
             create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());

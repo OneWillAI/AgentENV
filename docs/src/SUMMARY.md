@@ -87,6 +87,7 @@
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [BuildKit Template Builds](./internals/buildkit-template-builds.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)
+- [Memory-preserving Upper-mode Migration](./internals/upper-mode-migration.md)
 - [Proxy Design](./internals/proxy-design.md)
 - [Distributed Control Plane](./internals/services.md)
 - [P2P Artifact Transport](./internals/p2p-design.md)
