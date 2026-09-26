@@ -2481,6 +2481,42 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn reboot_retries_retained_runtime_stop_without_stopping_other_sandboxes(
+) -> anyhow::Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "temporary stop failure".into(),
+        },
+    );
+    let artifacts = TempDir::new()?;
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        RecordingPersister::with_artifact_root(artifacts.path().to_path_buf()),
+    );
+    let computer = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let other = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator
+        .pause_sandbox(computer.id)
+        .await
+        .expect_err("stop must fail once");
+    let resumed = orchestrator.reboot_sandbox(computer.id).await?;
+    assert_eq!(resumed.id, computer.id);
+    assert_eq!(resumed.state, SandboxState::Running);
+    assert_eq!(
+        orchestrator.get_sandbox(&other.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn pause_stop_failure_is_reported_and_keeps_stop_proof_unset() -> Result<()> {
