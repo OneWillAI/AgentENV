@@ -91,4 +91,4 @@
 - [Proxy Design](./internals/proxy-design.md)
 - [Distributed Control Plane](./internals/services.md)
 - [P2P Artifact Transport](./internals/p2p-design.md)
-  - [Maintained fork patch series](internals/fork-patch-series.md)
+- [Maintained fork patch series](./internals/fork-patch-series.md)
