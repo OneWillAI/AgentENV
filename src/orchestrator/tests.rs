@@ -2939,7 +2939,7 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
 }
 
 #[tokio::test]
-async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics() -> Result<()> {
+async fn capture_snapshot_terminal_stop_failure_retains_runtime_until_delete_retry() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -2973,10 +2973,27 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
         }
     ));
 
-    assert!(
-        orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
-        "terminal snapshot failure should remove sandbox metadata"
+    assert_eq!(
+        orchestrator.get_sandbox(&sandbox_id).await?.unwrap().state,
+        SandboxState::Killing
     );
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&sandbox_id));
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
@@ -7246,5 +7263,51 @@ async fn create_transfers_volume_ownership_before_start_and_releases_only_stoppe
             assert_eq!(owner, *observed.lock().unwrap());
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_terminal_stop_failure_retains_source_until_delete_retry() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    behavior.push_action(
+        MockOperation::Fork,
+        MockAction::FailTerminal {
+            message: "injected terminal fork failure".to_owned(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "injected uncertain stop".to_owned(),
+        },
+    );
+    orchestrator
+        .fork_sandbox(source.id, 1, NewTimeout::Set(Duration::from_secs(15)))
+        .await
+        .expect_err("fork must fail");
+    assert_eq!(
+        orchestrator.get_sandbox(&source.id).await?.unwrap().state,
+        SandboxState::Killing
+    );
+    assert!(orchestrator.sandboxes.read().await.contains_key(&source.id));
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        1,
+        1,
+        0,
+        source.resources.cpu_count,
+        source.resources.memory_mib,
+    )
+    .await;
+    orchestrator.delete_sandbox(source.id).await?;
+    assert!(orchestrator.get_sandbox(&source.id).await?.is_none());
+    assert_metrics_values(&orchestrator, 1, 1, 0, 0, 0, 0).await;
     Ok(())
 }

@@ -1223,7 +1223,7 @@ where
         .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
         let mut sandbox = handle.lock().await;
         let branch = crate::disk_branch::Publication::acquire(
-            crate::disk_branch::root(&ConfigManager::global_config()),
+            crate::disk_branch::root(ConfigManager::global_config()),
             crate::disk_branch::identity(source_sandbox_id, idempotency_key.as_deref()),
         )
         .await?;
@@ -1339,14 +1339,12 @@ where
                 warn!(error = ?err, "failed to fork sandbox");
                 self.counters.record_create_fail(u64::from(count));
                 if err.is_terminal() {
-                    self.detach_sandbox_handle_and_route(&source_sandbox_id)
-                        .await;
-                    let _ = {
-                        let mut sandbox = source_handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    self.finalize_terminal_volumes(&source_metadata).await;
-                    self.store.remove(&source_sandbox_id).await?;
+                    self.cleanup_terminal_runtime(
+                        source_sandbox_id,
+                        &source_handle,
+                        SandboxState::Forking,
+                    )
+                    .await?;
                 } else {
                     let _ = self
                         .store
@@ -2901,6 +2899,34 @@ where
         Err(OrchestratorError::SandboxNotFound(sandbox_id))
     }
 
+    /// Terminal capture errors permit cleanup only after a positive stop result.
+    /// On refusal retain the owning handle, volumes, metadata and image refs so
+    /// the normal delete path can retry stop without exposing mounted disks.
+    async fn cleanup_terminal_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        expected_state: SandboxState,
+    ) -> Result<()> {
+        if let Err(error) = handle.lock().await.stop().await {
+            warn!(%error, %sandbox_id, "terminal capture cleanup awaits a successful runtime stop");
+            self.store
+                .update_state_if_state(&sandbox_id, SandboxState::Killing, &[expected_state])
+                .await?;
+            let progress = self.deletion_progress(sandbox_id).await;
+            *progress.lock().await = DeleteProgress::Stop {
+                capture_failed: true,
+            };
+            return Ok(());
+        }
+        self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        if let Some(metadata) = self.store.get(&sandbox_id).await? {
+            self.finalize_terminal_volumes(&metadata).await;
+        }
+        self.store.remove(&sandbox_id).await?;
+        Ok(())
+    }
+
     async fn fail_snapshot_operation<T>(
         &self,
         sandbox_id: SandboxId,
@@ -2910,18 +2936,8 @@ where
     ) -> Result<T> {
         warn!(?error, ?operation, "sandbox snapshot operation failed");
         if error.is_terminal() {
-            self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            if let Err(stop_error) = handle.lock().await.stop().await {
-                warn!(
-                    ?stop_error,
-                    ?operation,
-                    "failed to stop sandbox after terminal snapshot failure"
-                );
-            }
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.store.remove(&sandbox_id).await?;
+            self.cleanup_terminal_runtime(sandbox_id, handle, SandboxState::Snapshotting)
+                .await?;
         } else {
             let _ = self
                 .store
