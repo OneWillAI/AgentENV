@@ -539,6 +539,7 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 | `global_config_path` | string | `"$AENV_HOME/overlaybd/overlaybd-global.json"` | Path to overlaybd global config JSON (see note below). Relative explicit paths are resolved against the config file directory. |
 | `read_only` | boolean | `false` | When set to `true`, materializes the rootfs without a writable upper |
 | `runtime_upper_mode` | string | `"hybridLogStructured"` | Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are `"logStructured"`, `"hybridLogStructured"`, and `"sparse"`. Existing source uppers keep their own mode |
+| `restore_log_upper_as_hybrid` | boolean | `false` | On memory restore, create a fresh hybrid rootfs upper for an immutable checkpoint whose recorded runtime mode is `logStructured`. Reject existing writable uppers or inconsistent rootfs/backend configs. Leaves source checkpoint bytes, RAM state and tools release unchanged; does not migrate a running VM or cold boot |
 | `allow_shrink` | boolean | `false` | Allows an explicit cold-start `diskSizeMB` smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes. |
 | `resize_timeout_secs` | integer | `120` | Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero. |
 | `download_enable` | boolean | `false` | Enables overlaybd layer-level background download for remote layers |

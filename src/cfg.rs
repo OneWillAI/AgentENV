@@ -534,6 +534,10 @@ pub struct UblkOverlaybdTomlConfig {
     /// Existing source uppers keep their own mode. Default: `hybridLogStructured`.
     #[config(default = "hybridLogStructured")]
     pub runtime_upper_mode: UpperMode,
+    /// Opt in to fresh hybrid rootfs uppers for memory restores of log-mode checkpoints.
+    /// Never rewrites an existing upper or changes the saved memory/tools release.
+    #[config(default = false)]
+    pub restore_log_upper_as_hybrid: bool,
     /// Permit shrinking a fresh cold-sandbox rootfs. Default: `false`.
     #[config(default = false)]
     pub allow_shrink: bool,
