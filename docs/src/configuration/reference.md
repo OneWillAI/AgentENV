@@ -460,6 +460,7 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 | `endpoint` | string | none | OSS endpoint URL, for example `"https://oss-cn-hangzhou.aliyuncs.com"` |
 | `bucket` | string | none | OSS bucket name used for committed snapshot state |
 | `prefix` | string | empty | Optional object key prefix under the bucket |
+| `google_service_account` | boolean | `false` | Use the attached Google Compute Engine service account through the metadata server and inject its refreshable OAuth Bearer token into S3-compatible GCS requests |
 | `credential_process` | string | unset | External command used to fetch OSS credentials. Use a plain executable-plus-args form without shell expansion, pipes, or command substitution so it behaves consistently across AgentENV and overlaybd credential consumers |
 | `access_key_id` | string | unset | Static OSS access key ID. Required when `credential_process` is not set |
 | `access_key_secret` | string | unset | Static OSS access key secret. Required when `credential_process` is not set |
@@ -470,7 +471,8 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 
 Notes:
 
-- `credential_process` and static access key settings are mutually exclusive in practice; when `credential_process` is set, the backend ignores static credential fields.
+- `google_service_account`, `credential_process`, and static access keys are mutually exclusive credential sources.
+- `google_service_account = true` preserves the configured S3-compatible endpoint and `s3://` layer references; only transport authentication changes to OAuth.
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
 - Leave `addressing_style` unset when endpoint-based detection is correct. Set it to `"virtual"` or `"path"` when the provider's required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.

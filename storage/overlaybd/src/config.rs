@@ -209,6 +209,7 @@ pub struct OssConfig {
     pub secret_access_key: String,
     pub security_token: String,
     pub credential_process: String,
+    pub google_service_account: bool,
     pub default_region: String,
     pub default_endpoint: String,
     /// Bucket addressing style: `"virtual"`, `"path"`, or empty to use
@@ -228,6 +229,7 @@ impl Default for OssConfig {
             secret_access_key: String::new(),
             security_token: String::new(),
             credential_process: String::new(),
+            google_service_account: false,
             default_region: String::new(),
             default_endpoint: String::new(),
             default_addressing_style: String::new(),
@@ -594,31 +596,8 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
     ensure!(cfg.io_engine <= 2, "unknown ioEngine {}", cfg.io_engine);
     validate_download_chunk_knobs(&cfg.download, "download.concurrency")?;
     validate_download_scheduler_caps(&cfg.download, "download")?;
-
-    match cfg.cache_config.cache_type.as_str() {
-        "file" | "ocf" | "download" => {}
-        other => {
-            bail!("unknown cache type: {other}");
-        }
-    }
-
-    ensure!(
-        !(cfg.enable_thread && cfg.cache_config.cache_type == "file"),
-        "enableThread=true is invalid when cache type is file"
-    );
-
-    match cfg.credential_config.mode.as_str() {
-        "" => {}
-        "file" | "http" => {
-            ensure!(
-                !cfg.credential_config.path.is_empty(),
-                "credentialConfig.path cannot be empty when mode is set"
-            );
-        }
-        other => {
-            bail!("invalid credential mode {other}");
-        }
-    }
+    validate_cache_config(cfg)?;
+    validate_credential_config(cfg)?;
 
     ensure!(
         !(cfg.p2p_config.enable && cfg.p2p_config.address.is_empty()),
@@ -631,42 +610,81 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
         cfg.registry_fs_version
     );
 
+    validate_oss_config(cfg)?;
     if cfg.oss_config.enable {
         ensure!(
-            !cfg.oss_config.default_endpoint.is_empty(),
-            "ossConfig.defaultEndpoint cannot be empty when oss is enabled"
-        );
-        ensure!(
-            !cfg.oss_config.default_region.trim().is_empty(),
-            "ossConfig.defaultRegion cannot be empty when oss is enabled"
-        );
-        ensure!(
-            cfg.oss_config.access_key_id.is_empty() == cfg.oss_config.secret_access_key.is_empty(),
-            "ossConfig.accessKeyId and ossConfig.secretAccessKey must be set together"
-        );
-        ensure!(
-            cfg.oss_config.credential_process.trim().is_empty()
-                || (cfg.oss_config.access_key_id.is_empty()
-                    && cfg.oss_config.secret_access_key.is_empty()
-                    && cfg.oss_config.security_token.is_empty()),
-            "ossConfig.credentialProcess cannot be combined with accessKeyId/secretAccessKey/securityToken"
-        );
-        ensure!(
-            cfg.oss_config.security_token.is_empty()
-                || (!cfg.oss_config.access_key_id.is_empty()
-                    && !cfg.oss_config.secret_access_key.is_empty()),
-            "ossConfig.securityToken requires accessKeyId and secretAccessKey"
-        );
-        ensure!(
-            matches!(
-                cfg.oss_config.default_addressing_style.trim(),
-                "" | "virtual" | "path"
-            ),
+            matches!(cfg.oss_config.default_addressing_style.trim(), "" | "virtual" | "path"),
             "ossConfig.defaultAddressingStyle must be 'virtual', 'path', or empty for auto-detection, got '{}'",
             cfg.oss_config.default_addressing_style
         );
     }
 
+    Ok(())
+}
+
+fn validate_cache_config(cfg: &GlobalConfig) -> Result<()> {
+    match cfg.cache_config.cache_type.as_str() {
+        "file" | "ocf" | "download" => {}
+        other => bail!("unknown cache type: {other}"),
+    }
+    ensure!(
+        !(cfg.enable_thread && cfg.cache_config.cache_type == "file"),
+        "enableThread=true is invalid when cache type is file"
+    );
+    Ok(())
+}
+
+fn validate_credential_config(cfg: &GlobalConfig) -> Result<()> {
+    match cfg.credential_config.mode.as_str() {
+        "" => Ok(()),
+        "file" | "http" => {
+            ensure!(
+                !cfg.credential_config.path.is_empty(),
+                "credentialConfig.path cannot be empty when mode is set"
+            );
+            Ok(())
+        }
+        other => bail!("invalid credential mode {other}"),
+    }
+}
+
+fn validate_oss_config(cfg: &GlobalConfig) -> Result<()> {
+    if !cfg.oss_config.enable {
+        return Ok(());
+    }
+    ensure!(
+        !cfg.oss_config.default_endpoint.is_empty(),
+        "ossConfig.defaultEndpoint cannot be empty when oss is enabled"
+    );
+    ensure!(
+        !cfg.oss_config.default_region.trim().is_empty(),
+        "ossConfig.defaultRegion cannot be empty when oss is enabled"
+    );
+    ensure!(
+        cfg.oss_config.access_key_id.is_empty() == cfg.oss_config.secret_access_key.is_empty(),
+        "ossConfig.accessKeyId and ossConfig.secretAccessKey must be set together"
+    );
+    ensure!(
+        cfg.oss_config.credential_process.trim().is_empty()
+            || (cfg.oss_config.access_key_id.is_empty()
+                && cfg.oss_config.secret_access_key.is_empty()
+                && cfg.oss_config.security_token.is_empty()),
+        "ossConfig.credentialProcess cannot be combined with accessKeyId/secretAccessKey/securityToken"
+    );
+    ensure!(
+        !cfg.oss_config.google_service_account
+            || (cfg.oss_config.access_key_id.is_empty()
+                && cfg.oss_config.secret_access_key.is_empty()
+                && cfg.oss_config.security_token.is_empty()
+                && cfg.oss_config.credential_process.trim().is_empty()),
+        "ossConfig.googleServiceAccount cannot be combined with static credentials or credentialProcess"
+    );
+    ensure!(
+        cfg.oss_config.security_token.is_empty()
+            || (!cfg.oss_config.access_key_id.is_empty()
+                && !cfg.oss_config.secret_access_key.is_empty()),
+        "ossConfig.securityToken requires accessKeyId and secretAccessKey"
+    );
     Ok(())
 }
 
@@ -951,6 +969,24 @@ mod tests {
         let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
         cfg.normalize_compat_fields();
         validate_global_config(&cfg).expect("credential_process-only config should validate");
+    }
+
+    #[test]
+    fn test_oss_config_allows_google_service_account_without_static_credentials() {
+        let raw = r#"
+        {
+          "registryFsVersion": "v2",
+          "ioEngine": 0,
+          "ossConfig": {
+            "enable": true,
+            "defaultEndpoint": "https://storage.googleapis.com",
+            "defaultRegion": "us-east-1",
+            "googleServiceAccount": true
+          }
+        }"#;
+        let mut cfg: GlobalConfig = serde_json::from_str(raw).expect("parse");
+        cfg.normalize_compat_fields();
+        validate_global_config(&cfg).expect("Google service account config should validate");
     }
 
     #[test]

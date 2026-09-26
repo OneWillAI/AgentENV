@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use object_store_operator::{
     build_object_store_operator, credential_source_from_fields, run_with_refresh, AddressingStyle,
-    CachedCredentialSource, CredentialFields, CredentialSource, CredentialSourceOptions,
-    ObjectStoreOperatorConfig, ObjectStoreOperatorError, OpenDalError, OpenDalErrorKind,
-    OpenDalResult, Operator, OperatorWithCredential, ResolvedCredential,
+    CachedBearerTokenSource, CachedCredentialSource, CredentialFields, CredentialSource,
+    CredentialSourceOptions, ObjectStoreOperatorConfig, ObjectStoreOperatorError, OpenDalError,
+    OpenDalErrorKind, OpenDalResult, Operator, OperatorWithCredential, ResolvedCredential,
 };
 use reqwest::Url;
 use std::cmp::min;
@@ -37,6 +37,7 @@ pub struct OssBackend {
 #[derive(Debug)]
 struct OssBackendInner {
     credentials: CachedCredentialSource,
+    bearer_tokens: Option<Arc<CachedBearerTokenSource>>,
     default_region: String,
     default_endpoint: String,
     addressing_override: Option<AddressingStyle>,
@@ -72,6 +73,8 @@ struct OperatorCacheKey {
 impl OssBackend {
     pub fn new(config: &OssConfig) -> Result<Self> {
         let credential_source = credential_source_from_config(config)?;
+        let bearer_tokens = matches!(credential_source, CredentialSource::GoogleServiceAccount)
+            .then(|| Arc::new(CachedBearerTokenSource::google_compute_engine()));
         let addressing_override = parse_addressing_style(&config.default_addressing_style)?;
         let timeout = if config.timeout_secs == 0 {
             DEFAULT_TIMEOUT
@@ -87,6 +90,7 @@ impl OssBackend {
         Ok(Self {
             inner: Arc::new(OssBackendInner {
                 credentials: CachedCredentialSource::new(credential_source),
+                bearer_tokens,
                 default_region: config.default_region.clone(),
                 default_endpoint: config.default_endpoint.clone(),
                 addressing_override,
@@ -306,7 +310,12 @@ impl ParsedOssUrl {
         }
     }
 
-    fn operator_config(&self, timeout: Duration, retry_count: u32) -> ObjectStoreOperatorConfig {
+    fn operator_config(
+        &self,
+        timeout: Duration,
+        retry_count: u32,
+        bearer_tokens: Option<Arc<CachedBearerTokenSource>>,
+    ) -> ObjectStoreOperatorConfig {
         ObjectStoreOperatorConfig {
             bucket: self.bucket.clone(),
             endpoint: self.endpoint.clone(),
@@ -314,6 +323,7 @@ impl ParsedOssUrl {
             addressing_style: self.addressing_style,
             timeout: Some(timeout),
             max_retries: Some(retry_count as usize),
+            bearer_tokens,
         }
     }
 }
@@ -325,7 +335,8 @@ impl OssBackendInner {
         Fut: std::future::Future<Output = OpenDalResult<T>>,
     {
         let current = self.ensure_fresh_operator(location).await?;
-        let config = location.operator_config(self.timeout, self.retry_count);
+        let config =
+            location.operator_config(self.timeout, self.retry_count, self.bearer_tokens.clone());
         let credentials = current.credential().is_some().then_some(&self.credentials);
         let (value, refreshed) = run_with_refresh(&current, credentials, &config, operation)
             .await
@@ -365,7 +376,11 @@ impl OssBackendInner {
     ) -> Result<OperatorWithCredential> {
         let entry = OperatorWithCredential::new(
             build_object_store_operator(
-                &location.operator_config(self.timeout, self.retry_count),
+                &location.operator_config(
+                    self.timeout,
+                    self.retry_count,
+                    self.bearer_tokens.clone(),
+                ),
                 credential.as_ref(),
             )
             .map_err(map_object_store_operator_error)?,
@@ -644,6 +659,7 @@ fn credential_source_from_config(config: &OssConfig) -> Result<CredentialSource>
             secret_access_key: Some(config.secret_access_key.as_str()),
             security_token: Some(config.security_token.as_str()),
             credential_process: Some(config.credential_process.as_str()),
+            google_service_account: config.google_service_account,
         },
         CredentialSourceOptions {
             scope: "oss",
@@ -693,6 +709,7 @@ mod tests {
             secret_access_key: "sk".to_string(),
             security_token: String::new(),
             credential_process: "echo '{}'".to_string(),
+            google_service_account: false,
             default_region: "us-east-1".to_string(),
             default_endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
             default_addressing_style: String::new(),

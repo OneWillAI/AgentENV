@@ -280,6 +280,7 @@ workers = 1
 # endpoint-based auto-detection.
 # addressing_style = "virtual" # or "path"
 # prefix = "snapshots/"
+# google_service_account = false
 # credential_process = "/usr/local/bin/get-oss-credentials"
 # access_key_id = "..."
 # access_key_secret = "..."
