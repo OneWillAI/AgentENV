@@ -1335,6 +1335,8 @@ mod tests {
             .arg("--exact")
             .arg(TEST_NAME)
             .arg("--ignored")
+            // Keep marker lines independent of libtest's per-test progress prefix.
+            .arg("--quiet")
             .arg("--nocapture")
             .env(CHILD_ENV, "1")
             .output()

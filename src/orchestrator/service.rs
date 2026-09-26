@@ -1560,6 +1560,11 @@ where
                 ProxyLookupResult::NotFound
             }
             Some(metadata) if metadata.state == SandboxState::Running => {
+                // Launch may have published its route between our first lookup
+                // and the metadata read. Running is published after the route.
+                if let Some(route) = self.proxy_routes.read().await.route(sandbox_id) {
+                    return Ok(ProxyLookupResult::Ready(route.target().clone()));
+                }
                 warn!("running sandbox is missing a runtime proxy route");
                 ProxyLookupResult::RouteMissing
             }
@@ -3072,6 +3077,27 @@ where
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Option<CustomExtensionParams>> {
+        let handle = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&sandbox_id).cloned()
+        };
+        let Some(handle) = handle else {
+            let metadata = self
+                .store
+                .get(&sandbox_id)
+                .await?
+                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        };
+
+        // Use the same lock as snapshot capture. Once a patch enters its hook,
+        // pause must capture both the approved backend value and metadata.
+        // Check state under the lock: a patch queued behind pause must not call
+        // the extension and mutate configuration after the snapshot was taken.
+        let mut sandbox = handle.lock().await;
         let metadata = self
             .store
             .get(&sandbox_id)
@@ -3084,18 +3110,6 @@ where
             });
         }
 
-        let sandbox = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
-        }
-        .ok_or_else(|| OrchestratorError::SandboxOperationConflict {
-            sandbox_id,
-            operation: SandboxOperation::PatchCustomExtensionParams,
-        })?;
-
-        // Invoke the extension's patch-params hook here (the backend only
-        // stores the approved value). The sandbox lock is not held during
-        // the hook call so pause/stop are not blocked on extension latency.
         let client = CustomExtensionClient::global().ok_or_else(|| {
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
@@ -3114,21 +3128,20 @@ where
                 source,
             })?;
 
-        {
-            let mut sandbox = sandbox.lock().await;
-            sandbox.update_custom_extension_params(new_params.clone());
-        }
-
-        // NOTE: a concurrent pause may have transitioned the sandbox since the entry check,
-        // so this may fail. But it's acceptable since extension state should be transient like network policy
+        // Pause may have claimed Pausing while the hook was running, but it
+        // cannot capture or persist until this guard is released. Configuration
+        // is durable state, not a disposable runtime projection.
         self.store
-            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
-                metadata.custom_extension_params = new_params.clone();
-            })
+            .update_if_state(
+                &sandbox_id,
+                &[SandboxState::Running, SandboxState::Pausing],
+                |metadata| {
+                    metadata.custom_extension_params = new_params.clone();
+                },
+            )
             .await
             .map_err(|err| match err {
-                // Lost a race against a concurrent state transition (e.g.
-                // pause): report it as a conflict instead of a 500.
+                // Deletion can still win; never recreate deleted metadata.
                 StoreError::StateConflict {
                     sandbox_id,
                     actual_state,
@@ -3140,6 +3153,7 @@ where
                 other => OrchestratorError::from(other),
             })?;
 
+        sandbox.update_custom_extension_params(new_params.clone());
         Ok(new_params)
     }
 

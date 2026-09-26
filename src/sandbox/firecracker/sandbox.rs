@@ -990,12 +990,23 @@ impl FirecrackerSandbox {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
+        if let Some(slot) = self.network_slot.as_ref() {
+            if let Err(error) = slot.refresh_guest_arp_once() {
+                warn!(error = %format_args!("{error:#}"), "failed to announce guest ARP before envd health");
+            }
+            slot.spawn_readiness_arp_refresh();
+        }
+        let health_started = Instant::now();
         envd_instance
             .wait_for_ready(
                 self.runtime_policy.envd_timeout,
                 self.runtime_policy.envd_poll_interval,
             )
             .await?;
+        info!(
+            elapsed_ms = health_started.elapsed().as_millis(),
+            "sandbox envd health ready"
+        );
         if let Some(tools) = &self.tools_ublk_device {
             let _ = UblkDeviceManager::global()
                 .notify_sandbox_ready(tools.image_config_path())
@@ -1015,6 +1026,7 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
+        let init_started = Instant::now();
         envd_instance
             .init(
                 self.launch.common().env_vars.clone(),
@@ -1022,6 +1034,10 @@ impl FirecrackerSandbox {
                 self.launch.common().default_user.clone(),
             )
             .await?;
+        info!(
+            elapsed_ms = init_started.elapsed().as_millis(),
+            "sandbox envd initialized"
+        );
 
         // The snapshot already carries mount state for its existing drives.
         // Only drives newly supplied for this launch need a guest-side mount.
