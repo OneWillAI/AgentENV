@@ -702,6 +702,9 @@ impl SandboxBackend for FirecrackerSandbox {
         }
     }
 
+    async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        FirecrackerSandbox::branch_user_disk(self, output_dir).await
+    }
 
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
         self.current_custom_extension_params = params;
@@ -1640,7 +1643,81 @@ impl FirecrackerSandbox {
     }
 
 
+    /// Pause Firecracker, copy the writable overlay, then resume. Does not
+    /// snapshot RAM or clone processes.
+    async fn branch_user_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(output_dir)
+            .await
+            .with_context(|| format!("create disk-branch dir {}", output_dir.display()))?;
+        // Pausing vCPUs alone leaves dirty guest metadata behind. A disk-only
+        // cold boot cannot recover that memory, unlike a full VM snapshot.
+        let token = Uuid::new_v4().to_string();
+        let frozen = self.disk_branch_freeze("freeze", &token).await;
+        let branched = match frozen {
+            Ok(()) => match self.fc_instance.pause().await {
+                Ok(()) => {
+                    let copied = self.export_user_disk(output_dir).await;
+                    match self.fc_instance.resume().await {
+                        Ok(()) => copied,
+                        Err(error) => Err(error).context(format!(
+                            "resume Firecracker after disk-branch (copy error: {:?})",
+                            copied.err()
+                        )),
+                    }
+                }
+                Err(error) => Err(error).context("pause Firecracker for disk-branch"),
+            },
+            Err(error) => Err(error),
+        };
+        // This also validates that the watchdog did not thaw before copying
+        // finished. Never publish a branch after losing the freeze lease.
+        let thawed = self.disk_branch_freeze("thaw", &token).await;
+        match (branched, thawed) {
+            (Ok(path), Ok(())) => Ok(path),
+            (Err(error), Ok(())) => Err(error),
+            (copy, Err(error)) => Err(error).context(format!(
+                "thaw source after disk-branch (copy error: {:?})",
+                copy.err()
+            )),
+        }
+    }
 
+    async fn disk_branch_freeze(&mut self, action: &str, token: &str) -> Result<()> {
+        let envd = self
+            .envd_instance
+            .as_ref()
+            .context("sandbox is not running")?
+            .clone();
+        let operation = action.to_owned();
+        let token = token.to_owned();
+        let handle = tokio::runtime::Handle::current();
+        // The envd process transport is !Send. Keep it on one blocking task,
+        // as template execution does, without changing lifecycle trait bounds.
+        let output = tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                Executor::new(envd)
+                    .run_command_with_opts(
+                        "/bin/sh",
+                        &[
+                            "-c",
+                            include_str!("disk-freeze.sh"),
+                            "disk-freeze",
+                            &operation,
+                            &token,
+                        ],
+                        &ProcessOpts::new().with_timeout(std::time::Duration::from_secs(15)),
+                    )
+                    .await
+            })
+        })
+        .await
+        .context("join disk-branch filesystem operation")?
+        .with_context(|| format!("{action} guest root filesystem for disk-branch"))?;
+        if output.exit_code != 0 {
+            bail!("disk-branch {action} failed: {}", output.stderr.trim());
+        }
+        Ok(())
+    }
 
     async fn export_user_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
         let Some(runtime) = self.rootfs_runtime.as_ref() else {
