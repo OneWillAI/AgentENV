@@ -15,7 +15,11 @@ use crate::sandbox::{PausedSandboxState, RuntimeArtifactSet};
 /// Keep boot-time writes in the retained generation, not the disposable VM
 /// work directory. The existing runtime materializer reopens this same upper
 /// on retry; normal pause subsequently exports and compacts it as usual.
-pub(super) fn prepare_writable_disk(image_path: &Path, virtual_size: u64) -> Result<()> {
+pub(super) fn prepare_writable_disk(
+    image_path: &Path,
+    virtual_size: u64,
+    mode: overlaybd::config::UpperMode,
+) -> Result<()> {
     use overlaybd::config::{load_image_config, UpperConfig, UpperMode};
     let mut image = load_image_config(image_path)?;
     ensure!(
@@ -29,14 +33,18 @@ pub(super) fn prepare_writable_disk(image_path: &Path, virtual_size: u64) -> Res
     let index = root.join("boot-upper.index");
     overlaybd::helper::prepare_runtime_upper(
         &data,
-        Some(&index),
+        (mode != UpperMode::Sparse).then_some(index.as_path()),
         virtual_size,
-        UpperMode::LogStructured,
+        mode,
     )?;
     image.upper = UpperConfig {
         data: data.display().to_string(),
-        index: index.display().to_string(),
-        mode: Some(UpperMode::LogStructured),
+        index: if mode == UpperMode::Sparse {
+            String::new()
+        } else {
+            index.display().to_string()
+        },
+        mode: Some(mode),
         ..Default::default()
     };
     // This private generation is synced before the existing persister publishes
@@ -114,6 +122,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cold_boot_upper_uses_requested_format_and_never_replaces_existing_state() -> Result<()> {
+        use overlaybd::config::{load_image_config, UpperMode};
+        use overlaybd::lsmt::file::{validate_rw_header_pair_paths, RwLayout};
+
+        for mode in [
+            UpperMode::LogStructured,
+            UpperMode::HybridLogStructured,
+            UpperMode::Sparse,
+        ] {
+            let root = tempfile::tempdir()?;
+            let image = root.path().join("image.json");
+            std::fs::write(&image, b"{}")?;
+            prepare_writable_disk(&image, 1024 * 1024, mode)?;
+            let config = load_image_config(&image)?;
+            assert_eq!(config.upper.mode, Some(mode));
+            let index = (!config.upper.index.is_empty()).then(|| Path::new(&config.upper.index));
+            validate_rw_header_pair_paths(
+                Path::new(&config.upper.data),
+                index,
+                1024 * 1024,
+                RwLayout::from(mode),
+            )?;
+            let before = std::fs::read(&config.upper.data)?;
+            assert!(
+                prepare_writable_disk(&image, 1024 * 1024, UpperMode::HybridLogStructured).is_err()
+            );
+            assert_eq!(std::fs::read(&config.upper.data)?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn disk_recovery_survives_missing_boot_dependencies_without_memory_artifacts() -> Result<()> {
         let root = tempfile::tempdir()?;
         let image = root.path().join("image.json");
@@ -123,12 +163,21 @@ mod tests {
             &image,
             serde_json::to_vec(&serde_json::json!({"lowers":[{"file":layer}]}))?,
         )?;
-        prepare_writable_disk(&image, 1024 * 1024)?;
+        prepare_writable_disk(
+            &image,
+            1024 * 1024,
+            overlaybd::config::UpperMode::HybridLogStructured,
+        )?;
         let upper = overlaybd::config::load_image_config(&image)?.upper;
         assert!(Path::new(&upper.data).is_file());
         assert!(Path::new(&upper.index).is_file());
         assert!(
-            prepare_writable_disk(&image, 1024 * 1024).is_err(),
+            prepare_writable_disk(
+                &image,
+                1024 * 1024,
+                overlaybd::config::UpperMode::HybridLogStructured
+            )
+            .is_err(),
             "retry must never replace an existing writable layer"
         );
         let mut config = FirecrackerSandboxConfig::new(

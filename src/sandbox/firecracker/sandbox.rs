@@ -1189,11 +1189,18 @@ impl FirecrackerSandbox {
         self.disk_branch_freeze("freeze-stop", &token).await?;
         self.fc_instance.pause().await?;
         let disk = self.export_user_disk(output_dir).await?;
-        super::cold_boot::prepare_writable_disk(&disk, self.snapshot_rootfs_virtual_size()?)?;
+        // This is a new upper over an immutable export, so use the explicit
+        // creation policy. Never reinterpret the source VM's existing upper.
+        let runtime_upper_mode = ConfigManager::global_config().ublk.overlaybd.runtime_upper_mode;
+        super::cold_boot::prepare_writable_disk(
+            &disk,
+            self.snapshot_rootfs_virtual_size()?,
+            runtime_upper_mode,
+        )?;
         let source = OverlaybdConfig {
             image_config_path: disk,
             read_only: false,
-            runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            runtime_upper_mode,
         };
         config.common.ublk_config = Some(
             crate::sandbox::UblkConfig::overlaybd_with_runtime_upper_mode(
