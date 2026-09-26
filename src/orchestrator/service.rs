@@ -1951,32 +1951,29 @@ where
     }
 
 
-    /// Stops every known sandbox and tears down in-memory runtime state.
-    ///
-    /// This is single-flight: the first caller performs cleanup and subsequent
-    /// callers wait for the same outcome rather than starting duplicate work.
-    ///
-    /// Cleanup itself is still best-effort: the executor keeps attempting
-    /// remaining sandboxes even if individual deletions fail, then returns an
-    /// error if any sandbox could not be cleaned up after several passes.
+    /// Preserve guests before allowing process exit. Successful preparation is
+    /// latched; a failed attempt keeps the API and background tasks available
+    /// and can be retried after the operator resolves the failure.
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
-        let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);
-        let _ = self.shutdown_tx.send_replace(true);
-
-        if !was_already_shutting_down {
-            info!("orchestrator shutdown requested; stopping all sandboxes");
+        let mut complete = self.shutdown_complete.lock().await;
+        if *complete {
+            return Ok(());
         }
-
-        let this = Arc::clone(self);
-        let outcome = self
-            .shutdown_outcome
-            .get_or_init(|| async move {
-                ShutdownOutcome::from_result(this.run_shutdown_cleanup().await)
-            })
-            .await;
-
-        outcome.as_result()
+        self.is_shutting_down.store(true, Ordering::Release);
+        let _exclusive = self.lifecycle_gate.write().await;
+        match self.run_shutdown_cleanup().await {
+            Ok(()) => {
+                *complete = true;
+                let _ = self.shutdown_tx.send_replace(true);
+                Ok(())
+            }
+            Err(error) => {
+                self.is_shutting_down.store(false, Ordering::Release);
+                warn!(error = %error, "shutdown blocked; keeping server and storage alive");
+                Err(error)
+            }
+        }
     }
 
     /// Pauses a running sandbox by taking a snapshot and stopping its VM.
@@ -3596,6 +3593,23 @@ where
         const MAX_SHUTDOWN_PASSES: usize = 3;
         let mut last_failures = Vec::new();
 
+        // Account for all concurrent/serial output coexistence before stopping
+        // the first guest. Each backend rechecks just before its own capture.
+        let handles: Vec<_> = self.sandboxes.read().await.values().cloned().collect();
+        let mut requirements = Vec::new();
+        for handle in handles {
+            if let Some(requirement) = handle
+                .lock()
+                .await
+                .checkpoint_capacity()
+                .map_err(|error| OrchestratorError::InternalError(error.to_string()))?
+            {
+                requirements.push(requirement);
+            }
+        }
+        crate::sandbox::checkpoint_capacity::check(&requirements)
+            .map_err(|error| OrchestratorError::InternalError(error.to_string()))?;
+
         // Preserve recoverable sandboxes by pausing running VMs before process exit.
         for pass in 1..=MAX_SHUTDOWN_PASSES {
             let sandboxes = self
@@ -3672,6 +3686,34 @@ where
                 last_failures.join(", ")
             )));
         }
+
+        // Paused alone is not proof of preservation: publication or runtime
+        // stop acknowledgement may have failed after the state transition.
+        for metadata in self
+            .store
+            .list_filtered(SandboxListFilter {
+                states: None,
+                excluded_states: None,
+                user_metadata: None,
+                ..SandboxListFilter::matches_all()
+            })
+            .await?
+        {
+            if metadata.state != SandboxState::Paused
+                || metadata.resume_recovery_pending
+                || !metadata.paused_runtime_stopped
+            {
+                return Err(OrchestratorError::InternalError(format!(
+                    "shutdown blocked: guest {} state={} stopped={} recovery_pending={}",
+                    metadata.id,
+                    metadata.state,
+                    metadata.paused_runtime_stopped,
+                    metadata.resume_recovery_pending,
+                )));
+            }
+        }
+
+        self.collect_checkpoints().await;
 
         // Clean up remaining network resources.
         if let Some(manager) = crate::sandbox::NetworkManager::global_if_initialized() {
