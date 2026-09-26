@@ -116,6 +116,9 @@ impl FileBackedSandboxPersister {
         self.root.join(RECORD_DB_DIR)
     }
 
+    fn create_idempotency_db_path(&self) -> PathBuf {
+        self.root.join(CREATE_IDEMPOTENCY_DB_DIR)
+    }
 
 
     fn artifacts_root(&self) -> PathBuf {
@@ -137,6 +140,18 @@ impl FileBackedSandboxPersister {
             .cloned()
     }
 
+    async fn create_idempotency_db(&self) -> PersistenceResult<LocalKvStore> {
+        self.create_idempotency_db
+            .get_or_try_init(|| async {
+                LocalKvStore::open(self.create_idempotency_db_path(), self.durability)
+                    .await
+                    .map_err(|source| {
+                        SandboxPersistenceError::store("open create idempotency RocksDB", source)
+                    })
+            })
+            .await
+            .cloned()
+    }
 
 
     fn manifest_path(artifact_root: &Path) -> PathBuf {
@@ -498,8 +513,25 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Ok(())
     }
 
+    async fn load_create_idempotency_records(
+        &self,
+    ) -> PersistenceResult<Vec<CreateIdempotencyRecord>> {
+        let journal = self.create_idempotency_db().await?;
+        super::operation_journal::load(&journal).await
+    }
 
+    async fn persist_create_idempotency_record(
+        &self,
+        record: &CreateIdempotencyRecord,
+    ) -> PersistenceResult<()> {
+        let journal = self.create_idempotency_db().await?;
+        super::operation_journal::put(&journal, record).await
+    }
 
+    async fn delete_create_idempotency_record(&self, key: &str) -> PersistenceResult<()> {
+        let journal = self.create_idempotency_db().await?;
+        super::operation_journal::delete(&journal, key).await
+    }
 }
 
 #[cfg(test)]
@@ -607,6 +639,39 @@ mod tests {
             .get(sandbox_id.to_string())
             .await?
             .is_some())
+    }
+    #[tokio::test]
+    async fn create_idempotency_journal_round_trips_and_deletes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let mut record = CreateIdempotencyRecord {
+            key: "create-journal-roundtrip".to_string(),
+            request_fingerprint: "sha256:journal-roundtrip".to_string(),
+            sandbox_id: SandboxId::new(),
+            state: CreateIdempotencyRecordState::Creating,
+        };
+
+        persister.persist_create_idempotency_record(&record).await?;
+        assert_eq!(
+            persister.load_create_idempotency_records().await?,
+            vec![record.clone()]
+        );
+
+        record.state = CreateIdempotencyRecordState::Succeeded;
+        persister.persist_create_idempotency_record(&record).await?;
+        assert_eq!(
+            persister.load_create_idempotency_records().await?,
+            vec![record.clone()]
+        );
+
+        persister
+            .delete_create_idempotency_record(&record.key)
+            .await?;
+        assert!(persister
+            .load_create_idempotency_records()
+            .await?
+            .is_empty());
+        Ok(())
     }
 
     #[tokio::test]

@@ -234,7 +234,14 @@ where
 
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
-        let persisted = persister.load_all(&factory).await?;
+        let mut persisted = persister.load_all(&factory).await?;
+        let durable_create_idempotency = persister.load_create_idempotency_records().await?;
+        let create_idempotency = Self::restore_create_idempotency(
+            &persister,
+            &mut persisted,
+            durable_create_idempotency,
+        )
+        .await?;
         let managed_seed_must_exist = persisted_sandboxes_require_managed_seed(&persisted);
         let access_tokens = tokio::task::spawn_blocking(move || {
             SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
@@ -270,9 +277,11 @@ where
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
-            shutdown_outcome: OnceCell::new(),
+            shutdown_complete: Mutex::new(false),
+            lifecycle_gate: RwLock::new(()),
             image_refs,
             access_tokens,
+            create_idempotency: Mutex::new(create_idempotency),
             volume_manager,
         });
 
@@ -308,12 +317,221 @@ where
         Ok(orchestrator)
     }
 
+    async fn restore_create_idempotency(
+        persister: &P,
+        persisted: &mut Vec<SandboxMetadata>,
+        records: Vec<CreateIdempotencyRecord>,
+    ) -> Result<HashMap<String, Arc<CreateIdempotencyEntry>>> {
+        let mut durable = Self::validate_durable_create_records(records)?;
+        Self::migrate_paused_create_records(persister, persisted, &mut durable).await?;
+        let (deleting_keys, deleting_sandboxes) =
+            Self::reconcile_interrupted_create_records(persister, &mut durable).await?;
+        persisted.retain(|metadata| !deleting_sandboxes.contains(&metadata.id));
+        Ok(Self::restore_create_entries(durable, &deleting_keys))
+    }
 
+    fn validate_durable_create_records(
+        records: Vec<CreateIdempotencyRecord>,
+    ) -> Result<HashMap<String, CreateIdempotencyRecord>> {
+        let mut durable = HashMap::new();
+        for record in records {
+            CreateSandboxIdempotency::new(record.key.clone(), record.request_fingerprint.clone())
+                .map_err(|message| {
+                OrchestratorError::InternalError(format!(
+                    "invalid durable create idempotency record for sandbox {}: {message}",
+                    record.sandbox_id
+                ))
+            })?;
+            let key = record.key.clone();
+            if durable.insert(key.clone(), record).is_some() {
+                return Err(OrchestratorError::InternalError(format!(
+                    "duplicate durable create idempotency key '{key}'"
+                )));
+            }
+        }
+        Ok(durable)
+    }
 
+    async fn migrate_paused_create_records(
+        persister: &P,
+        persisted: &[SandboxMetadata],
+        durable: &mut HashMap<String, CreateIdempotencyRecord>,
+    ) -> Result<()> {
+        let mut paused_keys = HashMap::<String, (SandboxId, String)>::new();
+        for metadata in persisted {
+            Self::migrate_paused_create_record(persister, metadata, &mut paused_keys, durable)
+                .await?;
+        }
+        Ok(())
+    }
 
+    async fn migrate_paused_create_record(
+        persister: &P,
+        metadata: &SandboxMetadata,
+        paused_keys: &mut HashMap<String, (SandboxId, String)>,
+        durable: &mut HashMap<String, CreateIdempotencyRecord>,
+    ) -> Result<()> {
+        let (key, request_fingerprint) = match (
+            metadata.create_idempotency_key.as_ref(),
+            metadata.create_request_fingerprint.as_ref(),
+        ) {
+            (None, None) => return Ok(()),
+            (Some(key), Some(request_fingerprint)) => (key, request_fingerprint),
+            _ => {
+                return Err(OrchestratorError::InternalError(format!(
+                    "sandbox {} has incomplete create idempotency metadata",
+                    metadata.id
+                )));
+            }
+        };
+        CreateSandboxIdempotency::new(key.clone(), request_fingerprint.clone()).map_err(
+            |message| {
+                OrchestratorError::InternalError(format!(
+                    "sandbox {} has invalid create idempotency metadata: {message}",
+                    metadata.id
+                ))
+            },
+        )?;
+        if let Some((other_id, _)) =
+            paused_keys.insert(key.clone(), (metadata.id, request_fingerprint.clone()))
+        {
+            return Err(OrchestratorError::InternalError(format!(
+                "paused sandboxes {other_id} and {} share create idempotency key '{key}'",
+                metadata.id
+            )));
+        }
 
+        match durable.get_mut(key) {
+            Some(record)
+                if record.sandbox_id != metadata.id
+                    || record.request_fingerprint != *request_fingerprint =>
+            {
+                Err(OrchestratorError::InternalError(format!(
+                    "paused sandbox {} conflicts with durable create idempotency key '{key}'",
+                    metadata.id
+                )))
+            }
+            Some(record) if record.state == CreateIdempotencyRecordState::Creating => {
+                record.state = CreateIdempotencyRecordState::Succeeded;
+                persister.persist_create_idempotency_record(record).await?;
+                Ok(())
+            }
+            Some(record) if record.state == CreateIdempotencyRecordState::Failed => {
+                Err(OrchestratorError::InternalError(format!(
+                    "paused sandbox {} conflicts with failed create idempotency key '{key}'",
+                    metadata.id
+                )))
+            }
+            Some(_) => Ok(()),
+            None => {
+                let record = CreateIdempotencyRecord {
+                    key: key.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    sandbox_id: metadata.id,
+                    state: CreateIdempotencyRecordState::Succeeded,
+                };
+                persister.persist_create_idempotency_record(&record).await?;
+                durable.insert(key.clone(), record);
+                Ok(())
+            }
+        }
+    }
 
+    async fn reconcile_interrupted_create_records(
+        persister: &P,
+        durable: &mut HashMap<String, CreateIdempotencyRecord>,
+    ) -> Result<(HashSet<String>, HashSet<SandboxId>)> {
+        let mut deleting_keys = HashSet::new();
+        let mut deleting_sandboxes = HashSet::new();
+        for (key, record) in durable.iter_mut() {
+            if Self::reconcile_interrupted_create_record(persister, key, record).await? {
+                deleting_keys.insert(key.clone());
+                deleting_sandboxes.insert(record.sandbox_id);
+            }
+        }
+        Ok((deleting_keys, deleting_sandboxes))
+    }
 
+    async fn reconcile_interrupted_create_record(
+        persister: &P,
+        key: &str,
+        record: &mut CreateIdempotencyRecord,
+    ) -> Result<bool> {
+        match record.state {
+            CreateIdempotencyRecordState::Deleting => {
+                match persister
+                    .delete_record_and_artifacts(&record.sandbox_id)
+                    .await
+                {
+                    Ok(()) => {
+                        persister.delete_create_idempotency_record(key).await?;
+                        Ok(true)
+                    }
+                    Err(error) if error.requires_explicit_purge() => {
+                        warn!(
+                            sandbox_id = %record.sandbox_id,
+                            error = %error,
+                            "paused sandbox delete at startup left artifacts in host-local quarantine; releasing the create key"
+                        );
+                        persister.delete_create_idempotency_record(key).await?;
+                        Ok(true)
+                    }
+                    Err(error) => {
+                        warn!(
+                            sandbox_id = %record.sandbox_id,
+                            error = %error,
+                            "paused sandbox delete at startup could not finish; retaining a failed create-key tombstone"
+                        );
+                        record.state = CreateIdempotencyRecordState::Failed;
+                        persister.persist_create_idempotency_record(record).await?;
+                        Ok(false)
+                    }
+                }
+            }
+            CreateIdempotencyRecordState::Creating => {
+                record.state = CreateIdempotencyRecordState::Failed;
+                persister.persist_create_idempotency_record(record).await?;
+                Ok(false)
+            }
+            CreateIdempotencyRecordState::Succeeded | CreateIdempotencyRecordState::Failed => {
+                Ok(false)
+            }
+        }
+    }
+
+    fn restore_create_entries(
+        durable: HashMap<String, CreateIdempotencyRecord>,
+        deleting_keys: &HashSet<String>,
+    ) -> HashMap<String, Arc<CreateIdempotencyEntry>> {
+        let mut entries = HashMap::new();
+        for (key, record) in durable {
+            if deleting_keys.contains(&key) {
+                continue;
+            }
+            let restored_state = match record.state {
+                CreateIdempotencyRecordState::Creating => unreachable!(
+                    "interrupted creating records are converted to failed before restoration"
+                ),
+                CreateIdempotencyRecordState::Succeeded => CreateIdempotencyState::Succeeded,
+                CreateIdempotencyRecordState::Failed => CreateIdempotencyState::Failed(
+                    "previous create outcome is unavailable after restart".to_string(),
+                ),
+                CreateIdempotencyRecordState::Deleting => {
+                    unreachable!("deleting records are reconciled before restoration")
+                }
+            };
+            let (state, _) = watch::channel(restored_state);
+            entries.insert(
+                key,
+                Arc::new(CreateIdempotencyEntry {
+                    sandbox_id: record.sandbox_id,
+                    request_fingerprint: record.request_fingerprint,
+                    state,
+                }),
+            );
+        }
+        entries
+    }
 
     async fn run_cancellation_safe<T>(
         self: &Arc<Self>,
@@ -325,8 +543,23 @@ where
         T: Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
+        let this = Arc::clone(self);
         tokio::spawn(async move {
-            let result = future.await;
+            let guard = this.lifecycle_gate.read().await;
+            let result = match this.ensure_accepting_lifecycle_operations() {
+                Ok(()) => future.await,
+                Err(error) => {
+                    if operation == "create" {
+                        this.counters.record_create_fail(1);
+                    }
+                    Err(error)
+                }
+            };
+            drop(guard);
+            if matches!(operation, "pause" | "reboot" | "evict") && result.is_ok() {
+                let _exclusive = this.lifecycle_gate.write().await;
+                this.collect_checkpoints().await;
+            }
             if tx.send(result).is_err() {
                 debug!(
                     sandbox_id = %sandbox_id,
@@ -455,14 +688,30 @@ where
         self: &Arc<Self>,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
+        self.create_sandbox_with_volume_reservation(request, None)
+            .await
+    }
+
+    /// Claim volume ownership before any backend can open the mounted disks.
+    /// API cancellation cannot interrupt this handoff or the supervised launch.
+    pub(crate) async fn create_sandbox_with_volume_reservation(
+        self: &Arc<Self>,
+        request: CreateSandboxRequest,
+        pending_volume_owner: Option<String>,
+    ) -> Result<SandboxMetadata> {
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request, false).await
+            if request.idempotency.is_some() {
+                this.create_idempotent_sandbox(sandbox_id, request, pending_volume_owner)
+                    .await
+            } else {
+                this.create_sandbox_inner(sandbox_id, request, false, pending_volume_owner)
+                    .await
+            }
         })
         .await
     }
-
 
     pub(crate) async fn create_template_builder(
         self: &Arc<Self>,
@@ -471,15 +720,220 @@ where
     ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("create_builder", build_id, async move {
-            this.create_sandbox_inner(build_id, request, true).await
+            this.create_sandbox_inner(build_id, request, true, None)
+                .await
         })
         .await
     }
 
+    /// Supervise the entire idempotent operation, including the first durable
+    /// claim write and its publication in memory. The caller only waits on the
+    /// outer oneshot, so cancellation cannot detach an in-flight RocksDB write
+    /// from the claim that owns it.
+    async fn create_idempotent_sandbox(
+        self: Arc<Self>,
+        candidate_sandbox_id: SandboxId,
+        request: CreateSandboxRequest,
+        pending_volume_owner: Option<String>,
+    ) -> Result<SandboxMetadata> {
+        let idempotency = request
+            .idempotency
+            .clone()
+            .expect("idempotent create supervisor requires idempotency");
+        match self
+            .claim_create_idempotency(&idempotency, candidate_sandbox_id)
+            .await?
+        {
+            CreateIdempotencyClaim::Replay(entry) => {
+                self.replay_idempotent_create(idempotency.key(), entry)
+                    .await
+            }
+            CreateIdempotencyClaim::Owner(entry) => {
+                let sandbox_id = entry.sandbox_id;
+                let key = idempotency.key().to_string();
+                let mut completion_guard =
+                    CreateIdempotencyCompletionGuard::new(Arc::clone(&entry));
+                let result = match AssertUnwindSafe(Arc::clone(&self).create_sandbox_inner(
+                    sandbox_id,
+                    request,
+                    false,
+                    pending_volume_owner,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let message = payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic payload".to_string());
+                        Err(OrchestratorError::InternalError(format!(
+                            "idempotent create panicked: {message}"
+                        )))
+                    }
+                };
+                let result = self.finish_idempotent_create(&key, &entry, result).await;
+                completion_guard.disarm();
+                result
+            }
+        }
+    }
 
+    /// Return or join an existing create claim without allocating a new one.
+    /// API handlers use this before mutable template/image resolution so a
+    /// successful replay cannot be invalidated by later source changes.
+    pub async fn replay_create_if_present(
+        &self,
+        idempotency: &CreateSandboxIdempotency,
+    ) -> Result<Option<SandboxMetadata>> {
+        let entry = {
+            let entries = self.create_idempotency.lock().await;
+            let Some(entry) = entries.get(idempotency.key()) else {
+                return Ok(None);
+            };
+            if entry.request_fingerprint != idempotency.request_fingerprint() {
+                return Err(OrchestratorError::CreateIdempotencyConflict {
+                    key: idempotency.key().to_string(),
+                });
+            }
+            Arc::clone(entry)
+        };
+        self.replay_idempotent_create(idempotency.key(), entry)
+            .await
+            .map(Some)
+    }
 
+    async fn claim_create_idempotency(
+        &self,
+        idempotency: &CreateSandboxIdempotency,
+        candidate_sandbox_id: SandboxId,
+    ) -> Result<CreateIdempotencyClaim> {
+        let mut entries = self.create_idempotency.lock().await;
+        if let Some(entry) = entries.get(idempotency.key()) {
+            if entry.request_fingerprint != idempotency.request_fingerprint() {
+                return Err(OrchestratorError::CreateIdempotencyConflict {
+                    key: idempotency.key().to_string(),
+                });
+            }
+            return Ok(CreateIdempotencyClaim::Replay(Arc::clone(entry)));
+        }
 
+        let (state, _) = watch::channel(CreateIdempotencyState::Creating);
+        let entry = Arc::new(CreateIdempotencyEntry {
+            sandbox_id: candidate_sandbox_id,
+            request_fingerprint: idempotency.request_fingerprint().to_string(),
+            state,
+        });
+        self.persister
+            .persist_create_idempotency_record(
+                &entry.durable_record(idempotency.key(), CreateIdempotencyRecordState::Creating),
+            )
+            .await?;
+        entries.insert(idempotency.key().to_string(), Arc::clone(&entry));
+        Ok(CreateIdempotencyClaim::Owner(entry))
+    }
 
+    async fn replay_idempotent_create(
+        &self,
+        key: &str,
+        entry: Arc<CreateIdempotencyEntry>,
+    ) -> Result<SandboxMetadata> {
+        let mut state = entry.state.subscribe();
+        loop {
+            let current = state.borrow_and_update().clone();
+            match current {
+                CreateIdempotencyState::Creating => {
+                    state.changed().await.map_err(|_| {
+                        OrchestratorError::InternalError(format!(
+                            "idempotent create state closed before completion for key '{key}'"
+                        ))
+                    })?;
+                }
+                CreateIdempotencyState::Succeeded => {
+                    return self.store.get(&entry.sandbox_id).await?.ok_or_else(|| {
+                        OrchestratorError::CreateIdempotencyResultUnavailable {
+                            key: key.to_string(),
+                        }
+                    });
+                }
+                CreateIdempotencyState::Failed(message) => {
+                    return Err(OrchestratorError::InternalError(format!(
+                        "idempotent create for key '{key}' failed: {message}"
+                    )));
+                }
+                CreateIdempotencyState::Deleting => {
+                    return Err(OrchestratorError::CreateIdempotencyResultUnavailable {
+                        key: key.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn finish_idempotent_create(
+        &self,
+        key: &str,
+        entry: &Arc<CreateIdempotencyEntry>,
+        result: Result<SandboxMetadata>,
+    ) -> Result<SandboxMetadata> {
+        // Serialize owner completion with deletion and any later claim. A
+        // delete may observe Running metadata just before this function; once
+        // it marks the entry Deleting, this owner must never overwrite that
+        // journal phase with Succeeded or Failed.
+        let entries = self.create_idempotency.lock().await;
+        let current = entries.get(key);
+        if !current.is_some_and(|current| Arc::ptr_eq(current, entry))
+            || !matches!(&*entry.state.borrow(), CreateIdempotencyState::Creating)
+        {
+            return match result {
+                Ok(_) => Err(OrchestratorError::CreateIdempotencyResultUnavailable {
+                    key: key.to_string(),
+                }),
+                Err(err) => Err(err),
+            };
+        }
+
+        match result {
+            Ok(metadata) => {
+                if let Err(err) = self
+                    .persister
+                    .persist_create_idempotency_record(
+                        &entry.durable_record(key, CreateIdempotencyRecordState::Succeeded),
+                    )
+                    .await
+                {
+                    let message = format!("failed to persist successful create result: {err}");
+                    let _ = entry
+                        .state
+                        .send_replace(CreateIdempotencyState::Failed(message));
+                    // The durable Creating record and in-memory Failed state are
+                    // both fail-closed; never return an unjournaled success.
+                    return Err(OrchestratorError::from(err));
+                }
+                let _ = entry.state.send_replace(CreateIdempotencyState::Succeeded);
+                Ok(metadata)
+            }
+            Err(err) => {
+                if let Err(persist_err) = self
+                    .persister
+                    .persist_create_idempotency_record(
+                        &entry.durable_record(key, CreateIdempotencyRecordState::Failed),
+                    )
+                    .await
+                {
+                    // The original durable Creating record remains a safe
+                    // tombstone and startup converts it to Failed.
+                    warn!(error = ?persist_err, "failed to persist create failure tombstone");
+                }
+                let _ = entry
+                    .state
+                    .send_replace(CreateIdempotencyState::Failed(err.to_string()));
+                Err(err)
+            }
+        }
+    }
 
     #[tracing::instrument(
         name = "create_sandbox",
@@ -491,6 +945,7 @@ where
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
         template_builder: bool,
+        pending_volume_owner: Option<String>,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
             self.counters.record_create_fail(1);
@@ -507,10 +962,15 @@ where
             network_policy,
             custom_extension_params,
             secure,
+            idempotency,
             volume_mounts,
             extra_drives: launch_extra_drives,
             extra_drives_in_snapshot,
         } = request;
+        let create_idempotency_key = idempotency.as_ref().map(|value| value.key().to_string());
+        let create_request_fingerprint = idempotency
+            .as_ref()
+            .map(|value| value.request_fingerprint().to_string());
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
 
@@ -565,6 +1025,8 @@ where
                     timeout_action,
                     auto_resume,
                     user_metadata,
+                    create_idempotency_key,
+                    create_request_fingerprint,
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
                     volume_mounts: volume_mounts.clone(),
@@ -572,13 +1034,16 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_from_snapshot(
-                    sandbox_id,
-                    snapshot,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
+                self.launch_sandbox_with_volume_reservation(
+                    LaunchPlan::for_create_from_snapshot(
+                        sandbox_id,
+                        snapshot,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ),
+                    pending_volume_owner.as_deref(),
+                )
                 .await
             }
             SandboxLaunchSource::Image {
@@ -630,6 +1095,8 @@ where
                     timeout_action,
                     auto_resume,
                     user_metadata,
+                    create_idempotency_key,
+                    create_request_fingerprint,
                     network_policy,
                     custom_extension_params,
                     volume_mounts,
@@ -637,13 +1104,16 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_fresh(
-                    sandbox_id,
-                    build_spec,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
+                self.launch_sandbox_with_volume_reservation(
+                    LaunchPlan::for_create_fresh(
+                        sandbox_id,
+                        build_spec,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ),
+                    pending_volume_owner.as_deref(),
+                )
                 .await
             }
         };
@@ -1402,10 +1872,71 @@ where
 
 
 
+    async fn idempotent_delete_entry(
+        &self,
+        metadata: &SandboxMetadata,
+        previous_state: SandboxState,
+    ) -> Result<Option<(String, Arc<CreateIdempotencyEntry>)>> {
+        let Some(key) = metadata.create_idempotency_key.as_ref() else {
+            return Ok(None);
+        };
+        let entry = self.create_idempotency.lock().await.get(key).cloned();
+        let Some(entry) = entry else {
+            self.rollback_delete_state(metadata.id, previous_state)
+                .await?;
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {} is missing create idempotency entry '{key}'",
+                metadata.id
+            )));
+        };
+        if entry.sandbox_id != metadata.id {
+            self.rollback_delete_state(metadata.id, previous_state)
+                .await?;
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {} create idempotency entry '{key}' points to {}",
+                metadata.id, entry.sandbox_id
+            )));
+        }
+        Ok(Some((key.clone(), entry)))
+    }
 
 
+    async fn mark_create_entry_deleting(
+        &self,
+        sandbox_id: SandboxId,
+        idempotent_delete: Option<&(String, Arc<CreateIdempotencyEntry>)>,
+    ) -> Result<()> {
+        let Some((key, entry)) = idempotent_delete else {
+            return Ok(());
+        };
+        let entries = self.create_idempotency.lock().await;
+        if !entries
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {sandbox_id} create idempotency entry '{key}' changed during delete"
+            )));
+        }
+        let _ = entry.state.send_replace(CreateIdempotencyState::Deleting);
+        Ok(())
+    }
 
 
+    async fn deleting_create_for_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<(String, Arc<CreateIdempotencyEntry>)> {
+        self.create_idempotency
+            .lock()
+            .await
+            .iter()
+            .find(|(_, entry)| {
+                entry.sandbox_id == sandbox_id
+                    && matches!(&*entry.state.borrow(), CreateIdempotencyState::Deleting)
+            })
+            .map(|(key, entry)| (key.clone(), Arc::clone(entry)))
+    }
 
 
     /// Stops every known sandbox and tears down in-memory runtime state.
