@@ -57,6 +57,8 @@ impl SnapshotPublishMetadata {
             startup: None,
             resources: SandboxResources::default(),
             runtime_versions: SnapshotRuntimeVersions {
+                kernel_sha256: None,
+                firecracker_sha256: None,
                 kernel_version: "kernel".to_string(),
                 firecracker_version: "firecracker".to_string(),
                 envd_version: "envd".to_string(),
@@ -355,6 +357,8 @@ impl CommittedSnapshot {
             context: CommandContext::default(),
             startup: None,
             runtime_versions: SnapshotRuntimeVersions {
+                kernel_sha256: None,
+                firecracker_sha256: None,
                 kernel_version: "kernel".to_string(),
                 firecracker_version: "firecracker".to_string(),
                 envd_version: "envd".to_string(),

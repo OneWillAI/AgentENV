@@ -58,6 +58,7 @@ Linux kernel image for microVMs.
 | `version` | string | manifest value | Optional kernel version override for auto-download |
 | `url` | string | manifest value | Optional download URL template override with `{version}` placeholder |
 | `image_path` | string | derived from manifest/config version | Explicit path to a local `vmlinux.bin`. Setup skips the kernel download and requires this to be a readable, non-empty regular file |
+| `sha256` | string | unset | Expected kernel SHA-256 (64 lowercase hex characters); explicit, downloaded and cached images are checked during setup, and configured images are checked before cold boot. Unset preserves legacy behavior. |
 
 ## `[tools]`
 
@@ -98,6 +99,12 @@ User-visible rootfs images are selected at the template API layer.
 - full OCI reference: use the supplied image
 - short name: normalize standard Docker Hub forms such as `ubuntu:24.04`
   and `node:20`
+
+## `[template]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `apply_cluster_cpu_config` | boolean | `true` | Apply the scheduler-provided cluster CPU intersection to temporary template-build VMs. Dedicated builders with an incompatible KVM CPU-template interface may disable this with `AENV_TEMPLATE_APPLY_CLUSTER_CPU_CONFIG=false`; ordinary sandbox CPU policy is unchanged. |
 
 ## `[image.resolver]`
 
@@ -544,7 +551,7 @@ The file at the configured default path
 `$AENV_HOME/overlaybd/overlaybd-global.json` is **auto-generated** by the server
 at startup. The generated JSON incorporates several TOML settings —
 `[image.cache].root_dir`, `[image.cache.remote_blocks].max_size_gb`,
-`download_enable`, `[backend.oss]` credentials, and Docker registry credentials
+`download_enable`, `[backend.oss]` authentication, and Docker registry credentials
 detected from `~/.docker/config.json` — into a single overlaybd runtime config
 file.
 

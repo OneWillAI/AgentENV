@@ -715,7 +715,16 @@ impl SandboxBackend for FirecrackerSandbox {
 
 #[async_trait(?Send)]
 impl SandboxExecutor for FirecrackerSandbox {
+    fn runtime_digests(&self) -> (Option<String>, Option<String>) {
+        FirecrackerSandbox::runtime_digests(self)
+    }
 
+    fn runtime_version_inputs(&self) -> Option<(PathBuf, String)> {
+        Some((
+            self.firecracker_binary_path().to_path_buf(),
+            self.tools_drive_version().to_owned(),
+        ))
+    }
 
     fn diagnostic_log_paths(&self) -> Vec<(&'static str, PathBuf)> {
         vec![
@@ -1592,7 +1601,17 @@ impl FirecrackerSandbox {
         &self.launch.common().firecracker_binary
     }
 
+    pub(crate) fn tools_drive_version(&self) -> &str {
+        &self.launch.common().tools_drive_version
+    }
 
+    pub(crate) fn runtime_digests(&self) -> (Option<String>, Option<String>) {
+        let common = self.launch.common();
+        (
+            common.kernel_sha256.clone(),
+            common.firecracker_sha256.clone(),
+        )
+    }
 
     /// Resolve the Firecracker stdout log path for this sandbox.
     pub fn firecracker_stdout_path(&self) -> PathBuf {
