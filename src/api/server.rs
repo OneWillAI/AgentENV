@@ -8,7 +8,7 @@ use axum::{
     Router,
 };
 
-use super::{impls::auth, proxy, ApiImpl};
+use super::{disk_branch, host_interaction, impls::auth, proxy, reboot, ApiImpl};
 use crate::observability::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
@@ -36,6 +36,9 @@ where
     agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
         .route_layer(middleware::from_fn(optional_connect_body))
         .merge(proxy::router(api_impl.clone()))
+        .merge(disk_branch::router(api_impl.clone()))
+        .merge(host_interaction::router(api_impl.clone()))
+        .merge(reboot::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
         .layer(middleware::from_fn_with_state(

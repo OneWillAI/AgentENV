@@ -34,6 +34,7 @@ pub(crate) enum OverlaybdLayerLocation {
 pub(crate) enum RuntimeImageOwner {
     StartingSandbox(SandboxId),
     PausedSandbox(SandboxId),
+    DiskBranch(String),
 }
 
 #[async_trait]
@@ -218,10 +219,11 @@ impl RuntimeImageRefs for ImageCacheStore {
     }
 }
 
-fn owner_namespace(owner: RuntimeImageOwner) -> (HoldNamespace, SandboxId) {
+fn owner_namespace(owner: RuntimeImageOwner) -> (HoldNamespace, String) {
     match owner {
-        RuntimeImageOwner::StartingSandbox(id) => (HoldNamespace::Runtime, id),
-        RuntimeImageOwner::PausedSandbox(id) => (HoldNamespace::Paused, id),
+        RuntimeImageOwner::StartingSandbox(id) => (HoldNamespace::Runtime, id.to_string()),
+        RuntimeImageOwner::PausedSandbox(id) => (HoldNamespace::Paused, id.to_string()),
+        RuntimeImageOwner::DiskBranch(id) => (HoldNamespace::DiskBranch, id),
     }
 }
 

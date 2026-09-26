@@ -1,8 +1,9 @@
 mod launch_plan;
 mod metrics;
-mod persistence;
+pub(crate) mod persistence;
 mod proxy;
 mod service;
+mod state_machine;
 mod store;
 mod types;
 
@@ -11,8 +12,9 @@ use crate::virtualization::VirtualizationMode;
 
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
-    DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
-    SandboxPersistenceError, SandboxPersister,
+    lock_runtime_store, CreateIdempotencyRecord, CreateIdempotencyRecordState,
+    DisabledSandboxPersister, FileBackedSandboxPersister, PausedSandboxQuarantine,
+    PausedSandboxRecoveryReport, PersistenceResult, SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
@@ -21,8 +23,9 @@ pub use store::{
     SandboxTimeoutAction,
 };
 pub use types::{
-    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    CreateSandboxIdempotency, CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource,
+    SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    MAX_CREATE_IDEMPOTENCY_KEY_LEN,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -38,6 +41,7 @@ pub enum SandboxOperation {
     Snapshot,
     SnapshotVolumes,
     Fork,
+    DiskBranch,
     UpdateNetwork,
     PatchCustomExtensionParams,
     Stop,
@@ -69,6 +73,11 @@ pub enum OrchestratorError {
         state: SandboxState,
     },
 
+    #[error(
+        "sandbox {sandbox_id} has an interrupted resume from the current host boot; reboot this worker before retrying"
+    )]
+    SandboxRecoveryRequired { sandbox_id: SandboxId },
+
     #[error("sandbox {sandbox_id} operation {operation:?} failed: {source}")]
     SandboxOperationFailed {
         sandbox_id: SandboxId,
@@ -82,6 +91,12 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         operation: SandboxOperation,
     },
+
+    #[error("idempotency key '{key}' was already used for a different create request")]
+    CreateIdempotencyConflict { key: String },
+
+    #[error("the result for idempotency key '{key}' is no longer available")]
+    CreateIdempotencyResultUnavailable { key: String },
 
     #[error("store operation failed: {0}")]
     StoreOperationFailed(#[source] store::StoreError),

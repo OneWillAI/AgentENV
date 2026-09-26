@@ -5,6 +5,7 @@
 # Downloads: aenv (cli)   -> /usr/local/bin/aenv
 #            buildctl -> /usr/local/bin/aenv-buildctl
 #            server -> /usr/local/bin/server
+#            paused-state recovery utility -> /usr/local/sbin/aenv-paused-recovery (root-only)
 #            dependencies -> /var/lib/aenv/deps
 #            ublk daemon -> /var/lib/aenv/ublk/uvm-ublk-daemon
 #            config  -> /var/lib/aenv/config/config.toml
@@ -30,6 +31,8 @@ fi
 
 REPO="kvcache-ai/AgentENV"
 INSTALL_DIR="/usr/local/bin"
+RECOVERY_INSTALL_DIR="/usr/local/sbin"
+RECOVERY_BINARY_PATH="${RECOVERY_INSTALL_DIR}/aenv-paused-recovery"
 SKIP_SETUP="${SKIP_SETUP:-0}"
 DATA_DIR="${AENV_HOME_PATH:-/var/lib/aenv}"
 CONFIG_PATH="${DATA_DIR}/config/config.toml"
@@ -193,6 +196,7 @@ download_release_asset() {
 }
 
 sudo mkdir -p "$INSTALL_DIR"
+sudo install -d -o root -g root -m 0755 "$RECOVERY_INSTALL_DIR"
 
 # ---------------------------------------------------------------------------
 # 1. Install the aenv CLI
@@ -224,6 +228,11 @@ tar -xzf "$tmp_tarball" -C "$tmp_dir"
 
 sudo mkdir -p "$(dirname "$UBLK_DAEMON_PATH")"
 sudo install -m 0755 "$tmp_dir/server" "${INSTALL_DIR}/server"
+# The recovery utility is intentionally not executable by the AgentENV service
+# account.  It operates on quarantined host state only when a host
+# administrator explicitly invokes it with an absolute persisted-store path.
+sudo install -o root -g root -m 0700 \
+    "$tmp_dir/aenv-paused-recovery" "$RECOVERY_BINARY_PATH"
 sudo install -m 0755 "$tmp_dir/ublk/uvm-ublk-daemon" "$UBLK_DAEMON_PATH"
 
 if [[ -d "$tmp_dir/deps" ]]; then
@@ -364,8 +373,10 @@ EnvironmentFile=${ENV_FILE}
 ExecStart=${INSTALL_DIR}/server
 RuntimeDirectory=aenv
 RuntimeDirectoryMode=0750
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+RuntimeDirectoryPreserve=yes
+Environment=AENV_PRESERVATION_SOCKET=/run/aenv/preservation.sock
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 NoNewPrivileges=true
 UMask=0027
 LimitNOFILE=1048576
@@ -376,7 +387,8 @@ RestartSec=5
 # exiting. The default control-group mode would SIGKILL all Firecracker child
 # processes immediately, losing in-memory sandbox state.
 KillMode=process
-TimeoutStopSec=30
+TimeoutStopSec=infinity
+SendSIGKILL=no
 
 [Install]
 WantedBy=multi-user.target
@@ -394,6 +406,7 @@ echo "Installation complete."
 echo ""
 echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
+echo "  Recovery (root-only): ${RECOVERY_BINARY_PATH}"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
 echo "  API key: ${DATA_DIR}/secrets/api-key (auto-generated when no API key is configured)"

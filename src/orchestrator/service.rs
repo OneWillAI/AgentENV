@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -6,7 +7,8 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
-use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
+use futures::FutureExt;
+use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
@@ -28,12 +30,18 @@ use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
-use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
+use super::persistence::{
+    CreateIdempotencyRecord, CreateIdempotencyRecordState, DisabledSandboxPersister,
+    FileBackedSandboxPersister, SandboxPersistenceError, SandboxPersister,
+};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
+use super::state_machine::{
+    DeleteTransition, FailedLaunchStage, PausePreparation, ResumePreparation,
+};
 use super::store::*;
 use super::types::{
-    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    CreateSandboxIdempotency, CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource,
+    SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -61,48 +69,74 @@ enum DeleteProgress {
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-#[derive(Clone, Debug)]
-enum ShutdownOutcome {
-    Success,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreateIdempotencyState {
+    Creating,
+    Succeeded,
     Failed(String),
+    Deleting,
 }
 
-impl ShutdownOutcome {
-    fn from_result(result: Result<()>) -> Self {
-        match result {
-            Ok(()) => Self::Success,
-            Err(OrchestratorError::InternalError(message)) => Self::Failed(message),
-            Err(err) => Self::Failed(err.to_string()),
-        }
-    }
+#[derive(Debug)]
+struct CreateIdempotencyEntry {
+    sandbox_id: SandboxId,
+    request_fingerprint: String,
+    state: watch::Sender<CreateIdempotencyState>,
+}
 
-    fn as_result(&self) -> Result<()> {
-        match self {
-            Self::Success => Ok(()),
-            Self::Failed(message) => Err(OrchestratorError::InternalError(message.clone())),
+impl CreateIdempotencyEntry {
+    fn durable_record(
+        &self,
+        key: impl Into<String>,
+        state: CreateIdempotencyRecordState,
+    ) -> CreateIdempotencyRecord {
+        CreateIdempotencyRecord {
+            key: key.into(),
+            request_fingerprint: self.request_fingerprint.clone(),
+            sandbox_id: self.sandbox_id,
+            state,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FailedLaunchStage {
-    Registered,
-    TransitionalPersisted,
-    RunningPersisted,
+/// Ensures an unexpected panic/abort cannot leave in-process replays waiting on
+/// `Creating` forever. The durable journal remains `Creating` in that case and
+/// startup converts it to a fail-closed tombstone.
+struct CreateIdempotencyCompletionGuard {
+    entry: Arc<CreateIdempotencyEntry>,
+    armed: bool,
 }
 
-impl FailedLaunchStage {
-    fn rollback_expected_state(self, plan: &LaunchPlan) -> Option<SandboxState> {
-        match self {
-            Self::Registered => None,
-            Self::TransitionalPersisted => Some(plan.transitional_state()),
-            Self::RunningPersisted => Some(SandboxState::Running),
-        }
+impl CreateIdempotencyCompletionGuard {
+    fn new(entry: Arc<CreateIdempotencyEntry>) -> Self {
+        Self { entry, armed: true }
     }
 
-    fn should_detach_proxy_route(self) -> bool {
-        matches!(self, Self::RunningPersisted)
+    fn disarm(&mut self) {
+        self.armed = false;
     }
+}
+
+impl Drop for CreateIdempotencyCompletionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.entry.state.send_if_modified(|state| {
+                if matches!(state, CreateIdempotencyState::Creating) {
+                    *state = CreateIdempotencyState::Failed(
+                        "create operation ended unexpectedly".to_string(),
+                    );
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+}
+
+enum CreateIdempotencyClaim {
+    Owner(Arc<CreateIdempotencyEntry>),
+    Replay(Arc<CreateIdempotencyEntry>),
 }
 
 pub struct Orchestrator<
@@ -124,9 +158,11 @@ pub struct Orchestrator<
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
-    shutdown_outcome: OnceCell<ShutdownOutcome>,
+    shutdown_complete: Mutex<bool>,
+    lifecycle_gate: RwLock<()>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
+    create_idempotency: Mutex<HashMap<String, Arc<CreateIdempotencyEntry>>>,
     volume_manager: Option<Arc<VolumeManager>>,
 }
 
@@ -207,7 +243,14 @@ where
 
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
-        let persisted = persister.load_all(&factory).await?;
+        let mut persisted = persister.load_all(&factory).await?;
+        let durable_create_idempotency = persister.load_create_idempotency_records().await?;
+        let create_idempotency = Self::restore_create_idempotency(
+            &persister,
+            &mut persisted,
+            durable_create_idempotency,
+        )
+        .await?;
         let managed_seed_must_exist = persisted_sandboxes_require_managed_seed(&persisted);
         let access_tokens = tokio::task::spawn_blocking(move || {
             SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
@@ -243,9 +286,11 @@ where
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
-            shutdown_outcome: OnceCell::new(),
+            shutdown_complete: Mutex::new(false),
+            lifecycle_gate: RwLock::new(()),
             image_refs,
             access_tokens,
+            create_idempotency: Mutex::new(create_idempotency),
             volume_manager,
         });
 
@@ -281,6 +326,222 @@ where
         Ok(orchestrator)
     }
 
+    async fn restore_create_idempotency(
+        persister: &P,
+        persisted: &mut Vec<SandboxMetadata>,
+        records: Vec<CreateIdempotencyRecord>,
+    ) -> Result<HashMap<String, Arc<CreateIdempotencyEntry>>> {
+        let mut durable = Self::validate_durable_create_records(records)?;
+        Self::migrate_paused_create_records(persister, persisted, &mut durable).await?;
+        let (deleting_keys, deleting_sandboxes) =
+            Self::reconcile_interrupted_create_records(persister, &mut durable).await?;
+        persisted.retain(|metadata| !deleting_sandboxes.contains(&metadata.id));
+        Ok(Self::restore_create_entries(durable, &deleting_keys))
+    }
+
+    fn validate_durable_create_records(
+        records: Vec<CreateIdempotencyRecord>,
+    ) -> Result<HashMap<String, CreateIdempotencyRecord>> {
+        let mut durable = HashMap::new();
+        for record in records {
+            CreateSandboxIdempotency::new(record.key.clone(), record.request_fingerprint.clone())
+                .map_err(|message| {
+                OrchestratorError::InternalError(format!(
+                    "invalid durable create idempotency record for sandbox {}: {message}",
+                    record.sandbox_id
+                ))
+            })?;
+            let key = record.key.clone();
+            if durable.insert(key.clone(), record).is_some() {
+                return Err(OrchestratorError::InternalError(format!(
+                    "duplicate durable create idempotency key '{key}'"
+                )));
+            }
+        }
+        Ok(durable)
+    }
+
+    async fn migrate_paused_create_records(
+        persister: &P,
+        persisted: &[SandboxMetadata],
+        durable: &mut HashMap<String, CreateIdempotencyRecord>,
+    ) -> Result<()> {
+        let mut paused_keys = HashMap::<String, (SandboxId, String)>::new();
+        for metadata in persisted {
+            Self::migrate_paused_create_record(persister, metadata, &mut paused_keys, durable)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn migrate_paused_create_record(
+        persister: &P,
+        metadata: &SandboxMetadata,
+        paused_keys: &mut HashMap<String, (SandboxId, String)>,
+        durable: &mut HashMap<String, CreateIdempotencyRecord>,
+    ) -> Result<()> {
+        let (key, request_fingerprint) = match (
+            metadata.create_idempotency_key.as_ref(),
+            metadata.create_request_fingerprint.as_ref(),
+        ) {
+            (None, None) => return Ok(()),
+            (Some(key), Some(request_fingerprint)) => (key, request_fingerprint),
+            _ => {
+                return Err(OrchestratorError::InternalError(format!(
+                    "sandbox {} has incomplete create idempotency metadata",
+                    metadata.id
+                )));
+            }
+        };
+        CreateSandboxIdempotency::new(key.clone(), request_fingerprint.clone()).map_err(
+            |message| {
+                OrchestratorError::InternalError(format!(
+                    "sandbox {} has invalid create idempotency metadata: {message}",
+                    metadata.id
+                ))
+            },
+        )?;
+        if let Some((other_id, _)) =
+            paused_keys.insert(key.clone(), (metadata.id, request_fingerprint.clone()))
+        {
+            return Err(OrchestratorError::InternalError(format!(
+                "paused sandboxes {other_id} and {} share create idempotency key '{key}'",
+                metadata.id
+            )));
+        }
+
+        match durable.get_mut(key) {
+            Some(record)
+                if record.sandbox_id != metadata.id
+                    || record.request_fingerprint != *request_fingerprint =>
+            {
+                Err(OrchestratorError::InternalError(format!(
+                    "paused sandbox {} conflicts with durable create idempotency key '{key}'",
+                    metadata.id
+                )))
+            }
+            Some(record) if record.state == CreateIdempotencyRecordState::Creating => {
+                record.state = CreateIdempotencyRecordState::Succeeded;
+                persister.persist_create_idempotency_record(record).await?;
+                Ok(())
+            }
+            Some(record) if record.state == CreateIdempotencyRecordState::Failed => {
+                Err(OrchestratorError::InternalError(format!(
+                    "paused sandbox {} conflicts with failed create idempotency key '{key}'",
+                    metadata.id
+                )))
+            }
+            Some(_) => Ok(()),
+            None => {
+                let record = CreateIdempotencyRecord {
+                    key: key.clone(),
+                    request_fingerprint: request_fingerprint.clone(),
+                    sandbox_id: metadata.id,
+                    state: CreateIdempotencyRecordState::Succeeded,
+                };
+                persister.persist_create_idempotency_record(&record).await?;
+                durable.insert(key.clone(), record);
+                Ok(())
+            }
+        }
+    }
+
+    async fn reconcile_interrupted_create_records(
+        persister: &P,
+        durable: &mut HashMap<String, CreateIdempotencyRecord>,
+    ) -> Result<(HashSet<String>, HashSet<SandboxId>)> {
+        let mut deleting_keys = HashSet::new();
+        let mut deleting_sandboxes = HashSet::new();
+        for (key, record) in durable.iter_mut() {
+            if Self::reconcile_interrupted_create_record(persister, key, record).await? {
+                deleting_keys.insert(key.clone());
+                deleting_sandboxes.insert(record.sandbox_id);
+            }
+        }
+        Ok((deleting_keys, deleting_sandboxes))
+    }
+
+    async fn reconcile_interrupted_create_record(
+        persister: &P,
+        key: &str,
+        record: &mut CreateIdempotencyRecord,
+    ) -> Result<bool> {
+        match record.state {
+            CreateIdempotencyRecordState::Deleting => {
+                match persister
+                    .delete_record_and_artifacts(&record.sandbox_id)
+                    .await
+                {
+                    Ok(()) => {
+                        persister.delete_create_idempotency_record(key).await?;
+                        Ok(true)
+                    }
+                    Err(error) if error.requires_explicit_purge() => {
+                        warn!(
+                            sandbox_id = %record.sandbox_id,
+                            error = %error,
+                            "paused sandbox delete at startup left artifacts in host-local quarantine; releasing the create key"
+                        );
+                        persister.delete_create_idempotency_record(key).await?;
+                        Ok(true)
+                    }
+                    Err(error) => {
+                        warn!(
+                            sandbox_id = %record.sandbox_id,
+                            error = %error,
+                            "paused sandbox delete at startup could not finish; retaining a failed create-key tombstone"
+                        );
+                        record.state = CreateIdempotencyRecordState::Failed;
+                        persister.persist_create_idempotency_record(record).await?;
+                        Ok(false)
+                    }
+                }
+            }
+            CreateIdempotencyRecordState::Creating => {
+                record.state = CreateIdempotencyRecordState::Failed;
+                persister.persist_create_idempotency_record(record).await?;
+                Ok(false)
+            }
+            CreateIdempotencyRecordState::Succeeded | CreateIdempotencyRecordState::Failed => {
+                Ok(false)
+            }
+        }
+    }
+
+    fn restore_create_entries(
+        durable: HashMap<String, CreateIdempotencyRecord>,
+        deleting_keys: &HashSet<String>,
+    ) -> HashMap<String, Arc<CreateIdempotencyEntry>> {
+        let mut entries = HashMap::new();
+        for (key, record) in durable {
+            if deleting_keys.contains(&key) {
+                continue;
+            }
+            let restored_state = match record.state {
+                CreateIdempotencyRecordState::Creating => unreachable!(
+                    "interrupted creating records are converted to failed before restoration"
+                ),
+                CreateIdempotencyRecordState::Succeeded => CreateIdempotencyState::Succeeded,
+                CreateIdempotencyRecordState::Failed => CreateIdempotencyState::Failed(
+                    "previous create outcome is unavailable after restart".to_string(),
+                ),
+                CreateIdempotencyRecordState::Deleting => {
+                    unreachable!("deleting records are reconciled before restoration")
+                }
+            };
+            let (state, _) = watch::channel(restored_state);
+            entries.insert(
+                key,
+                Arc::new(CreateIdempotencyEntry {
+                    sandbox_id: record.sandbox_id,
+                    request_fingerprint: record.request_fingerprint,
+                    state,
+                }),
+            );
+        }
+        entries
+    }
+
     async fn run_cancellation_safe<T>(
         self: &Arc<Self>,
         operation: &'static str,
@@ -291,8 +552,23 @@ where
         T: Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
+        let this = Arc::clone(self);
         tokio::spawn(async move {
-            let result = future.await;
+            let guard = this.lifecycle_gate.read().await;
+            let result = match this.ensure_accepting_lifecycle_operations() {
+                Ok(()) => future.await,
+                Err(error) => {
+                    if operation == "create" {
+                        this.counters.record_create_fail(1);
+                    }
+                    Err(error)
+                }
+            };
+            drop(guard);
+            if matches!(operation, "pause" | "reboot" | "evict") && result.is_ok() {
+                let _exclusive = this.lifecycle_gate.write().await;
+                this.collect_checkpoints().await;
+            }
             if tx.send(result).is_err() {
                 debug!(
                     sandbox_id = %sandbox_id,
@@ -421,10 +697,27 @@ where
         self: &Arc<Self>,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
+        self.create_sandbox_with_volume_reservation(request, None)
+            .await
+    }
+
+    /// Claim volume ownership before any backend can open the mounted disks.
+    /// API cancellation cannot interrupt this handoff or the supervised launch.
+    pub(crate) async fn create_sandbox_with_volume_reservation(
+        self: &Arc<Self>,
+        request: CreateSandboxRequest,
+        pending_volume_owner: Option<String>,
+    ) -> Result<SandboxMetadata> {
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request, false).await
+            if request.idempotency.is_some() {
+                this.create_idempotent_sandbox(sandbox_id, request, pending_volume_owner)
+                    .await
+            } else {
+                this.create_sandbox_inner(sandbox_id, request, false, pending_volume_owner)
+                    .await
+            }
         })
         .await
     }
@@ -436,9 +729,219 @@ where
     ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("create_builder", build_id, async move {
-            this.create_sandbox_inner(build_id, request, true).await
+            this.create_sandbox_inner(build_id, request, true, None)
+                .await
         })
         .await
+    }
+
+    /// Supervise the entire idempotent operation, including the first durable
+    /// claim write and its publication in memory. The caller only waits on the
+    /// outer oneshot, so cancellation cannot detach an in-flight RocksDB write
+    /// from the claim that owns it.
+    async fn create_idempotent_sandbox(
+        self: Arc<Self>,
+        candidate_sandbox_id: SandboxId,
+        request: CreateSandboxRequest,
+        pending_volume_owner: Option<String>,
+    ) -> Result<SandboxMetadata> {
+        let idempotency = request
+            .idempotency
+            .clone()
+            .expect("idempotent create supervisor requires idempotency");
+        match self
+            .claim_create_idempotency(&idempotency, candidate_sandbox_id)
+            .await?
+        {
+            CreateIdempotencyClaim::Replay(entry) => {
+                self.replay_idempotent_create(idempotency.key(), entry)
+                    .await
+            }
+            CreateIdempotencyClaim::Owner(entry) => {
+                let sandbox_id = entry.sandbox_id;
+                let key = idempotency.key().to_string();
+                let mut completion_guard =
+                    CreateIdempotencyCompletionGuard::new(Arc::clone(&entry));
+                let result = match AssertUnwindSafe(Arc::clone(&self).create_sandbox_inner(
+                    sandbox_id,
+                    request,
+                    false,
+                    pending_volume_owner,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let message = payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic payload".to_string());
+                        Err(OrchestratorError::InternalError(format!(
+                            "idempotent create panicked: {message}"
+                        )))
+                    }
+                };
+                let result = self.finish_idempotent_create(&key, &entry, result).await;
+                completion_guard.disarm();
+                result
+            }
+        }
+    }
+
+    /// Return or join an existing create claim without allocating a new one.
+    /// API handlers use this before mutable template/image resolution so a
+    /// successful replay cannot be invalidated by later source changes.
+    pub async fn replay_create_if_present(
+        &self,
+        idempotency: &CreateSandboxIdempotency,
+    ) -> Result<Option<SandboxMetadata>> {
+        let entry = {
+            let entries = self.create_idempotency.lock().await;
+            let Some(entry) = entries.get(idempotency.key()) else {
+                return Ok(None);
+            };
+            if entry.request_fingerprint != idempotency.request_fingerprint() {
+                return Err(OrchestratorError::CreateIdempotencyConflict {
+                    key: idempotency.key().to_string(),
+                });
+            }
+            Arc::clone(entry)
+        };
+        self.replay_idempotent_create(idempotency.key(), entry)
+            .await
+            .map(Some)
+    }
+
+    async fn claim_create_idempotency(
+        &self,
+        idempotency: &CreateSandboxIdempotency,
+        candidate_sandbox_id: SandboxId,
+    ) -> Result<CreateIdempotencyClaim> {
+        let mut entries = self.create_idempotency.lock().await;
+        if let Some(entry) = entries.get(idempotency.key()) {
+            if entry.request_fingerprint != idempotency.request_fingerprint() {
+                return Err(OrchestratorError::CreateIdempotencyConflict {
+                    key: idempotency.key().to_string(),
+                });
+            }
+            return Ok(CreateIdempotencyClaim::Replay(Arc::clone(entry)));
+        }
+
+        let (state, _) = watch::channel(CreateIdempotencyState::Creating);
+        let entry = Arc::new(CreateIdempotencyEntry {
+            sandbox_id: candidate_sandbox_id,
+            request_fingerprint: idempotency.request_fingerprint().to_string(),
+            state,
+        });
+        self.persister
+            .persist_create_idempotency_record(
+                &entry.durable_record(idempotency.key(), CreateIdempotencyRecordState::Creating),
+            )
+            .await?;
+        entries.insert(idempotency.key().to_string(), Arc::clone(&entry));
+        Ok(CreateIdempotencyClaim::Owner(entry))
+    }
+
+    async fn replay_idempotent_create(
+        &self,
+        key: &str,
+        entry: Arc<CreateIdempotencyEntry>,
+    ) -> Result<SandboxMetadata> {
+        let mut state = entry.state.subscribe();
+        loop {
+            let current = state.borrow_and_update().clone();
+            match current {
+                CreateIdempotencyState::Creating => {
+                    state.changed().await.map_err(|_| {
+                        OrchestratorError::InternalError(format!(
+                            "idempotent create state closed before completion for key '{key}'"
+                        ))
+                    })?;
+                }
+                CreateIdempotencyState::Succeeded => {
+                    return self.store.get(&entry.sandbox_id).await?.ok_or_else(|| {
+                        OrchestratorError::CreateIdempotencyResultUnavailable {
+                            key: key.to_string(),
+                        }
+                    });
+                }
+                CreateIdempotencyState::Failed(message) => {
+                    return Err(OrchestratorError::InternalError(format!(
+                        "idempotent create for key '{key}' failed: {message}"
+                    )));
+                }
+                CreateIdempotencyState::Deleting => {
+                    return Err(OrchestratorError::CreateIdempotencyResultUnavailable {
+                        key: key.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn finish_idempotent_create(
+        &self,
+        key: &str,
+        entry: &Arc<CreateIdempotencyEntry>,
+        result: Result<SandboxMetadata>,
+    ) -> Result<SandboxMetadata> {
+        // Serialize owner completion with deletion and any later claim. A
+        // delete may observe Running metadata just before this function; once
+        // it marks the entry Deleting, this owner must never overwrite that
+        // journal phase with Succeeded or Failed.
+        let entries = self.create_idempotency.lock().await;
+        let current = entries.get(key);
+        if !current.is_some_and(|current| Arc::ptr_eq(current, entry))
+            || !matches!(&*entry.state.borrow(), CreateIdempotencyState::Creating)
+        {
+            return match result {
+                Ok(_) => Err(OrchestratorError::CreateIdempotencyResultUnavailable {
+                    key: key.to_string(),
+                }),
+                Err(err) => Err(err),
+            };
+        }
+
+        match result {
+            Ok(metadata) => {
+                if let Err(err) = self
+                    .persister
+                    .persist_create_idempotency_record(
+                        &entry.durable_record(key, CreateIdempotencyRecordState::Succeeded),
+                    )
+                    .await
+                {
+                    let message = format!("failed to persist successful create result: {err}");
+                    let _ = entry
+                        .state
+                        .send_replace(CreateIdempotencyState::Failed(message));
+                    // The durable Creating record and in-memory Failed state are
+                    // both fail-closed; never return an unjournaled success.
+                    return Err(OrchestratorError::from(err));
+                }
+                let _ = entry.state.send_replace(CreateIdempotencyState::Succeeded);
+                Ok(metadata)
+            }
+            Err(err) => {
+                if let Err(persist_err) = self
+                    .persister
+                    .persist_create_idempotency_record(
+                        &entry.durable_record(key, CreateIdempotencyRecordState::Failed),
+                    )
+                    .await
+                {
+                    // The original durable Creating record remains a safe
+                    // tombstone and startup converts it to Failed.
+                    warn!(error = ?persist_err, "failed to persist create failure tombstone");
+                }
+                let _ = entry
+                    .state
+                    .send_replace(CreateIdempotencyState::Failed(err.to_string()));
+                Err(err)
+            }
+        }
     }
 
     #[tracing::instrument(
@@ -451,6 +954,7 @@ where
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
         template_builder: bool,
+        pending_volume_owner: Option<String>,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
             self.counters.record_create_fail(1);
@@ -467,10 +971,15 @@ where
             network_policy,
             custom_extension_params,
             secure,
+            idempotency,
             volume_mounts,
             extra_drives: launch_extra_drives,
             extra_drives_in_snapshot,
         } = request;
+        let create_idempotency_key = idempotency.as_ref().map(|value| value.key().to_string());
+        let create_request_fingerprint = idempotency
+            .as_ref()
+            .map(|value| value.request_fingerprint().to_string());
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
 
@@ -525,6 +1034,8 @@ where
                     timeout_action,
                     auto_resume,
                     user_metadata,
+                    create_idempotency_key,
+                    create_request_fingerprint,
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
                     volume_mounts: volume_mounts.clone(),
@@ -532,13 +1043,16 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_from_snapshot(
-                    sandbox_id,
-                    snapshot,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
+                self.launch_sandbox_with_volume_reservation(
+                    LaunchPlan::for_create_from_snapshot(
+                        sandbox_id,
+                        snapshot,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ),
+                    pending_volume_owner.as_deref(),
+                )
                 .await
             }
             SandboxLaunchSource::Image {
@@ -590,6 +1104,8 @@ where
                     timeout_action,
                     auto_resume,
                     user_metadata,
+                    create_idempotency_key,
+                    create_request_fingerprint,
                     network_policy,
                     custom_extension_params,
                     volume_mounts,
@@ -597,13 +1113,16 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_fresh(
-                    sandbox_id,
-                    build_spec,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
+                self.launch_sandbox_with_volume_reservation(
+                    LaunchPlan::for_create_fresh(
+                        sandbox_id,
+                        build_spec,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ),
+                    pending_volume_owner.as_deref(),
+                )
                 .await
             }
         };
@@ -666,6 +1185,90 @@ where
         .await
     }
 
+    /// Copy a running sandbox's writable disk without cloning RAM or processes.
+    pub async fn branch_sandbox_disk(
+        self: &Arc<Self>,
+        source_sandbox_id: SandboxId,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("disk-branch", source_sandbox_id, async move {
+            this.branch_sandbox_disk_inner(source_sandbox_id, idempotency_key)
+                .await
+        })
+        .await
+    }
+
+    async fn branch_sandbox_disk_inner(
+        self: Arc<Self>,
+        source_sandbox_id: SandboxId,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
+        self.ensure_accepting_lifecycle_operations()?;
+        let metadata = self
+            .store
+            .get(&source_sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id: source_sandbox_id,
+                state: metadata.state,
+            });
+        }
+        let handle = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&source_sandbox_id).cloned()
+        }
+        .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        let mut sandbox = handle.lock().await;
+        let branch = crate::disk_branch::Publication::acquire(
+            crate::disk_branch::root(ConfigManager::global_config()),
+            crate::disk_branch::identity(source_sandbox_id, idempotency_key.as_deref()),
+        )
+        .await?;
+        if let Some(image) = branch.replay()? {
+            let path = image
+                .strip_prefix("overlaybd-config:")
+                .expect("validated replay");
+            self.protect_image_refs(
+                RuntimeImageOwner::DiskBranch(branch.id.clone()),
+                RuntimeArtifactSet::from_overlaybd_image_configs(vec![path.into()]),
+                "disk-branch replay",
+            )
+            .await?;
+            return Ok(image);
+        }
+        // Recheck after taking the lifecycle lock; pause/delete may have won it.
+        let current = self
+            .store
+            .get(&source_sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        if current.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id: source_sandbox_id,
+                state: current.state,
+            });
+        }
+        branch.prepare()?;
+        let image_config = sandbox
+            .branch_disk(&branch.directory)
+            .await
+            .map_err(|source| OrchestratorError::SandboxOperationFailed {
+                sandbox_id: source_sandbox_id,
+                operation: SandboxOperation::DiskBranch,
+                source,
+            })?;
+        self.protect_image_refs(
+            RuntimeImageOwner::DiskBranch(branch.id.clone()),
+            RuntimeArtifactSet::from_overlaybd_image_configs(vec![image_config.clone()]),
+            "disk-branch publication",
+        )
+        .await?;
+        Ok(branch.commit(&image_config)?)
+    }
+
     #[tracing::instrument(
         name = "fork_sandbox",
         skip(self, child_specs),
@@ -709,16 +1312,7 @@ where
                 metadata.state = SandboxState::Forking
             })
             .await
-            .map_err(|err| match err {
-                StoreError::StateConflict { actual_state, .. } => match actual_state {
-                    SandboxState::Killing => OrchestratorError::SandboxNotFound(source_sandbox_id),
-                    _ => OrchestratorError::InvalidSandboxState {
-                        sandbox_id: source_sandbox_id,
-                        state: actual_state,
-                    },
-                },
-                err => OrchestratorError::from(err),
-            })?
+            .map_err(|error| Self::fork_state_error(source_sandbox_id, error))?
             .previous;
 
         let backend_specs = child_specs
@@ -745,14 +1339,12 @@ where
                 warn!(error = ?err, "failed to fork sandbox");
                 self.counters.record_create_fail(u64::from(count));
                 if err.is_terminal() {
-                    self.detach_sandbox_handle_and_route(&source_sandbox_id)
-                        .await;
-                    let _ = {
-                        let mut sandbox = source_handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    self.finalize_terminal_volumes(&source_metadata).await;
-                    self.store.remove(&source_sandbox_id).await?;
+                    self.cleanup_terminal_runtime(
+                        source_sandbox_id,
+                        &source_handle,
+                        SandboxState::Forking,
+                    )
+                    .await?;
                 } else {
                     let _ = self
                         .store
@@ -804,6 +1396,12 @@ where
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
             metadata.paused_state = None;
+            // A fork is a distinct runtime, not the result of the source's
+            // create operation. Carrying these fields into the child would
+            // create duplicate durable keys after pause/restart.
+            metadata.create_idempotency_key = None;
+            metadata.create_request_fingerprint = None;
+            metadata.paused_runtime_stopped = false;
             metadata.volume_mounts = child.volume_mounts;
             metadata.update_timeout(new_timeout);
 
@@ -845,6 +1443,19 @@ where
         self.counters
             .record_create_fail(u64::from(count) - successes);
         Ok(outcomes)
+    }
+
+    fn fork_state_error(source_sandbox_id: SandboxId, error: StoreError) -> OrchestratorError {
+        match error {
+            StoreError::StateConflict { actual_state, .. } => match actual_state {
+                SandboxState::Killing => OrchestratorError::SandboxNotFound(source_sandbox_id),
+                _ => OrchestratorError::InvalidSandboxState {
+                    sandbox_id: source_sandbox_id,
+                    state: actual_state,
+                },
+            },
+            error => OrchestratorError::from(error),
+        }
     }
 
     fn fork_child_error(sandbox_id: SandboxId, source: anyhow::Error) -> OrchestratorError {
@@ -949,6 +1560,11 @@ where
                 ProxyLookupResult::NotFound
             }
             Some(metadata) if metadata.state == SandboxState::Running => {
+                // Launch may have published its route between our first lookup
+                // and the metadata read. Running is published after the route.
+                if let Some(route) = self.proxy_routes.read().await.route(sandbox_id) {
+                    return Ok(ProxyLookupResult::Ready(route.target().clone()));
+                }
                 warn!("running sandbox is missing a runtime proxy route");
                 ProxyLookupResult::RouteMissing
             }
@@ -1085,20 +1701,21 @@ where
     async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("deleting sandbox");
         let deletion = self.deletion_progress(sandbox_id).await;
-        let mut progress = deletion.lock().await;
-        match *progress {
-            DeleteProgress::Done => return Ok(()),
-            DeleteProgress::Capture => {}
-            _ => {
-                return self
-                    .delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress)
-                    .await
+        loop {
+            let mut progress = deletion.lock().await;
+            match *progress {
+                DeleteProgress::Done => return Ok(()),
+                DeleteProgress::Capture => {}
+                _ => {
+                    return self
+                        .delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress)
+                        .await
+                }
             }
-        }
-
-        // Attempt to transition to Killing, retrying after waiting whenever we
-        // find the sandbox in a transitional state.
-        let previous_state = loop {
+            if self.finish_retried_delete_if_needed(sandbox_id).await? {
+                *progress = DeleteProgress::Done;
+                return Ok(());
+            }
             match self
                 .store
                 .update_state_if_state(
@@ -1108,72 +1725,46 @@ where
                 )
                 .await
             {
-                Ok(previous_state) => break previous_state,
-                Err(StoreError::StateConflict { actual_state, .. }) => match actual_state {
-                    SandboxState::Killing => {
-                        debug!("sandbox already in killing state, waiting for delete to finish");
-                        match self
-                            .wait_for_transition(sandbox_id, SandboxState::Killing)
-                            .await
-                        {
-                            Ok(_) => {
-                                // The in-flight delete rolled back to a stable state.
-                                // Retry the Killing CAS rather than letting multiple
-                                // deleters run concurrently.
-                                continue;
-                            }
-                            Err(OrchestratorError::SandboxNotFound(_)) => {
-                                info!("sandbox was deleted by a concurrent delete");
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    SandboxState::Creating
-                    | SandboxState::Snapshotting
-                    | SandboxState::Forking
-                    | SandboxState::Pausing
-                    | SandboxState::Resuming => {
-                        // An in-progress operation is currently holding the sandbox in this
-                        // transitional state.  Wait for it to finish so our Killing transition
-                        // doesn't race with the final state write from that operation.
-                        debug!(
-                            state = ?actual_state,
-                            "sandbox in transitional state, waiting before deletion"
-                        );
-                        match self.wait_for_transition(sandbox_id, actual_state).await {
-                            Ok(_) => {
-                                // Transition finished; retry the Killing CAS.
-                                continue;
-                            }
-                            Err(OrchestratorError::SandboxNotFound(_)) => {
-                                // Sandbox was removed while we waited (e.g. by
-                                // another concurrent delete).
-                                info!("sandbox was deleted while waiting for transitional state");
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    _ => {
-                        return Err(OrchestratorError::from(StoreError::StateConflict {
-                            sandbox_id,
-                            expected_states: vec![SandboxState::Running, SandboxState::Paused],
-                            actual_state,
-                        }));
-                    }
-                },
-                Err(err) => {
-                    if matches!(err, StoreError::SandboxNotFound { .. }) {
-                        self.deletions.lock().await.remove(&sandbox_id);
-                    }
-                    return Err(OrchestratorError::from(err));
+                Ok(previous_state) => {
+                    return self
+                        .delete_sandbox_impl(sandbox_id, previous_state, &mut progress)
+                        .await
                 }
+                Err(StoreError::StateConflict { actual_state, .. }) => {
+                    // A failed capture/launch may need this same mutex to
+                    // publish its retained-stop phase. Never hold it while
+                    // waiting for that lifecycle operation to finish.
+                    drop(progress);
+                    match self
+                        .resolve_delete_state_conflict(sandbox_id, actual_state)
+                        .await?
+                    {
+                        DeleteTransition::Retry => continue,
+                        DeleteTransition::Complete => return Ok(()),
+                    }
+                }
+                Err(error) => return Err(OrchestratorError::from(error)),
             }
-        };
+        }
+    }
 
-        self.delete_sandbox_impl(sandbox_id, previous_state, &mut progress)
-            .await
+    async fn finish_retried_delete_if_needed(&self, sandbox_id: SandboxId) -> Result<bool> {
+        match self.store.get(&sandbox_id).await? {
+            Some(metadata) if metadata.resume_recovery_pending => {
+                Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id })
+            }
+            Some(_) => Ok(false),
+            None => {
+                let Some((key, entry)) = self.deleting_create_for_sandbox(sandbox_id).await else {
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+                };
+                self.finish_durable_sandbox_delete(&key, &entry).await?;
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                info!("sandbox delete cleanup completed");
+                Ok(true)
+            }
+        }
     }
 
     async fn claim_expired_running_sandbox(
@@ -1225,12 +1816,30 @@ where
         let optional_cache = metadata
             .as_ref()
             .is_some_and(|record| record.template_builder);
+        let stopped = metadata
+            .as_ref()
+            .is_some_and(|record| record.paused_runtime_stopped && !record.resume_recovery_pending);
         let volume_ids = metadata
             .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
         let mut capture_error = None;
 
+        if matches!(progress, DeleteProgress::Capture) && handle.is_none() && !stopped {
+            // Refuse before publication or owner changes. A missing handle is
+            // not evidence that its runtime stopped, and must not strand the
+            // original record in a deletion phase that cannot safely advance.
+            self.rollback_delete_state(sandbox_id, previous_state)
+                .await?;
+            self.restore_proxy_route(sandbox_id, removed_route).await;
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Stop,
+                source: anyhow::anyhow!(
+                    "runtime handle is missing and durable runtime stop proof is unavailable"
+                ),
+            });
+        }
         if matches!(progress, DeleteProgress::Capture) {
             let mut volumes_frozen = false;
             let capture_result: std::result::Result<(), SandboxCaptureError> = async {
@@ -1285,29 +1894,39 @@ where
             };
         }
 
-        let cleanup: anyhow::Result<()> = async {
-            if let DeleteProgress::Stop { capture_failed } = *progress {
-                if let Some(handle) = handle.as_ref() {
-                    handle.lock().await.stop().await?;
-                }
-                *progress = DeleteProgress::Release { capture_failed };
-            }
-            if let DeleteProgress::Release { capture_failed } = *progress {
-                if let Some(manager) = self.volume_manager.as_ref() {
-                    let owner = sandbox_id.to_string();
-                    // An incomplete restack may leave image.json pointing at old
-                    // layers. Never publish that backing as a successful capture.
-                    if capture_failed {
-                        manager.fail_backings(&owner, &volume_ids).await?;
+        let cleanup: anyhow::Result<()> =
+            async {
+                if let DeleteProgress::Stop { capture_failed } = *progress {
+                    if let Some(handle) = handle.as_ref() {
+                        handle.lock().await.stop().await?;
+                    } else {
+                        let metadata = self
+                            .store
+                            .get(&sandbox_id)
+                            .await?
+                            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                        anyhow::ensure!(metadata.paused_runtime_stopped,
+                        "runtime handle is missing and durable runtime stop proof is unavailable");
+                        Self::require_resume_recovery_resolved(&metadata)?;
                     }
-                    manager.replace_owner_for(&owner, None, &volume_ids).await?;
+                    *progress = DeleteProgress::Release { capture_failed };
                 }
-                self.remove_deleted_sandbox(sandbox_id).await?;
-                *progress = DeleteProgress::Done;
+                if let DeleteProgress::Release { capture_failed } = *progress {
+                    if let Some(manager) = self.volume_manager.as_ref() {
+                        let owner = sandbox_id.to_string();
+                        // An incomplete restack may leave image.json pointing at old
+                        // layers. Never publish that backing as a successful capture.
+                        if capture_failed {
+                            manager.fail_backings(&owner, &volume_ids).await?;
+                        }
+                        manager.replace_owner_for(&owner, None, &volume_ids).await?;
+                    }
+                    self.remove_deleted_sandbox(sandbox_id).await?;
+                    *progress = DeleteProgress::Done;
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
+            .await;
         if let Err(error) = cleanup {
             if matches!(progress, DeleteProgress::Stop { .. }) {
                 if let Some(handle) = handle {
@@ -1332,55 +1951,233 @@ where
     }
 
     async fn remove_deleted_sandbox(&self, sandbox_id: SandboxId) -> Result<()> {
-        let metadata = self.store.remove(&sandbox_id).await?;
-        if let Some(metadata) = metadata {
+        let metadata = self.store.get(&sandbox_id).await?;
+        let entry = match metadata.as_ref() {
+            Some(metadata) => {
+                self.idempotent_delete_entry(metadata, SandboxState::Killing)
+                    .await?
+            }
+            None => self.deleting_create_for_sandbox(sandbox_id).await,
+        };
+        self.mark_create_entry_deleting(sandbox_id, entry.as_ref())
+            .await?;
+        // Keep metadata until non-idempotent deletion succeeds too: its presence
+        // permits a retry after a durable artifact deletion failure.
+        self.finish_sandbox_delete(sandbox_id, entry.as_ref())
+            .await?;
+        self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+            .await;
+        self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
+            .await;
+        self.deletions.lock().await.remove(&sandbox_id);
+        Ok(())
+    }
+
+    async fn remove_deleted_metadata(&self, sandbox_id: SandboxId) -> Result<()> {
+        if let Some(metadata) = self.store.remove(&sandbox_id).await? {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
                 metadata.id,
                 metadata.resources,
             );
         }
-        if let Err(err) = self
-            .persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-        {
-            warn!(error = ?err, "failed to delete persisted sandbox state");
-        }
-        self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-            .await;
-        self.deletions.lock().await.remove(&sandbox_id);
-        info!("sandbox deleted");
-
         Ok(())
     }
 
-    /// Stops every known sandbox and tears down in-memory runtime state.
-    ///
-    /// This is single-flight: the first caller performs cleanup and subsequent
-    /// callers wait for the same outcome rather than starting duplicate work.
-    ///
-    /// Cleanup itself is still best-effort: the executor keeps attempting
-    /// remaining sandboxes even if individual deletions fail, then returns an
-    /// error if any sandbox could not be cleaned up after several passes.
-    #[tracing::instrument(skip(self))]
-    pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
-        let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);
-        let _ = self.shutdown_tx.send_replace(true);
-
-        if !was_already_shutting_down {
-            info!("orchestrator shutdown requested; stopping all sandboxes");
+    async fn resolve_delete_state_conflict(
+        &self,
+        sandbox_id: SandboxId,
+        actual_state: SandboxState,
+    ) -> Result<DeleteTransition> {
+        if actual_state == SandboxState::Killing {
+            debug!("sandbox already in killing state, waiting for delete to finish");
+        } else if matches!(
+            actual_state,
+            SandboxState::Creating
+                | SandboxState::Snapshotting
+                | SandboxState::Forking
+                | SandboxState::Pausing
+                | SandboxState::Resuming
+        ) {
+            debug!(state = ?actual_state, "sandbox in transitional state, waiting before deletion");
+        } else {
+            return Err(OrchestratorError::from(StoreError::StateConflict {
+                sandbox_id,
+                expected_states: vec![SandboxState::Running, SandboxState::Paused],
+                actual_state,
+            }));
         }
 
-        let this = Arc::clone(self);
-        let outcome = self
-            .shutdown_outcome
-            .get_or_init(|| async move {
-                ShutdownOutcome::from_result(this.run_shutdown_cleanup().await)
-            })
-            .await;
+        match self.wait_for_transition(sandbox_id, actual_state).await {
+            Ok(_) => Ok(DeleteTransition::Retry),
+            Err(OrchestratorError::SandboxNotFound(_)) => {
+                self.finish_concurrent_delete(sandbox_id).await?;
+                info!("sandbox was deleted while waiting for another lifecycle operation");
+                Ok(DeleteTransition::Complete)
+            }
+            Err(error) => Err(error),
+        }
+    }
 
-        outcome.as_result()
+    async fn finish_concurrent_delete(&self, sandbox_id: SandboxId) -> Result<()> {
+        if let Some((key, entry)) = self.deleting_create_for_sandbox(sandbox_id).await {
+            self.finish_durable_sandbox_delete(&key, &entry).await?;
+            self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn idempotent_delete_entry(
+        &self,
+        metadata: &SandboxMetadata,
+        previous_state: SandboxState,
+    ) -> Result<Option<(String, Arc<CreateIdempotencyEntry>)>> {
+        let Some(key) = metadata.create_idempotency_key.as_ref() else {
+            return Ok(None);
+        };
+        let entry = self.create_idempotency.lock().await.get(key).cloned();
+        let Some(entry) = entry else {
+            self.rollback_delete_state(metadata.id, previous_state)
+                .await?;
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {} is missing create idempotency entry '{key}'",
+                metadata.id
+            )));
+        };
+        if entry.sandbox_id != metadata.id {
+            self.rollback_delete_state(metadata.id, previous_state)
+                .await?;
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {} create idempotency entry '{key}' points to {}",
+                metadata.id, entry.sandbox_id
+            )));
+        }
+        Ok(Some((key.clone(), entry)))
+    }
+
+    async fn rollback_delete_state(
+        &self,
+        sandbox_id: SandboxId,
+        previous_state: SandboxState,
+    ) -> Result<()> {
+        self.store
+            .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_create_entry_deleting(
+        &self,
+        sandbox_id: SandboxId,
+        idempotent_delete: Option<&(String, Arc<CreateIdempotencyEntry>)>,
+    ) -> Result<()> {
+        let Some((key, entry)) = idempotent_delete else {
+            return Ok(());
+        };
+        let entries = self.create_idempotency.lock().await;
+        if !entries
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {sandbox_id} create idempotency entry '{key}' changed during delete"
+            )));
+        }
+        let _ = entry.state.send_replace(CreateIdempotencyState::Deleting);
+        Ok(())
+    }
+
+    async fn finish_sandbox_delete(
+        &self,
+        sandbox_id: SandboxId,
+        idempotent_delete: Option<&(String, Arc<CreateIdempotencyEntry>)>,
+    ) -> Result<()> {
+        if let Some((key, entry)) = idempotent_delete {
+            self.finish_durable_sandbox_delete(key, entry).await
+        } else {
+            self.persister
+                .delete_record_and_artifacts(&sandbox_id)
+                .await?;
+            self.remove_deleted_metadata(sandbox_id).await?;
+            Ok(())
+        }
+    }
+
+    async fn deleting_create_for_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<(String, Arc<CreateIdempotencyEntry>)> {
+        self.create_idempotency
+            .lock()
+            .await
+            .iter()
+            .find(|(_, entry)| {
+                entry.sandbox_id == sandbox_id
+                    && matches!(&*entry.state.borrow(), CreateIdempotencyState::Deleting)
+            })
+            .map(|(key, entry)| (key.clone(), Arc::clone(entry)))
+    }
+
+    async fn finish_durable_sandbox_delete(
+        &self,
+        key: &str,
+        entry: &Arc<CreateIdempotencyEntry>,
+    ) -> Result<()> {
+        // Serialize the complete release transition with claims and other
+        // delete finishers. Without this lock, a stale concurrent finisher
+        // could delete a newly claimed journal record after the first finisher
+        // releases the key.
+        let mut entries = self.create_idempotency.lock().await;
+        let Some(current) = entries.get(key) else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(current, entry) {
+            return Ok(());
+        }
+
+        // Sync the phase marker before touching the paused record. Startup only
+        // treats Deleting as proof of runtime absence because callers reach this
+        // helper after stop succeeds.
+        self.persister
+            .persist_create_idempotency_record(
+                &entry.durable_record(key, CreateIdempotencyRecordState::Deleting),
+            )
+            .await?;
+        self.persister
+            .delete_record_and_artifacts(&entry.sandbox_id)
+            .await?;
+        // Keep the durable tombstone and key reservation until metadata removal
+        // succeeds. A store failure must remain retryable with the same entry.
+        self.remove_deleted_metadata(entry.sandbox_id).await?;
+        self.persister.delete_create_idempotency_record(key).await?;
+        entries.remove(key);
+        Ok(())
+    }
+
+    /// Preserve guests before allowing process exit. Successful preparation is
+    /// latched; a failed attempt keeps the API and background tasks available
+    /// and can be retried after the operator resolves the failure.
+    #[tracing::instrument(skip(self))]
+    pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
+        let mut complete = self.shutdown_complete.lock().await;
+        if *complete {
+            return Ok(());
+        }
+        self.is_shutting_down.store(true, Ordering::Release);
+        let _exclusive = self.lifecycle_gate.write().await;
+        match self.run_shutdown_cleanup().await {
+            Ok(()) => {
+                *complete = true;
+                let _ = self.shutdown_tx.send_replace(true);
+                Ok(())
+            }
+            Err(error) => {
+                self.is_shutting_down.store(false, Ordering::Release);
+                warn!(error = %error, "shutdown blocked; keeping server and storage alive");
+                Err(error)
+            }
+        }
     }
 
     /// Pauses a running sandbox by taking a snapshot and stopping its VM.
@@ -1396,155 +2193,112 @@ where
         .await
     }
 
+    /// Apply the node's installed tools release to this sandbox's retained
+    /// disk. Product maintenance admission and initialization belong to the
+    /// caller. The selected version is also the retry identity: after capture,
+    /// retries resume the retained record instead of capturing an older disk.
+    pub async fn reboot_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<SandboxMetadata> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("reboot", sandbox_id, async move {
+            this.ensure_accepting_lifecycle_operations()?;
+            let tools_version = ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_owned();
+            loop {
+                let metadata = this
+                    .store
+                    .get(&sandbox_id)
+                    .await?
+                    .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                Self::require_resume_recovery_resolved(&metadata)?;
+                match metadata.state {
+                    SandboxState::Pausing | SandboxState::Resuming => {
+                        this.wait_for_transition(sandbox_id, metadata.state).await?;
+                        continue;
+                    }
+                    SandboxState::Paused => {
+                        if !metadata.paused_runtime_stopped {
+                            let handle = this.sandboxes.read().await.get(&sandbox_id).cloned();
+                            if let Some(handle) = handle {
+                                this.stop_and_ack_paused_runtime(
+                                    sandbox_id,
+                                    &handle,
+                                    metadata.paused_state.as_ref(),
+                                )
+                                .await?;
+                            }
+                        }
+                        Arc::clone(&this)
+                            .resume_sandbox_inner(
+                                sandbox_id,
+                                NewTimeout::EnsureMinimum(Duration::from_secs(300)),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    SandboxState::Running => {
+                        if metadata.runtime_versions.tools_drive_version == tools_version {
+                            return Ok(metadata);
+                        }
+                        this.preserve_sandbox(sandbox_id, Some(&tools_version))
+                            .await?;
+                    }
+                    state => {
+                        return Err(OrchestratorError::InvalidSandboxState { sandbox_id, state })
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     #[tracing::instrument(
         name = "pause_sandbox",
         skip(self),
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        info!("pausing sandbox");
-        match self
-            .store
-            .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
-            .await
-        {
-            Ok(_) => {}
-            Err(StoreError::StateConflict { actual_state, .. }) => {
-                return match actual_state {
-                    // Another task is already performing the pause.  Wait for
-                    // it to finish and then report the final outcome.
-                    SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
-                    SandboxState::Paused => Ok(()),
-                    SandboxState::Killing => {
-                        info!("sandbox is being deleted while pausing");
-                        Err(OrchestratorError::SandboxNotFound(sandbox_id))
-                    }
-                    _ => {
-                        info!(state = ?actual_state, "cannot pause sandbox in current state");
-                        Err(OrchestratorError::InvalidSandboxState {
-                            sandbox_id,
-                            state: actual_state,
-                        })
-                    }
-                };
-            }
-            Err(err) => return Err(OrchestratorError::from(err)),
-        }
-
-        self.pause_sandbox_impl(sandbox_id).await
+        self.preserve_sandbox(sandbox_id, None).await
     }
 
-    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        // Pin paused runtime artifacts before detaching from the running set.
-        let runtime_artifacts = {
-            let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
-            match handle {
-                Some(handle) => {
-                    let sandbox = handle.lock().await;
-                    sandbox.runtime_info().runtime_artifacts
-                }
-                None => RuntimeArtifactSet::empty(),
-            }
-        };
-        if let Err(error) = self
-            .protect_image_refs(
-                RuntimeImageOwner::PausedSandbox(sandbox_id),
-                runtime_artifacts,
-                "paused sandbox",
-            )
-            .await
-        {
-            warn!(error = %error, "failed to protect paused runtime artifacts; keeping sandbox Running");
-            let _ = self
-                .store
-                .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
-                .await;
-            return Err(error);
+    // Both memory resume and disk-only cold boot use the same publication,
+    // retention and stop proof. The caller owns maintenance admission.
+    async fn preserve_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        cold_boot_tools: Option<&str>,
+    ) -> Result<()> {
+        info!("pausing sandbox");
+        match self.transition_to_pausing(sandbox_id).await? {
+            PausePreparation::Owner => {}
+            PausePreparation::Complete => return Ok(()),
         }
+        self.preserve_claimed_sandbox(sandbox_id, cold_boot_tools)
+            .await
+    }
 
-        // Allocate persistence space while the running handle and route are
-        // still attached. Allocation does not mutate the backend, so failure
-        // only needs to restore metadata and release the temporary image refs.
-        let artifact_root = match self.persister.allocate_artifact_root(&sandbox_id).await {
-            Ok(artifact_root) => artifact_root,
-            Err(err) => {
-                warn!(error = ?err, "failed to allocate paused sandbox artifact root");
-                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-                    .await;
-                let _ = self
-                    .store
-                    .update_state_if_state(
-                        &sandbox_id,
-                        SandboxState::Running,
-                        &[SandboxState::Pausing],
-                    )
-                    .await;
-                return Err(OrchestratorError::from(err));
-            }
-        };
+    async fn preserve_claimed_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        cold_boot_tools: Option<&str>,
+    ) -> Result<()> {
+        self.protect_pause_artifacts(sandbox_id).await?;
+        let artifact_root = self.allocate_pause_artifact_root(sandbox_id).await?;
 
         let (handle, removed_proxy_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
-
-        let Some(handle) = handle else {
-            warn!("sandbox handle not found while pausing, removing from store");
-            self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-                .await;
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.store.remove(&sandbox_id).await?;
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
-        };
-
-        // Pause the sandbox and capture the paused state for resuming later.
-        let paused_state_result = {
-            let mut sandbox = handle.lock().await;
-            sandbox.pause(artifact_root.as_deref()).await
-        };
-
-        // If pausing failed, attempt to put the sandbox back and return an error.
-        let paused_state = match paused_state_result {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(error = ?err, "failed to pause sandbox");
-                if err.is_terminal() {
-                    // The handle was already detached from `self.sandboxes`
-                    // before `pause()`. Do not reinsert it here: the live
-                    // runtime may have been mutated and is no longer safe to
-                    // keep serving as a running sandbox.
-                    let stop_result = {
-                        let mut sandbox = handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    if let Err(stop_err) = stop_result {
-                        warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
-                    }
-                    if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                        self.finalize_terminal_volumes(&metadata).await;
-                    }
-                    self.store.remove(&sandbox_id).await?;
-                } else {
-                    self.sandboxes.write().await.insert(sandbox_id, handle);
-                    self.restore_proxy_route(sandbox_id, removed_proxy_route)
-                        .await;
-                    let _ = self
-                        .store
-                        .update_state_if_state(
-                            &sandbox_id,
-                            SandboxState::Running,
-                            &[SandboxState::Pausing],
-                        )
-                        .await;
-                }
-                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-                    .await;
-                return Err(OrchestratorError::SandboxOperationFailed {
-                    sandbox_id,
-                    operation: SandboxOperation::Pause,
-                    source: err.into(),
-                });
-            }
-        };
+        let handle = self.require_pause_handle(sandbox_id, handle).await?;
+        let paused_state = self
+            .pause_runtime(
+                sandbox_id,
+                &handle,
+                removed_proxy_route.clone(),
+                artifact_root.as_deref(),
+                cold_boot_tools,
+            )
+            .await?;
 
         let persisted_metadata = {
             let mut metadata = self
@@ -1554,6 +2308,10 @@ where
                 .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
             metadata.state = SandboxState::Paused;
             metadata.paused_state = Some(paused_state.clone());
+            metadata.paused_runtime_stopped = false;
+            if let Some(tools_version) = cold_boot_tools {
+                metadata.runtime_versions.tools_drive_version = tools_version.to_owned();
+            }
             metadata
         };
         if let Err(err) = self
@@ -1565,29 +2323,101 @@ where
             )
             .await
         {
-            warn!(error = ?err, "failed to persist paused sandbox state");
-            let resume_result = {
-                let mut sandbox = handle.lock().await;
-                sandbox.resume().await
-            };
-            if let Err(resume_err) = resume_result {
-                warn!(error = ?resume_err, "failed to resume sandbox after pause failure");
-                let stop_result = {
-                    let mut sandbox = handle.lock().await;
-                    sandbox.stop().await
-                };
-                if let Err(stop_err) = stop_result {
-                    warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
+            return self
+                .recover_failed_pause_persistence(
+                    sandbox_id,
+                    &handle,
+                    removed_proxy_route,
+                    &persisted_metadata,
+                    err,
+                )
+                .await;
+        }
+        let resources = persisted_metadata.resources;
+        self.store.update(persisted_metadata).await?;
+        if let Err(error) = self
+            .stop_and_ack_paused_runtime(sandbox_id, &handle, Some(&paused_state))
+            .await
+        {
+            self.sandboxes
+                .write()
+                .await
+                .insert(sandbox_id, Arc::clone(&handle));
+            return Err(error);
+        }
+        self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
+        info!("sandbox paused");
+
+        Ok(())
+    }
+
+    async fn transition_to_pausing(&self, sandbox_id: SandboxId) -> Result<PausePreparation> {
+        match self
+            .store
+            .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
+            .await
+        {
+            Ok(_) => Ok(PausePreparation::Owner),
+            Err(StoreError::StateConflict { actual_state, .. }) => match actual_state {
+                SandboxState::Pausing => {
+                    self.join_concurrent_pause(sandbox_id).await?;
+                    Ok(PausePreparation::Complete)
                 }
-                if let Ok(Some(metadata)) = self.store.get(&sandbox_id).await {
-                    self.finalize_terminal_volumes(&metadata).await;
+                SandboxState::Paused => {
+                    let metadata = self
+                        .store
+                        .get(&sandbox_id)
+                        .await?
+                        .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                    Self::require_resume_recovery_resolved(&metadata)?;
+                    Self::require_paused_stop_proof(&metadata)?;
+                    Ok(PausePreparation::Complete)
                 }
-                if let Err(error) = self.store.remove(&sandbox_id).await {
-                    warn!(error = ?error, "failed to remove sandbox after pause failure");
+                SandboxState::Killing => {
+                    info!("sandbox is being deleted while pausing");
+                    Err(OrchestratorError::SandboxNotFound(sandbox_id))
                 }
-            } else {
-                self.sandboxes.write().await.insert(sandbox_id, handle);
-                self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                state => {
+                    info!(?state, "cannot pause sandbox in current state");
+                    Err(OrchestratorError::InvalidSandboxState { sandbox_id, state })
+                }
+            },
+            Err(error) => Err(OrchestratorError::from(error)),
+        }
+    }
+
+    async fn protect_pause_artifacts(&self, sandbox_id: SandboxId) -> Result<()> {
+        let runtime_artifacts = match self.sandboxes.read().await.get(&sandbox_id).cloned() {
+            Some(handle) => handle.lock().await.runtime_info().runtime_artifacts,
+            None => RuntimeArtifactSet::empty(),
+        };
+        let result = self
+            .protect_image_refs(
+                RuntimeImageOwner::PausedSandbox(sandbox_id),
+                runtime_artifacts,
+                "paused sandbox",
+            )
+            .await;
+        if let Err(error) = result {
+            warn!(error = %error, "failed to protect paused runtime artifacts; keeping sandbox Running");
+            let _ = self
+                .store
+                .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn allocate_pause_artifact_root(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<std::path::PathBuf>> {
+        match self.persister.allocate_artifact_root(&sandbox_id).await {
+            Ok(artifact_root) => Ok(artifact_root),
+            Err(error) => {
+                warn!(error = ?error, "failed to allocate paused sandbox artifact root");
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                     .await;
                 let _ = self
                     .store
@@ -1597,27 +2427,249 @@ where
                         &[SandboxState::Pausing],
                     )
                     .await;
+                Err(OrchestratorError::from(error))
             }
+        }
+    }
+
+    async fn require_pause_handle(
+        &self,
+        sandbox_id: SandboxId,
+        handle: Option<SandboxHandle>,
+    ) -> Result<SandboxHandle> {
+        let Some(handle) = handle else {
+            warn!("sandbox handle not found while pausing, removing from store");
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
+            self.store.remove(&sandbox_id).await?;
+            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+        };
+        Ok(handle)
+    }
+
+    async fn pause_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        removed_proxy_route: Option<ProxyRoute>,
+        artifact_root: Option<&std::path::Path>,
+        cold_boot_tools: Option<&str>,
+    ) -> Result<Arc<dyn PausedSandboxState>> {
+        let pause_result = if let Some(tools_version) = cold_boot_tools {
+            let resources = self
+                .store
+                .get(&sandbox_id)
+                .await?
+                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?
+                .resources;
+            match artifact_root {
+                Some(root) => {
+                    handle
+                        .lock()
+                        .await
+                        .pause_for_cold_boot(root, tools_version, resources)
+                        .await
+                }
+                None => Err(crate::sandbox::SandboxCaptureError::recoverable(
+                    anyhow::anyhow!("retained-disk cold boot requires durable sandbox persistence"),
+                )),
+            }
+        } else {
+            handle.lock().await.pause(artifact_root).await
+        };
+        let error = match pause_result {
+            Ok(paused_state) => return Ok(paused_state),
+            Err(error) => error,
+        };
+
+        warn!(error = ?error, "failed to pause sandbox");
+        if error.is_terminal() {
+            // Retain ownership: dropping this handle kills Firecracker. An
+            // ambiguous capture requires intervention, never destructive cleanup.
+            self.retain_failed_pause(sandbox_id, handle).await?;
+        } else {
+            self.sandboxes
+                .write()
+                .await
+                .insert(sandbox_id, Arc::clone(handle));
+            if let Some(root) = artifact_root {
+                if let Err(cleanup_error) = self
+                    .persister
+                    .discard_empty_capture(&sandbox_id, root)
+                    .await
+                {
+                    warn!(error = %cleanup_error, "retaining failed capture directory after empty-directory cleanup failed");
+                }
+            }
+            self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                .await;
+            let _ = self
+                .store
+                .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
+                .await;
+        }
+        self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+            .await;
+        Err(OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::Pause,
+            source: error.into(),
+        })
+    }
+
+    async fn recover_failed_pause_persistence(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        removed_proxy_route: Option<ProxyRoute>,
+        persisted_metadata: &SandboxMetadata,
+        error: SandboxPersistenceError,
+    ) -> Result<()> {
+        warn!(error = ?error, "failed to persist paused sandbox state");
+        if error.is_uncertain_commit() {
+            let mut recovery_metadata = persisted_metadata.clone();
+            recovery_metadata.resume_recovery_pending = true;
+            recovery_metadata.paused_runtime_stopped = false;
+            if let Err(store_error) = self.store.update(recovery_metadata).await {
+                warn!(error = ?store_error, "failed to mark uncertain paused sandbox recovery-pending");
+            }
+            self.sandboxes
+                .write()
+                .await
+                .insert(sandbox_id, Arc::clone(handle));
+            return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+        }
+
+        let resume_result = handle.lock().await.resume().await;
+        if let Err(resume_error) = resume_result {
+            warn!(error = ?resume_error, "failed to resume sandbox after pause failure");
+            self.retain_failed_pause(sandbox_id, handle).await?;
+        } else {
+            self.sandboxes
+                .write()
+                .await
+                .insert(sandbox_id, Arc::clone(handle));
+            self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                .await;
+            let _ = self
+                .store
+                .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
+                .await;
+        }
+        self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+            .await;
+        Err(OrchestratorError::InternalError(format!(
+            "failed to persist paused sandbox state: {error:#}"
+        )))
+    }
+
+    async fn retain_failed_pause(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+    ) -> Result<()> {
+        self.sandboxes
+            .write()
+            .await
+            .insert(sandbox_id, Arc::clone(handle));
+        self.store
+            .update_if_state(&sandbox_id, &[SandboxState::Pausing], |metadata| {
+                metadata.state = SandboxState::Paused;
+                metadata.paused_runtime_stopped = false;
+                metadata.resume_recovery_pending = true;
+            })
+            .await?;
+        warn!(%sandbox_id, "preservation requires intervention; VM and storage retained, stop forbidden");
+        Ok(())
+    }
+
+    async fn stop_and_ack_paused_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        expected_paused_state: Option<&Arc<dyn PausedSandboxState>>,
+    ) -> Result<()> {
+        // Keep concurrent retries on this retained handle serialized through
+        // the durable acknowledgment. Never stop a newer resumed runtime.
+        let mut runtime = handle.lock().await;
+        let handles = self.sandboxes.read().await;
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Paused
+            || handles
+                .get(&sandbox_id)
+                .is_some_and(|current| !Arc::ptr_eq(current, handle))
+            || !metadata
+                .paused_state
+                .as_ref()
+                .zip(expected_paused_state)
+                .is_some_and(|(current, expected)| Arc::ptr_eq(current, expected))
+        {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+        Self::require_resume_recovery_resolved(&metadata)?;
+        if metadata.paused_runtime_stopped {
+            return Ok(());
+        }
+        drop(handles);
+        if let Err(error) = runtime.stop().await {
+            warn!(error = ?error, "failed to stop sandbox after pausing");
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Stop,
+                source: error,
+            });
+        }
+        if let Err(error) = self
+            .persister
+            .mark_paused_runtime_stopped(&sandbox_id)
+            .await
+        {
+            if error.is_uncertain_commit() {
+                if let Err(store_error) = self
+                    .store
+                    .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
+                        metadata.paused_runtime_stopped = false;
+                        metadata.resume_recovery_pending = true;
+                    })
+                    .await
+                {
+                    warn!(error = ?store_error, "failed to mark paused sandbox recovery-pending after uncertain stop proof");
+                }
+                return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+            }
+            return Err(OrchestratorError::from(error));
+        }
+        self.store
+            .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
+                metadata.paused_runtime_stopped = true;
+            })
+            .await?;
+        Ok(())
+    }
+
+    fn require_paused_stop_proof(metadata: &SandboxMetadata) -> Result<()> {
+        if !metadata.paused_runtime_stopped {
             return Err(OrchestratorError::InternalError(format!(
-                "failed to persist paused sandbox state: {err:#}"
+                "cannot use paused sandbox {}: durable runtime stop proof is unavailable",
+                metadata.id
             )));
         }
-        let resources = persisted_metadata.resources;
-        self.store.update(persisted_metadata.clone()).await?;
+        Ok(())
+    }
 
-        // Stop the sandbox to free up resources.
-        let stop_result = {
-            let mut sandbox = handle.lock().await;
-            sandbox.stop().await
-        };
-        if let Err(err) = stop_result {
-            warn!(error = ?err, "failed to stop sandbox after pausing");
+    fn require_resume_recovery_resolved(metadata: &SandboxMetadata) -> Result<()> {
+        if metadata.resume_recovery_pending {
+            return Err(OrchestratorError::SandboxRecoveryRequired {
+                sandbox_id: metadata.id,
+            });
         }
-        self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
-        info!("sandbox paused");
-
         Ok(())
     }
 
@@ -1653,86 +2705,17 @@ where
         self.ensure_accepting_lifecycle_operations()?;
 
         info!("resuming sandbox");
-        let mut metadata = self
-            .store
-            .get(&sandbox_id)
-            .await?
-            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        let metadata = match self.prepare_resume(sandbox_id, timeout).await? {
+            ResumePreparation::Paused(metadata) => metadata,
+            ResumePreparation::Complete(metadata) => return Ok(metadata),
+        };
 
-        // If another resume is in progress, wait for it to complete and
-        // re-evaluate the resulting stable state.
-        if metadata.state == SandboxState::Resuming {
-            metadata = self
-                .wait_for_transition(sandbox_id, SandboxState::Resuming)
-                .await?;
+        let prior_paused_stop_proof = metadata.paused_runtime_stopped;
+        if let Some(metadata) = self.transition_to_resuming(sandbox_id, timeout).await? {
+            return Ok(metadata);
         }
-
-        match metadata.state {
-            SandboxState::Killing => {
-                return Err(OrchestratorError::SandboxNotFound(sandbox_id));
-            }
-            SandboxState::Running => {
-                // Already running — just update the timeout if requested and return.
-                return self.maybe_update_running_timeout(sandbox_id, timeout).await;
-            }
-            SandboxState::Paused => {}
-            state => {
-                return Err(OrchestratorError::InvalidSandboxState { sandbox_id, state });
-            }
-        }
-
-        let node_mode = ConfigManager::global_config().virtualization_mode;
-        if metadata.virtualization_mode != node_mode {
-            return Err(OrchestratorError::VirtualizationModeMismatch {
-                resource: format!("paused sandbox {sandbox_id}"),
-                resource_mode: metadata.virtualization_mode,
-                node_mode,
-            });
-        }
-
-        match self
-            .store
-            .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
-            .await
-        {
-            Ok(_) => {}
-            Err(StoreError::StateConflict { actual_state, .. }) => {
-                return match actual_state {
-                    SandboxState::Running => {
-                        // Another task already completed the resume.
-                        self.maybe_update_running_timeout(sandbox_id, timeout).await
-                    }
-                    SandboxState::Resuming => {
-                        // A second concurrent resume snuck in between our state
-                        // read and CAS.  Wait for it and return the outcome.
-                        self.join_concurrent_resume(sandbox_id, timeout).await
-                    }
-                    SandboxState::Killing => {
-                        info!("sandbox is being deleted while resuming");
-                        Err(OrchestratorError::SandboxNotFound(sandbox_id))
-                    }
-                    _ => {
-                        info!(state = ?actual_state, "cannot resume sandbox in current state");
-                        Err(OrchestratorError::InvalidSandboxState {
-                            sandbox_id,
-                            state: actual_state,
-                        })
-                    }
-                };
-            }
-            Err(err) => return Err(OrchestratorError::from(err)),
-        }
-
-        if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
-            warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
-            let _ = self
-                .store
-                .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Resuming])
-                .await;
-            return Err(OrchestratorError::InternalError(format!(
-                "failed to mark persisted sandbox record as resuming: {err:#}"
-            )));
-        }
+        self.mark_resume_started(sandbox_id, prior_paused_stop_proof)
+            .await?;
 
         let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
             warn!("missing paused state while resuming");
@@ -1760,6 +2743,110 @@ where
             );
         }
         resumed
+    }
+
+    async fn prepare_resume(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: NewTimeout,
+    ) -> Result<ResumePreparation> {
+        let mut metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state == SandboxState::Resuming {
+            metadata = self
+                .wait_for_transition(sandbox_id, SandboxState::Resuming)
+                .await?;
+        }
+        Self::require_resume_recovery_resolved(&metadata)?;
+        match metadata.state {
+            SandboxState::Killing => {
+                return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+            }
+            SandboxState::Running => {
+                return Ok(ResumePreparation::Complete(
+                    self.maybe_update_running_timeout(sandbox_id, timeout)
+                        .await?,
+                ));
+            }
+            SandboxState::Paused => {}
+            state => {
+                return Err(OrchestratorError::InvalidSandboxState { sandbox_id, state });
+            }
+        }
+        Self::require_paused_stop_proof(&metadata)?;
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        if metadata.virtualization_mode != node_mode {
+            return Err(OrchestratorError::VirtualizationModeMismatch {
+                resource: format!("paused sandbox {sandbox_id}"),
+                resource_mode: metadata.virtualization_mode,
+                node_mode,
+            });
+        }
+        Ok(ResumePreparation::Paused(metadata))
+    }
+
+    async fn transition_to_resuming(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: NewTimeout,
+    ) -> Result<Option<SandboxMetadata>> {
+        match self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Paused], |metadata| {
+                metadata.state = SandboxState::Resuming;
+                metadata.paused_runtime_stopped = false;
+            })
+            .await
+        {
+            Ok(_) => Ok(None),
+            Err(StoreError::StateConflict { actual_state, .. }) => match actual_state {
+                SandboxState::Running => Ok(Some(
+                    self.maybe_update_running_timeout(sandbox_id, timeout)
+                        .await?,
+                )),
+                SandboxState::Resuming => Ok(Some(
+                    self.join_concurrent_resume(sandbox_id, timeout).await?,
+                )),
+                SandboxState::Killing => {
+                    info!("sandbox is being deleted while resuming");
+                    Err(OrchestratorError::SandboxNotFound(sandbox_id))
+                }
+                state => {
+                    info!(?state, "cannot resume sandbox in current state");
+                    Err(OrchestratorError::InvalidSandboxState { sandbox_id, state })
+                }
+            },
+            Err(error) => Err(OrchestratorError::from(error)),
+        }
+    }
+
+    async fn mark_resume_started(
+        &self,
+        sandbox_id: SandboxId,
+        prior_paused_stop_proof: bool,
+    ) -> Result<()> {
+        let Err(error) = self.persister.mark_resuming(&sandbox_id).await else {
+            return Ok(());
+        };
+        warn!(error = ?error, "failed to mark persisted sandbox record as resuming");
+        let uncertain_commit = error.is_uncertain_commit();
+        let _ = self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Resuming], |metadata| {
+                metadata.state = SandboxState::Paused;
+                metadata.paused_runtime_stopped = prior_paused_stop_proof;
+                metadata.resume_recovery_pending = uncertain_commit;
+            })
+            .await;
+        if uncertain_commit {
+            return Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id });
+        }
+        Err(OrchestratorError::InternalError(format!(
+            "failed to mark persisted sandbox record as resuming: {error:#}"
+        )))
     }
 
     /// Captures a snapshot of a running sandbox.
@@ -1800,13 +2887,47 @@ where
         if let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() {
             return Ok(handle);
         }
-        warn!("sandbox handle not found while snapshotting, removing from store");
+        // Losing an in-memory handle does not prove that its VM or storage
+        // stopped. Preserve metadata, routes, volume ownership and image refs;
+        // restore the prior state so recovery can reattach the owning handle.
+        warn!(%sandbox_id, "snapshot requires recovery of the missing runtime handle");
+        self.store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Running,
+                &[SandboxState::Snapshotting],
+            )
+            .await?;
+        Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id })
+    }
+
+    /// Terminal capture errors permit cleanup only after a positive stop result.
+    /// On refusal retain the owning handle, volumes, metadata and image refs so
+    /// the normal delete path can retry stop without exposing mounted disks.
+    async fn cleanup_terminal_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        expected_state: SandboxState,
+    ) -> Result<()> {
+        if let Err(error) = handle.lock().await.stop().await {
+            warn!(%error, %sandbox_id, "terminal capture cleanup awaits a successful runtime stop");
+            let progress = self.deletion_progress(sandbox_id).await;
+            let mut progress = progress.lock().await;
+            self.store
+                .update_state_if_state(&sandbox_id, SandboxState::Killing, &[expected_state])
+                .await?;
+            *progress = DeleteProgress::Stop {
+                capture_failed: true,
+            };
+            return Ok(());
+        }
         self.detach_sandbox_handle_and_route(&sandbox_id).await;
         if let Some(metadata) = self.store.get(&sandbox_id).await? {
             self.finalize_terminal_volumes(&metadata).await;
         }
         self.store.remove(&sandbox_id).await?;
-        Err(OrchestratorError::SandboxNotFound(sandbox_id))
+        Ok(())
     }
 
     async fn fail_snapshot_operation<T>(
@@ -1818,18 +2939,8 @@ where
     ) -> Result<T> {
         warn!(?error, ?operation, "sandbox snapshot operation failed");
         if error.is_terminal() {
-            self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            if let Err(stop_error) = handle.lock().await.stop().await {
-                warn!(
-                    ?stop_error,
-                    ?operation,
-                    "failed to stop sandbox after terminal snapshot failure"
-                );
-            }
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.store.remove(&sandbox_id).await?;
+            self.cleanup_terminal_runtime(sandbox_id, handle, SandboxState::Snapshotting)
+                .await?;
         } else {
             let _ = self
                 .store
@@ -2027,6 +3138,27 @@ where
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Option<CustomExtensionParams>> {
+        let handle = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&sandbox_id).cloned()
+        };
+        let Some(handle) = handle else {
+            let metadata = self
+                .store
+                .get(&sandbox_id)
+                .await?
+                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        };
+
+        // Use the same lock as snapshot capture. Once a patch enters its hook,
+        // pause must capture both the approved backend value and metadata.
+        // Check state under the lock: a patch queued behind pause must not call
+        // the extension and mutate configuration after the snapshot was taken.
+        let mut sandbox = handle.lock().await;
         let metadata = self
             .store
             .get(&sandbox_id)
@@ -2039,18 +3171,6 @@ where
             });
         }
 
-        let sandbox = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
-        }
-        .ok_or_else(|| OrchestratorError::SandboxOperationConflict {
-            sandbox_id,
-            operation: SandboxOperation::PatchCustomExtensionParams,
-        })?;
-
-        // Invoke the extension's patch-params hook here (the backend only
-        // stores the approved value). The sandbox lock is not held during
-        // the hook call so pause/stop are not blocked on extension latency.
         let client = CustomExtensionClient::global().ok_or_else(|| {
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
@@ -2069,21 +3189,20 @@ where
                 source,
             })?;
 
-        {
-            let mut sandbox = sandbox.lock().await;
-            sandbox.update_custom_extension_params(new_params.clone());
-        }
-
-        // NOTE: a concurrent pause may have transitioned the sandbox since the entry check,
-        // so this may fail. But it's acceptable since extension state should be transient like network policy
+        // Pause may have claimed Pausing while the hook was running, but it
+        // cannot capture or persist until this guard is released. Configuration
+        // is durable state, not a disposable runtime projection.
         self.store
-            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
-                metadata.custom_extension_params = new_params.clone();
-            })
+            .update_if_state(
+                &sandbox_id,
+                &[SandboxState::Running, SandboxState::Pausing],
+                |metadata| {
+                    metadata.custom_extension_params = new_params.clone();
+                },
+            )
             .await
             .map_err(|err| match err {
-                // Lost a race against a concurrent state transition (e.g.
-                // pause): report it as a conflict instead of a 500.
+                // Deletion can still win; never recreate deleted metadata.
                 StoreError::StateConflict {
                     sandbox_id,
                     actual_state,
@@ -2095,6 +3214,7 @@ where
                 other => OrchestratorError::from(other),
             })?;
 
+        sandbox.update_custom_extension_params(new_params.clone());
         Ok(new_params)
     }
 
@@ -2105,11 +3225,21 @@ where
     /// consistent with the orchestrator's current set of sandboxes.
     pub async fn metrics_snapshot(&self) -> Result<OrchestratorMetrics> {
         let mut metrics = OrchestratorMetrics::default();
+        let owned: std::collections::HashSet<_> =
+            self.sandboxes.read().await.keys().copied().collect();
         self.store
             .list_with_callback(|metadata| {
                 aggregate_resource_metrics(
                     &mut metrics,
-                    SandboxContribution::new(metadata.state, metadata.resources),
+                    SandboxContribution::new(
+                        if metadata.state == SandboxState::Paused && owned.contains(&metadata.id) {
+                            // An unproven/failed stop still owns VM resources.
+                            SandboxState::Pausing
+                        } else {
+                            metadata.state
+                        },
+                        metadata.resources,
+                    ),
                 );
             })
             .await?;
@@ -2140,7 +3270,7 @@ where
     /// resulting metadata. Returns `SandboxNotFound` if the sandbox is removed
     /// while waiting, or `InvalidSandboxState` if the sandbox is still in the
     /// transitional state after the [`WAIT_TRANSITION_TIMEOUT`] elapses.
-    async fn wait_for_transition(
+    pub(crate) async fn wait_for_transition(
         &self,
         sandbox_id: SandboxId,
         transitional_state: SandboxState,
@@ -2203,7 +3333,7 @@ where
         match m.state {
             SandboxState::Paused => {
                 debug!("concurrent pause succeeded");
-                Ok(())
+                Self::require_paused_stop_proof(&m)
             }
             SandboxState::Running => {
                 info!("concurrent pause failed; sandbox returned to running state");
@@ -2273,28 +3403,39 @@ where
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            let claimed_state = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => SandboxState::Pausing,
-                SandboxTimeoutAction::Delete => SandboxState::Killing,
-            };
-            // Use the same operation lock as explicit deletion before claiming Killing.
-            let deletion = self.deletion_progress(metadata.id).await;
-            let mut progress = deletion.lock().await;
-            let result = match self
-                .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
-                .await
-            {
-                Ok(true) => match metadata.timeout_action {
-                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
-                    SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
-                            .await
+            let this = Arc::clone(self);
+            let result = self
+                .run_cancellation_safe("evict", metadata.id, async move {
+                    let claimed_state = match metadata.timeout_action {
+                        SandboxTimeoutAction::Pause => SandboxState::Pausing,
+                        SandboxTimeoutAction::Delete => SandboxState::Killing,
+                    };
+                    // Use the same operation lock as explicit deletion before claiming Killing.
+                    let deletion = this.deletion_progress(metadata.id).await;
+                    let mut progress = deletion.lock().await;
+                    match this
+                        .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
+                        .await
+                    {
+                        Ok(true) => match metadata.timeout_action {
+                            SandboxTimeoutAction::Pause => {
+                                this.preserve_claimed_sandbox(metadata.id, None).await
+                            }
+                            SandboxTimeoutAction::Delete => {
+                                this.delete_sandbox_impl(
+                                    metadata.id,
+                                    SandboxState::Running,
+                                    &mut progress,
+                                )
+                                .await
+                            }
+                        }
+                        .map(|_| true),
+                        Ok(false) => Ok(false),
+                        Err(err) => Err(err),
                     }
-                }
-                .map(|_| true),
-                Ok(false) => Ok(false),
-                Err(err) => Err(err),
-            };
+                })
+                .await;
             match result {
                 Ok(true) => evicted_ids.push(metadata.id),
                 Ok(false) => continue,
@@ -2393,64 +3534,72 @@ where
     }
 
     #[tracing::instrument(skip(self, plan))]
-    async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
+    async fn launch_sandbox_with_volume_reservation(
+        self: &Arc<Self>,
+        plan: LaunchPlan,
+        pending_owner: Option<&str>,
+    ) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
+        if let Some(owner) = pending_owner {
+            let manager = self.volume_manager.as_ref().ok_or_else(|| {
+                OrchestratorError::InternalError(
+                    "volume reservation requires a volume manager".to_owned(),
+                )
+            })?;
+            let volume_ids = plan
+                .transitional_metadata()
+                .map(|metadata| metadata.volume_mounts.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let sandbox_owner = plan.sandbox_id().to_string();
+            let transfer: anyhow::Result<()> = async {
+                for id in &volume_ids {
+                    anyhow::ensure!(
+                        manager.get(id).await?.mounted_by(owner),
+                        "volume {id} no longer belongs to its preparation owner"
+                    );
+                }
+                manager
+                    .replace_owner_for(owner, Some(&sandbox_owner), &volume_ids)
+                    .await?;
+                for id in &volume_ids {
+                    anyhow::ensure!(
+                        manager.get(id).await?.mounted_by(&sandbox_owner),
+                        "volume {id} ownership transfer was not committed"
+                    );
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = transfer {
+                // No backend has opened these disks. Return any partially moved
+                // reservations to preparation ownership for the API's cleanup.
+                // Failed rollback retains the sandbox owner and blocks reuse.
+                if let Err(rollback) = manager
+                    .replace_owner_for(&sandbox_owner, Some(owner), &volume_ids)
+                    .await
+                {
+                    warn!(%rollback, "volume ownership rollback requires recovery");
+                }
+                return Err(OrchestratorError::InternalError(format!(
+                    "claim launch volumes: {error}"
+                )));
+            }
+        }
+        self.launch_sandbox(plan).await
+    }
 
-        let sandbox_id = plan.sandbox_id();
+    async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
         let transitional_state = plan.transitional_state();
-
-        // Build and start the sandbox first, before making any state changes, so that we don't
-        // have to roll back any persisted state if the build fails.
-        // Meanwhile, the start process can be overlapped with the initial state persistence.
-        let mut sandbox = match self.build_sandbox(&plan) {
-            Ok(sandbox) => sandbox,
-            Err(err) => {
-                self.rollback_failed_launch_metadata(&plan, transitional_state)
-                    .await;
-                return Err(err);
-            }
-        };
-
-        // Protect artifacts before the backend opens them.
-        let startup_artifacts = sandbox.startup_artifacts();
-        if let Err(err) = self
-            .protect_image_refs(
-                RuntimeImageOwner::StartingSandbox(sandbox_id),
-                startup_artifacts,
-                "starting sandbox",
-            )
-            .await
-        {
-            warn!(error = %format_args!("{err:#}"), "failed to protect starting runtime artifacts");
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+        if let Err(error) = self.ensure_accepting_lifecycle_operations() {
+            // The preparation owner may already have transferred its volumes.
+            // No backend was opened, so releasing this launch is safe.
+            self.rollback_failed_launch_metadata(&plan, transitional_state, true)
                 .await;
-            return Err(err);
+            return Err(error);
         }
-        if let Err(source) = sandbox.start_nowait().await {
-            warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
-            if let Err(stop_err) = sandbox.stop().await {
-                warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
-            }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
-                .await;
-            return Err(OrchestratorError::SandboxOperationFailed {
-                sandbox_id,
-                operation: SandboxOperation::Start,
-                source,
-            });
-        }
-        debug!("sandbox start requested");
-
-        // If the orchestrator started shutting down, stop here before we persist any state.
-        if self.is_shutting_down() {
-            info!("orchestrator started shutting down just after starting the sandbox");
-            if let Err(err) = sandbox.stop().await {
-                warn!(error = %format_args!("{err:#}"), "failed to stop sandbox");
-            }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
-                .await;
-            return Err(OrchestratorError::ShuttingDown);
-        }
+        let sandbox = self
+            .build_and_start_sandbox(&plan, transitional_state)
+            .await?;
 
         let runtime_resources =
             resources_with_runtime_info(plan.resources(), sandbox.runtime_info());
@@ -2459,61 +3608,175 @@ where
             metadata.resources = runtime_resources;
             metadata
         });
+        let handle = self
+            .register_launch(&plan, sandbox, transitional_metadata)
+            .await?;
+        self.wait_for_launch_ready(&plan, &handle).await?;
+        // Publish the ready runtime before Running wakes transition waiters.
+        // Otherwise concurrent auto-resume requests can observe a missing route.
+        self.publish_launch_route(&plan, &handle).await?;
+        let final_metadata = self
+            .persist_running_launch(&plan, &handle, transitional_state, runtime_resources)
+            .await?;
+        if matches!(plan, LaunchPlan::Resume(_)) {
+            if let Err(error) = self.persister.delete_record(&plan.sandbox_id()).await {
+                warn!(error = %format_args!("{error:#}"), "failed to delete persisted sandbox record after resume");
+            }
+        }
 
-        // Store the sandbox handle in memory.
+        info!("sandbox launch completed");
+        Ok(final_metadata)
+    }
+
+    async fn build_and_start_sandbox(
+        &self,
+        plan: &LaunchPlan,
+        transitional_state: SandboxState,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        let sandbox_id = plan.sandbox_id();
+        let mut sandbox = match self.build_sandbox(plan) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                self.rollback_failed_launch_metadata(plan, transitional_state, true)
+                    .await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .protect_image_refs(
+                RuntimeImageOwner::StartingSandbox(sandbox_id),
+                sandbox.startup_artifacts(),
+                "starting sandbox",
+            )
+            .await
+        {
+            warn!(error = %format_args!("{error:#}"), "failed to protect starting runtime artifacts");
+            self.rollback_failed_launch_metadata(plan, transitional_state, true)
+                .await;
+            return Err(error);
+        }
+        if let Err(source) = sandbox.start_nowait().await {
+            warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
+            let runtime_absence_proven = self.stop_unregistered_sandbox(plan, sandbox).await;
+            self.rollback_failed_launch_metadata(plan, transitional_state, runtime_absence_proven)
+                .await;
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Start,
+                source,
+            });
+        }
+        debug!("sandbox start requested");
+        if self.is_shutting_down() {
+            info!("orchestrator started shutting down just after starting the sandbox");
+            let runtime_absence_proven = self.stop_unregistered_sandbox(plan, sandbox).await;
+            self.rollback_failed_launch_metadata(plan, transitional_state, runtime_absence_proven)
+                .await;
+            return Err(OrchestratorError::ShuttingDown);
+        }
+        Ok(sandbox)
+    }
+
+    async fn stop_unregistered_sandbox(
+        &self,
+        plan: &LaunchPlan,
+        mut sandbox: Box<dyn SandboxBackend>,
+    ) -> bool {
+        match sandbox.stop().await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "retaining failed launch runtime after uncertain stop");
+                // Dropping the backend can kill its VM and storage. Publish
+                // ownership before rollback so a failed launch remains alive
+                // and a normal delete can retry graceful stop.
+                self.sandboxes
+                    .write()
+                    .await
+                    .insert(plan.sandbox_id(), Arc::new(Mutex::new(sandbox)));
+                false
+            }
+        }
+    }
+
+    async fn register_launch(
+        &self,
+        plan: &LaunchPlan,
+        sandbox: Box<dyn SandboxBackend>,
+        transitional_metadata: Option<SandboxMetadata>,
+    ) -> Result<SandboxHandle> {
+        let sandbox_id = plan.sandbox_id();
         let handle = Arc::new(Mutex::new(sandbox));
         self.sandboxes
             .write()
             .await
-            .insert(sandbox_id, handle.clone());
-
+            .insert(sandbox_id, Arc::clone(&handle));
         self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
             .await;
 
-        // Persist the sandbox metadata if needed (during creation).
-        if let Some(metadata) = transitional_metadata.as_ref() {
-            if let Err(err) = self.store.add(metadata.clone()).await {
-                warn!(error = %format_args!("{err:#}"), "failed to persist sandbox metadata; cleaning up");
-                self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::Registered)
-                    .await;
-                return Err(OrchestratorError::from(err));
+        if let Some(metadata) = transitional_metadata {
+            if let Err(error) = self.store.add(metadata).await {
+                warn!(error = %format_args!("{error:#}"), "failed to persist sandbox metadata; cleaning up");
+                self.cleanup_failed_launch(
+                    plan,
+                    Arc::clone(&handle),
+                    FailedLaunchStage::Registered,
+                )
+                .await;
+                return Err(OrchestratorError::from(error));
             }
         }
-
-        // Check for shutdown again before we wait for the sandbox to become ready.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down before sandbox became ready");
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
+            self.cleanup_failed_launch(
+                plan,
+                Arc::clone(&handle),
+                FailedLaunchStage::TransitionalPersisted,
+            )
+            .await;
             return Err(OrchestratorError::ShuttingDown);
         }
+        Ok(handle)
+    }
 
-        // Wait for the sandbox to be ready
-        let wait_result = {
-            let sandbox = handle.lock().await;
-            sandbox.wait_for_ready().await
-        };
+    async fn wait_for_launch_ready(&self, plan: &LaunchPlan, handle: &SandboxHandle) -> Result<()> {
+        let wait_result = handle.lock().await.wait_for_ready().await;
         if let Err(source) = wait_result {
             warn!(error = %format_args!("{source:#}"), "sandbox failed to become ready");
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
+            self.cleanup_failed_launch(
+                plan,
+                Arc::clone(handle),
+                FailedLaunchStage::TransitionalPersisted,
+            )
+            .await;
             return Err(OrchestratorError::SandboxOperationFailed {
-                sandbox_id,
+                sandbox_id: plan.sandbox_id(),
                 operation: SandboxOperation::WaitReady,
                 source,
             });
         }
-
-        // Check for shutdown again before we persist the final state and publish the proxy route.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down while sandbox was becoming ready");
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
+            self.cleanup_failed_launch(
+                plan,
+                Arc::clone(handle),
+                FailedLaunchStage::TransitionalPersisted,
+            )
+            .await;
             return Err(OrchestratorError::ShuttingDown);
         }
+        Ok(())
+    }
 
+    async fn persist_running_launch(
+        &self,
+        plan: &LaunchPlan,
+        handle: &SandboxHandle,
+        transitional_state: SandboxState,
+        runtime_resources: SandboxResources,
+    ) -> Result<SandboxMetadata> {
+        let sandbox_id = plan.sandbox_id();
         let launch_timeout = plan.timeout();
-        let final_metadata = match self
+        match self
             .store
             .update_if_state(
                 &sandbox_id,
@@ -2521,48 +3784,52 @@ where
                 move |metadata| {
                     metadata.resources = runtime_resources;
                     metadata.state = SandboxState::Running;
+                    metadata.paused_runtime_stopped = false;
                     metadata.update_timeout(launch_timeout);
                 },
             )
             .await
         {
-            Ok(update) => update.current,
-            Err(err) => {
-                warn!(error = %format_args!("{err:#}"), "failed to persist final sandbox metadata after launch");
-                self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                    .await;
-                return Err(OrchestratorError::from(err));
+            Ok(update) => Ok(update.current),
+            Err(error) => {
+                warn!(error = %format_args!("{error:#}"), "failed to persist final sandbox metadata after launch");
+                self.cleanup_failed_launch(
+                    plan,
+                    Arc::clone(handle),
+                    FailedLaunchStage::RoutePublished,
+                )
+                .await;
+                Err(OrchestratorError::from(error))
             }
-        };
+        }
+    }
 
+    async fn publish_launch_route(&self, plan: &LaunchPlan, handle: &SandboxHandle) -> Result<()> {
+        let sandbox_id = plan.sandbox_id();
         let proxy_target = {
             let sandbox = handle.lock().await;
             match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
                 Ok(proxy_target) => proxy_target,
-                Err(err) => {
-                    warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
+                Err(error) => {
+                    warn!(error = %format_args!("{error:#}"), "sandbox became ready without a proxy target; rolling back launch");
                     drop(sandbox);
-                    self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
-                        .await;
-                    return Err(err);
+                    self.cleanup_failed_launch(
+                        plan,
+                        Arc::clone(handle),
+                        FailedLaunchStage::TransitionalPersisted,
+                    )
+                    .await;
+                    return Err(error);
                 }
             }
         };
         if !self
-            .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
+            .upsert_proxy_route_if_current_handle(sandbox_id, handle, proxy_target)
             .await
         {
             debug!("skipping runtime proxy route publication because sandbox handle is stale");
         }
-
-        if matches!(plan, LaunchPlan::Resume(_)) {
-            if let Err(err) = self.persister.delete_record(&sandbox_id).await {
-                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
-            }
-        }
-
-        info!("sandbox launch completed");
-        Ok(final_metadata)
+        Ok(())
     }
 
     fn build_sandbox(&self, plan: &LaunchPlan) -> Result<Box<dyn SandboxBackend>> {
@@ -2597,6 +3864,23 @@ where
         handle: SandboxHandle,
         stage: FailedLaunchStage,
     ) {
+        // Keep the registered owning handle until stop succeeds. In particular,
+        // a failed readiness check is not permission to drop a running backend.
+        let stop_result = handle.lock().await.stop().await;
+        if let Err(error) = stop_result {
+            warn!(%error, "failed launch cleanup awaits a successful runtime stop");
+            let is_current = self
+                .sandboxes
+                .read()
+                .await
+                .get(&plan.sandbox_id())
+                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            if is_current {
+                self.rollback_failed_launch_metadata(plan, plan.transitional_state(), false)
+                    .await;
+            }
+            return;
+        }
         let should_rollback_shared_state = self
             .detach_launch_runtime_if_current(
                 &plan.sandbox_id(),
@@ -2605,23 +3889,11 @@ where
                 stage,
             )
             .await;
-
-        // Stop the sandbox.
-        let stop_result = {
-            let mut sandbox = handle.lock().await;
-            sandbox.stop().await
-        };
-        if let Err(err) = stop_result {
-            warn!(error = %format_args!("{err:#}"), "failed to stop sandbox while rolling back launch");
-        }
-
-        if !should_rollback_shared_state {
-            return;
-        }
-
-        if let Some(expected_state) = stage.rollback_expected_state(plan) {
-            self.rollback_failed_launch_metadata(plan, expected_state)
-                .await;
+        if should_rollback_shared_state {
+            if let Some(expected_state) = stage.rollback_expected_state(plan) {
+                self.rollback_failed_launch_metadata(plan, expected_state, true)
+                    .await;
+            }
         }
     }
 
@@ -2629,11 +3901,57 @@ where
         &self,
         plan: &LaunchPlan,
         expected_state: SandboxState,
+        runtime_absence_proven: bool,
     ) {
-        self.release_image_refs(RuntimeImageOwner::StartingSandbox(plan.sandbox_id()))
-            .await;
+        if runtime_absence_proven {
+            self.release_image_refs(RuntimeImageOwner::StartingSandbox(plan.sandbox_id()))
+                .await;
+        }
         match plan {
-            LaunchPlan::Create(_) => {
+            LaunchPlan::Create(create) => {
+                if !runtime_absence_proven {
+                    warn!(sandbox_id = %plan.sandbox_id(), "retaining create runtime and volume ownership after uncertain stop");
+                    // A failure before register_launch has no metadata yet.
+                    // Keep a discoverable record and resume deletion at stop,
+                    // without publishing an incompletely started volume.
+                    let progress = self.deletion_progress(create.sandbox_id).await;
+                    let mut progress = progress.lock().await;
+                    let retained = match self.store.get(&create.sandbox_id).await {
+                        Ok(Some(_)) => self
+                            .store
+                            .update_state_if_state(
+                                &create.sandbox_id,
+                                SandboxState::Killing,
+                                &[expected_state],
+                            )
+                            .await
+                            .map(|_| ()),
+                        Ok(None) => {
+                            let mut metadata = create.metadata.clone();
+                            metadata.state = SandboxState::Killing;
+                            self.store.add(metadata).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = retained {
+                        warn!(%error, "failed to record retained launch; runtime and references remain owned");
+                    }
+                    *progress = DeleteProgress::Stop {
+                        capture_failed: true,
+                    };
+                    return;
+                }
+                if let (Some(manager), Some(metadata)) =
+                    (self.volume_manager.as_ref(), plan.transitional_metadata())
+                {
+                    let ids = metadata.volume_mounts.values().cloned().collect::<Vec<_>>();
+                    if let Err(error) = manager
+                        .replace_owner_for(&plan.sandbox_id().to_string(), None, &ids)
+                        .await
+                    {
+                        warn!(%error, "failed to release stopped launch volumes; retaining reservation");
+                    }
+                }
                 if let Err(err) = self.store.remove(&plan.sandbox_id()).await {
                     warn!(error = %format_args!("{err:#}"), "failed to remove sandbox metadata during launch rollback");
                 }
@@ -2641,19 +3959,99 @@ where
             LaunchPlan::Resume(_) => {
                 if let Err(err) = self
                     .store
-                    .update_state_if_state(
+                    .update_if_state(
                         &plan.sandbox_id(),
-                        SandboxState::Paused,
                         std::slice::from_ref(&expected_state),
+                        |metadata| {
+                            metadata.state = SandboxState::Paused;
+                            metadata.paused_runtime_stopped = false;
+                        },
                     )
                     .await
                 {
                     warn!(error = %format_args!("{err:#}"), "failed to restore sandbox metadata during launch rollback");
                 }
-                if let Err(err) = self.persister.rollback_resuming(&plan.sandbox_id()).await {
-                    warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
+                let durable_rollback_succeeded = match self
+                    .persister
+                    .rollback_resuming(&plan.sandbox_id())
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
+                        if err.is_uncertain_commit() {
+                            // The rollback write may have committed despite
+                            // its error. Never carry forward an in-memory
+                            // stop proof or let a later resume/delete treat
+                            // the snapshot as safe until host recovery has
+                            // reconciled the durable marker.
+                            self.mark_resume_recovery_pending_after_launch_rollback(
+                                plan.sandbox_id(),
+                                expected_state,
+                            )
+                            .await;
+                        }
+                        false
+                    }
+                };
+                if runtime_absence_proven && durable_rollback_succeeded {
+                    match self
+                        .persister
+                        .mark_paused_runtime_stopped(&plan.sandbox_id())
+                        .await
+                    {
+                        Ok(()) => {
+                            if let Err(err) = self
+                                .store
+                                .update_if_state(
+                                    &plan.sandbox_id(),
+                                    &[SandboxState::Paused],
+                                    |metadata| metadata.paused_runtime_stopped = true,
+                                )
+                                .await
+                            {
+                                warn!(error = %format_args!("{err:#}"), "failed to restore paused runtime stop proof in metadata");
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %format_args!("{err:#}"), "failed to restore durable paused runtime stop proof after launch rollback");
+                            if err.is_uncertain_commit() {
+                                self.mark_resume_recovery_pending_after_launch_rollback(
+                                    plan.sandbox_id(),
+                                    expected_state,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    async fn mark_resume_recovery_pending_after_launch_rollback(
+        &self,
+        sandbox_id: SandboxId,
+        expected_state: SandboxState,
+    ) {
+        if let Err(error) = self
+            .store
+            .update_if_state(
+                &sandbox_id,
+                &[SandboxState::Paused, SandboxState::Resuming, expected_state],
+                |metadata| {
+                    metadata.state = SandboxState::Paused;
+                    metadata.paused_runtime_stopped = false;
+                    metadata.resume_recovery_pending = true;
+                },
+            )
+            .await
+        {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %format_args!("{error:#}"),
+                "failed to mark paused sandbox recovery-pending after uncertain launch rollback"
+            );
         }
     }
 
@@ -2781,9 +4179,46 @@ where
         (handle, removed_route)
     }
 
+    /// Caller holds lifecycle_gate exclusively: no capture, resume, fork or
+    /// deletion can change references while the collection plan is applied.
+    async fn collect_checkpoints(&self) {
+        let result = async {
+            let mut protected = Vec::new();
+            for handle in self.sandboxes.read().await.values() {
+                protected.extend(handle.lock().await.checkpoint_references()?);
+            }
+            if let Some(manager) = self.volume_manager.as_ref() {
+                protected.extend(manager.checkpoint_references().await?);
+            }
+            self.persister.collect_checkpoints(&protected).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            warn!(%error, "checkpoint collection skipped; retaining recovery artifacts");
+        }
+    }
+
     async fn run_shutdown_cleanup(self: &Arc<Self>) -> Result<()> {
         const MAX_SHUTDOWN_PASSES: usize = 3;
         let mut last_failures = Vec::new();
+
+        // Account for all concurrent/serial output coexistence before stopping
+        // the first guest. Each backend rechecks just before its own capture.
+        let handles: Vec<_> = self.sandboxes.read().await.values().cloned().collect();
+        let mut requirements = Vec::new();
+        for handle in handles {
+            if let Some(requirement) = handle
+                .lock()
+                .await
+                .checkpoint_capacity()
+                .map_err(|error| OrchestratorError::InternalError(error.to_string()))?
+            {
+                requirements.push(requirement);
+            }
+        }
+        crate::sandbox::checkpoint_capacity::check(&requirements)
+            .map_err(|error| OrchestratorError::InternalError(error.to_string()))?;
 
         // Preserve recoverable sandboxes by pausing running VMs before process exit.
         for pass in 1..=MAX_SHUTDOWN_PASSES {
@@ -2861,6 +4296,34 @@ where
                 last_failures.join(", ")
             )));
         }
+
+        // Paused alone is not proof of preservation: publication or runtime
+        // stop acknowledgement may have failed after the state transition.
+        for metadata in self
+            .store
+            .list_filtered(SandboxListFilter {
+                states: None,
+                excluded_states: None,
+                user_metadata: None,
+                ..SandboxListFilter::matches_all()
+            })
+            .await?
+        {
+            if metadata.state != SandboxState::Paused
+                || metadata.resume_recovery_pending
+                || !metadata.paused_runtime_stopped
+            {
+                return Err(OrchestratorError::InternalError(format!(
+                    "shutdown blocked: guest {} state={} stopped={} recovery_pending={}",
+                    metadata.id,
+                    metadata.state,
+                    metadata.paused_runtime_stopped,
+                    metadata.resume_recovery_pending,
+                )));
+            }
+        }
+
+        self.collect_checkpoints().await;
 
         // Clean up remaining network resources.
         if let Some(manager) = crate::sandbox::NetworkManager::global_if_initialized() {
@@ -3020,7 +4483,7 @@ fn resources_with_runtime_info(
 
 fn configured_runtime_versions() -> SnapshotRuntimeVersions {
     let config = ConfigManager::global_config();
-    SnapshotRuntimeVersions::new(
+    let mut versions = SnapshotRuntimeVersions::new(
         config
             .kernel
             .version
@@ -3033,7 +4496,19 @@ fn configured_runtime_versions() -> SnapshotRuntimeVersions {
             .unwrap_or_else(|| "unknown".to_string()),
         config.envd.version.clone(),
         config.resolved_tools_version().to_string(),
-    )
+    );
+    // Record actual bytes, never relabel a snapshot using only version strings.
+    // Missing files remain unknown here; the cold-boot factory fails before
+    // launching if its configured runtime artifacts cannot be read/verified.
+    versions.kernel_sha256 =
+        crate::digest::FileDigest::describe_blocking(&config.resolved_kernel_image_path())
+            .ok()
+            .map(|digest| digest.sha256);
+    versions.firecracker_sha256 =
+        crate::digest::FileDigest::describe_blocking(&config.resolved_firecracker_binary_path())
+            .ok()
+            .map(|digest| digest.sha256);
+    versions
 }
 
 #[cfg(test)]

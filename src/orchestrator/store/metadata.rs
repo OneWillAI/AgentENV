@@ -51,6 +51,21 @@ pub struct SandboxMetadata {
     #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
     pub image_configs: ImageConfigs,
     pub user_metadata: Option<HashMap<String, String>>,
+    /// Internal create retry identity. This is separate from user metadata so
+    /// clients cannot accidentally alter or filter on lifecycle bookkeeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_fingerprint: Option<String>,
+    /// Durable proof that the paused runtime was successfully stopped after
+    /// its resume artifacts were persisted.
+    pub paused_runtime_stopped: bool,
+    /// Set when startup finds a `Resuming` persistence record from this same
+    /// host boot. The previous AgentENV process may have left its Firecracker
+    /// child alive, so the retained snapshot must not be resumed or deleted
+    /// until a later host boot proves that child is gone.
+    #[serde(skip)]
+    pub resume_recovery_pending: bool,
     pub network_policy: SandboxNetworkPolicy,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Persisted into committed snapshots so template launches inherit it
@@ -95,6 +110,10 @@ impl Default for SandboxMetadata {
             startup: None,
             image_configs: ImageConfigs::new(),
             user_metadata: None,
+            create_idempotency_key: None,
+            create_request_fingerprint: None,
+            paused_runtime_stopped: false,
+            resume_recovery_pending: false,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             volume_mounts: HashMap::new(),

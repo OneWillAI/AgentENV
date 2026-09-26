@@ -118,6 +118,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub snapshot: SnapshotConfig,
     #[config(nested)]
+    pub template: TemplateConfig,
+    #[config(nested)]
     pub ublk: UblkTomlConfig,
     #[config(nested)]
     pub observability: ObservabilityConfig,
@@ -232,6 +234,35 @@ pub struct KernelConfig {
     pub image_path: Option<PathBuf>,
     pub version: Option<String>,
     pub url: Option<String>,
+    /// Optional immutable image identity (64 lowercase hex characters).
+    /// Legacy configurations without a digest retain their existing behavior.
+    pub sha256: Option<String>,
+}
+
+impl KernelConfig {
+    pub fn verify_image(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let Some(expected) = self.sha256.as_deref() else {
+            return Ok(());
+        };
+        if expected.len() != 64
+            || !expected
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            anyhow::bail!("kernel.sha256 must contain exactly 64 lowercase hexadecimal characters");
+        }
+        let actual = crate::digest::FileDigest::describe_blocking(path)
+            .with_context(|| format!("hash kernel image {}", path.display()))?;
+        if actual.sha256 != format!("sha256:{expected}") {
+            anyhow::bail!(
+                "kernel image checksum mismatch at {}: expected sha256:{}, got {}",
+                path.display(),
+                expected,
+                actual.sha256
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -358,6 +389,15 @@ pub struct SnapshotConfig {
     pub publish_compression: SnapshotPublishCompressionConfig,
     #[config(nested)]
     pub memory_startup_pack: SnapshotStartupPackConfig,
+}
+
+#[derive(Debug, Clone, Config)]
+pub struct TemplateConfig {
+    /// Apply the scheduler-provided cluster CPU intersection to new templates
+    /// and cold-started VMs. Operators may disable this on dedicated hosts
+    /// whose KVM cannot accept the advertised CPU template.
+    #[config(default = true, env = "AENV_TEMPLATE_APPLY_CLUSTER_CPU_CONFIG")]
+    pub apply_cluster_cpu_config: bool,
 }
 
 #[derive(Debug, Config, Clone)]

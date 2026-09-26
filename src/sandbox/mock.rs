@@ -6,7 +6,7 @@
 //! need a real VM.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +56,7 @@ pub enum MockOperation {
     ThawVolumes,
     Fork,
     ForkChild,
+    BranchDisk,
     Stop,
     UpdateNetwork,
 }
@@ -80,11 +81,19 @@ pub struct MockBehavior {
     runtime_info: Mutex<SandboxRuntimeInfo>,
     metrics_sampler: Mutex<Option<MetricsSampler>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
+    checkpoint_capacity: Mutex<Option<super::checkpoint_capacity::CheckpointCapacity>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
 
 impl MockBehavior {
+    pub fn set_checkpoint_capacity(
+        &self,
+        capacity: super::checkpoint_capacity::CheckpointCapacity,
+    ) {
+        *self.checkpoint_capacity.lock().unwrap() = Some(capacity);
+    }
+
     pub fn set_metrics_sampler(&self, sampler: MetricsSampler) {
         *self.metrics_sampler.lock().unwrap() = Some(sampler);
     }
@@ -240,6 +249,7 @@ impl MockBehavior {
     }
 
     fn apply_sync(&self, operation: MockOperation) -> Result<()> {
+        self.run_operation_hook(operation);
         Self::run_sync_action(
             self.pop_action(operation),
             |message| anyhow!(message),
@@ -278,6 +288,16 @@ impl MockSandboxBackend {
 
 #[async_trait]
 impl SandboxBackend for MockSandboxBackend {
+    fn checkpoint_references(&self) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint_capacity(
+        &self,
+    ) -> Result<Option<super::checkpoint_capacity::CheckpointCapacity>> {
+        Ok(self.behavior.checkpoint_capacity.lock().unwrap().clone())
+    }
+
     fn metrics_sample(
         &self,
     ) -> Option<futures::future::BoxFuture<'static, Result<super::SandboxMetric>>> {
@@ -295,6 +315,17 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn wait_for_ready(&self) -> Result<()> {
         self.behavior.apply_async(MockOperation::WaitForReady).await
+    }
+
+    async fn pause_for_cold_boot(
+        &mut self,
+        artifact_root: &Path,
+        _tools_version: &str,
+        _resources: crate::types::SandboxResources,
+    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        // The mock exercises lifecycle ordering; disk/RAM format behavior is
+        // covered by the real Firecracker backend's tests.
+        self.pause(Some(artifact_root)).await
     }
 
     async fn pause(
@@ -424,6 +455,11 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}
+
+    async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        self.behavior.apply_async(MockOperation::BranchDisk).await?;
+        Ok(output_dir.join("image.json"))
+    }
 }
 
 // ── MockBackendFactory ────────────────────────────────────────────────────────

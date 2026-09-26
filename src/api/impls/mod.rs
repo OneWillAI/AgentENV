@@ -40,6 +40,11 @@ pub struct ApiImpl {
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
     build_sessions: Arc<image_build::BuildSessions>,
+    create_preparations: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
+    >,
 }
 
 impl ApiImpl {
@@ -65,6 +70,7 @@ impl ApiImpl {
             sandbox_proxy_domains,
             api_key,
             build_sessions: Arc::new(image_build::BuildSessions::default()),
+            create_preparations: Default::default(),
         }
     }
 

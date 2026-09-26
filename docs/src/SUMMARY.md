@@ -61,6 +61,7 @@
 # API Reference
 
 - [API Reference](./api/index.md)
+- [Disk Branching and Runtime Discovery](./internals/disk-branch-api.md)
 
 # Integration
 
@@ -69,6 +70,7 @@
 # Troubleshooting
 
 - [Common Issues](./troubleshooting/common-issues.md)
+- [Paused Sandbox Recovery](./troubleshooting/paused-sandbox-recovery.md)
 
 # Configuration
 

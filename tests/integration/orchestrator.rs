@@ -94,6 +94,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             auto_resume: false,
             custom_extension_params: None,
             secure: true,
+            idempotency: None,
             volume_mounts: std::collections::HashMap::new(),
         };
 
@@ -255,6 +256,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 secure: false,
+                idempotency: None,
                 volume_mounts: std::collections::HashMap::new(),
             })
             .await?;
@@ -355,6 +357,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 secure: false,
+                idempotency: None,
                 volume_mounts: std::collections::HashMap::new(),
             })
             .await?;

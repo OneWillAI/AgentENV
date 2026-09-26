@@ -13,3 +13,5 @@ Name | Type | Description | Notes
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
 
 
+
+**firecracker_pid** | Option<i32> | Firecracker PID after snapshot load, before resume. | [optional]
