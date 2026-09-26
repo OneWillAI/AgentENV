@@ -165,6 +165,7 @@ impl ApiImpl {
             .create_template_builder(
                 SandboxId::parse_str(id)?,
                 CreateSandboxRequest {
+                    idempotency: None,
                     source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
                     extra_drives: drives,
                     extra_drives_in_snapshot: false,

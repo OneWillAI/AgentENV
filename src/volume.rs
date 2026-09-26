@@ -252,6 +252,35 @@ impl VolumeManager {
         })
     }
 
+    /// Persistent backings can outlive every sandbox that mounted them. Include
+    /// their storage references when collecting paused-sandbox checkpoints, also
+    /// after restart when the in-memory materialization cache is empty.
+    pub(crate) async fn checkpoint_references(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut references = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self
+                .list_page(token.as_deref(), DEFAULT_VOLUME_PAGE_SIZE)
+                .await?;
+            for record in page.records {
+                let path = record
+                    .backing_image_config
+                    .unwrap_or_else(|| self.data_dir(&record.id).join("image.json"));
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        references.extend(crate::sandbox::checkpoint_references::image(&path)?)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            token = page.next_token;
+            if token.is_none() {
+                return Ok(references);
+            }
+        }
+    }
+
     pub fn data_dir(&self, volume_id: &str) -> PathBuf {
         self.root.join("data").join(volume_id)
     }
