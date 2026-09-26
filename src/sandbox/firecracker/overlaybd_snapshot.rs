@@ -824,7 +824,7 @@ mod tests {
                 &directory,
                 Some(local_layer_config(&next)),
                 MANAGED_BASE_LAYER_FILE,
-                &[artifacts.clone()],
+                std::slice::from_ref(&artifacts),
                 OverlaybdCompactOutput::Raw,
             )
             .await

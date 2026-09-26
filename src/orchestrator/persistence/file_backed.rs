@@ -302,7 +302,7 @@ impl FileBackedSandboxPersister {
         child_name: &std::ffi::OsStr,
     ) -> Option<PathBuf> {
         match stdfs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return None,
+            Ok(metadata) if metadata.file_type().is_symlink() => None,
             Ok(_) => {
                 let canonical_child = stdfs::canonicalize(path).ok()?;
                 (canonical_child.parent() == Some(canonical_parent)).then_some(canonical_child)
@@ -310,7 +310,7 @@ impl FileBackedSandboxPersister {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Some(canonical_parent.join(child_name))
             }
-            Err(_) => return None,
+            Err(_) => None,
         }
     }
 
@@ -446,6 +446,8 @@ impl FileBackedSandboxPersister {
         .await
     }
 
+    // Keep the independently validated recovery inputs explicit at this boundary.
+    #[expect(clippy::too_many_arguments)]
     async fn quarantine_with_policy(
         &self,
         reason: impl Into<String>,
@@ -1469,6 +1471,8 @@ impl FileBackedSandboxPersister {
         Ok(selection)
     }
 
+    // Keep the independently validated recovery inputs explicit at this boundary.
+    #[expect(clippy::too_many_arguments)]
     async fn reconcile_v2_index_entry(
         &self,
         key_id: Option<SandboxId>,
@@ -1545,6 +1549,8 @@ impl FileBackedSandboxPersister {
             && candidate.is_none_or(|entry| entry.matches_index(index))
     }
 
+    // Keep the independently validated recovery inputs explicit at this boundary.
+    #[expect(clippy::too_many_arguments)]
     async fn reconcile_invalid_index_entry(
         &self,
         key_id: Option<SandboxId>,

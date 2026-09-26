@@ -84,15 +84,18 @@ pub(super) fn plan(
                 root.clone(),
                 recovery_checkpoint_references(record.state.clone())?,
             );
-            if record.checkpoint_at_unix_ms.is_none()
-                || record.commit_state != PersistedPausedCommitState::Committed
-                || record.metadata.resume_recovery_pending
-                || root.join(".paused-record.v2.recovery-pending").exists()
-            {
-                retained.insert(root.clone());
-            } else {
-                complete.insert(root.clone());
-                successful.push((record.checkpoint_at_unix_ms.unwrap(), root.clone()));
+            match record.checkpoint_at_unix_ms {
+                Some(at)
+                    if record.commit_state == PersistedPausedCommitState::Committed
+                        && !record.metadata.resume_recovery_pending
+                        && !root.join(".paused-record.v2.recovery-pending").exists() =>
+                {
+                    complete.insert(root.clone());
+                    successful.push((at, root.clone()));
+                }
+                _ => {
+                    retained.insert(root.clone());
+                }
             }
             generations.insert(root, inventory);
         }
@@ -300,7 +303,11 @@ mod tests {
             // Another live guest can still need an old generation, including
             // its currently unreferenced layers. Do not prune within that root.
             fs::write(live.join("live-only.commit"), b"live")?;
-            let plan = collect(temp.path(), &[current.clone()], &[live.join("data.commit")])?;
+            let plan = collect(
+                temp.path(),
+                std::slice::from_ref(&current),
+                &[live.join("data.commit")],
+            )?;
             assert!(plan.retained_generations <= 3);
             assert!(live.join("live-only.commit").exists());
             assert!(previous.join("data.commit").exists());
@@ -370,11 +377,15 @@ mod tests {
                 "lowers": [{"file": current.join("data.commit")}, {"dir": cache.join("evicted"), "digest": format!("sha256:{}", "a".repeat(64))}]
             }))?,
         )?;
-        collect(&artifacts, &[current.clone()], &[cache.join("evicted")])?;
+        collect(
+            &artifacts,
+            std::slice::from_ref(&current),
+            &[cache.join("evicted")],
+        )?;
         assert!(!old.exists());
         assert!(rollback.exists());
         fs::remove_file(current.join("data.commit"))?;
-        assert!(collect(&artifacts, &[current.clone()], &[]).is_err());
+        assert!(collect(&artifacts, std::slice::from_ref(&current), &[]).is_err());
         assert!(rollback.exists());
         fs::write(current.join("data.commit"), b"restored")?;
         // A dangling alias cannot hide an unresolved reference into the store.

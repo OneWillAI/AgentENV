@@ -454,7 +454,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 
 enum CreatePreflight {
     Start(Option<CreateSandboxIdempotency>),
-    Replay(SandboxMetadata),
+    Replay(Box<SandboxMetadata>),
 }
 
 enum CreateRequestError {
@@ -546,7 +546,7 @@ impl ApiImpl {
             return Ok(CreatePreflight::Start(None));
         };
         match self.orchestrator.replay_create_if_present(create).await {
-            Ok(Some(metadata)) => Ok(CreatePreflight::Replay(metadata)),
+            Ok(Some(metadata)) => Ok(CreatePreflight::Replay(Box::new(metadata))),
             Ok(None) => Ok(CreatePreflight::Start(idempotency)),
             Err(error) => Err(CreateRequestError::from_orchestrator(error)),
         }
@@ -2422,6 +2422,7 @@ impl ApiImpl {
         {
             Ok(CreatePreflight::Start(idempotency)) => idempotency,
             Ok(CreatePreflight::Replay(metadata)) => {
+                let metadata = *metadata;
                 let sandbox_id = metadata.id.to_string();
                 return Ok(
                     SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -2517,6 +2518,7 @@ impl ApiImpl {
         {
             Ok(CreatePreflight::Start(idempotency)) => idempotency,
             Ok(CreatePreflight::Replay(metadata)) => {
+                let metadata = *metadata;
                 let sandbox_id = metadata.id.to_string();
                 return Ok(
                     SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -2552,7 +2554,7 @@ impl ApiImpl {
             };
             (mounts, Vec::new())
         } else {
-            match restore_snapshot_volume_mounts(self, &snapshot).await {
+            match restore_snapshot_volume_mounts(self, snapshot).await {
                 Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
                 Err(error) => {
                     return Ok(match error.code {

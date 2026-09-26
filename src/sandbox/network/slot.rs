@@ -1041,10 +1041,8 @@ fn refresh_guest_arp_in(
             // bounded two-second repair window.
             warn!(error = %format_args!("{error:#}"), attempt, "guest ARP refresh failed");
         }
-        if attempt < 39 {
-            if !cancellation.wait(Duration::from_millis(50)) {
-                return Ok(());
-            }
+        if attempt < 39 && !cancellation.wait(Duration::from_millis(50)) {
+            return Ok(());
         }
     }
     Ok(())
