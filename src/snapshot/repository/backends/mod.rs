@@ -171,6 +171,7 @@ mod tests {
                 bucket: "shared".to_owned(),
                 prefix: prefix.map(str::to_owned),
                 credential_process: None,
+                google_service_account: false,
                 access_key_id: None,
                 access_key_secret: None,
                 security_token: None,
