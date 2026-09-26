@@ -98,6 +98,7 @@ async fn publish_captured_snapshot_for_test(
                 virtualization_mode: agentenv::cfg::ConfigManager::global_config()
                     .virtualization_mode,
                 image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
                 custom_extension_params: None,
             },
             captured_snapshot,
@@ -375,6 +376,8 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
             env_vars: None,
             network: None,
             extra_mmds: serde_json::Map::new(),
+            extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             custom_extension_params: None,
             envd_access_token: None,
         };
@@ -576,6 +579,8 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         env_vars: None,
                         network: None,
                         extra_mmds: serde_json::Map::new(),
+                        extra_drives: Vec::new(),
+                        extra_drives_in_snapshot: false,
                         custom_extension_params: None,
                         envd_access_token: None,
                     };

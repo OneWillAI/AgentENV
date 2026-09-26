@@ -26,6 +26,13 @@ static BK_REMOTE_INFLIGHT: AtomicI64 = AtomicI64::new(0);
 /// (a trickle) instead of starving them outright.
 const BK_FLOOR_INFLIGHT: i64 = 1;
 
+/// Floor for startup-class prefetch reads (startup pack/manifest). Startup
+/// prefetch fetches the same working set the guest is about to touch — it is
+/// latency-critical like the foreground fault path, only more efficient —
+/// so it gets a much higher floor than steady-state background downloads.
+/// Still bounded so a resume storm cannot drown demand reads outright.
+const STARTUP_FLOOR_INFLIGHT: i64 = 8;
+
 const GATE_BACKOFF: Duration = Duration::from_millis(200);
 
 /// Fallback for the envd-ready wait: if no readiness notification arrives for
@@ -135,6 +142,18 @@ static GATE_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// The check-then-increment race can briefly push the floor one block higher
 /// than configured; that is benign and accepted over taking a lock.
 pub(crate) async fn gate_block_read(running: &AtomicBool) -> Option<BkReadPermit> {
+    gate_block_read_with_floor(running, BK_FLOOR_INFLIGHT).await
+}
+
+/// Like [`gate_block_read`], with the startup-class floor: startup pack and
+/// manifest prefetch reads are admitted well past the steady-state background
+/// floor, because they fetch the same latency-critical working set the guest
+/// is about to touch. Plain background downloads keep the floor of one.
+pub(crate) async fn gate_startup_block_read(running: &AtomicBool) -> Option<BkReadPermit> {
+    gate_block_read_with_floor(running, STARTUP_FLOOR_INFLIGHT).await
+}
+
+async fn gate_block_read_with_floor(running: &AtomicBool, floor: i64) -> Option<BkReadPermit> {
     loop {
         {
             // Hold the test mutex only for this admission check, never across
@@ -142,7 +161,7 @@ pub(crate) async fn gate_block_read(running: &AtomicBool) -> Option<BkReadPermit
             // that serialize on GATE_TEST_MUTEX.
             #[cfg(test)]
             let _test_guard = GATE_TEST_MUTEX.lock().await;
-            if let Some(permit) = try_admit_block_read(running) {
+            if let Some(permit) = try_admit_block_read(running, floor) {
                 return Some(permit);
             }
             if !running.load(Ordering::SeqCst) {
@@ -155,7 +174,7 @@ pub(crate) async fn gate_block_read(running: &AtomicBool) -> Option<BkReadPermit
 
 /// One admission check: admit immediately unless foreground reads are in
 /// flight and the background floor is used up.
-fn try_admit_block_read(running: &AtomicBool) -> Option<BkReadPermit> {
+fn try_admit_block_read(running: &AtomicBool, floor: i64) -> Option<BkReadPermit> {
     if !running.load(Ordering::SeqCst) {
         return None;
     }
@@ -166,7 +185,7 @@ fn try_admit_block_read(running: &AtomicBool) -> Option<BkReadPermit> {
     }
     BK_REMOTE_INFLIGHT
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |background| {
-            (background < BK_FLOOR_INFLIGHT).then_some(background + 1)
+            (background < floor).then_some(background + 1)
         })
         .ok()
         .map(|_| BkReadPermit)
@@ -175,7 +194,7 @@ fn try_admit_block_read(running: &AtomicBool) -> Option<BkReadPermit> {
 #[cfg(test)]
 async fn gate_block_read_inner(running: &AtomicBool) -> Option<BkReadPermit> {
     loop {
-        if let Some(permit) = try_admit_block_read(running) {
+        if let Some(permit) = try_admit_block_read(running, BK_FLOOR_INFLIGHT) {
             return Some(permit);
         }
         if !running.load(Ordering::SeqCst) {
@@ -248,7 +267,7 @@ mod tests {
                     .map(|_| {
                         scope.spawn(|| {
                             barrier.wait();
-                            try_admit_block_read(&running)
+                            try_admit_block_read(&running, BK_FLOOR_INFLIGHT)
                         })
                     })
                     .collect::<Vec<_>>();

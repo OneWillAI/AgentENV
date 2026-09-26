@@ -4,6 +4,7 @@ mod preservation;
 use std::sync::{Arc, RwLock};
 
 use agentenv::api::{server, ApiImpl};
+use agentenv::api_key::ApiKey;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
@@ -12,6 +13,7 @@ use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
+use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::sync::oneshot;
@@ -93,10 +95,13 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    let api_key = ApiKey::resolve(config)?;
+
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
+    agentenv::image::initialize_image_cache_p2p_transport(Arc::clone(&p2p_transport));
     let overlaybd_p2p =
         OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
 
@@ -128,8 +133,23 @@ async fn main() -> anyhow::Result<()> {
         &cluster_cpu_arc,
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
+    let volume_manager = Arc::new(
+        VolumeManager::open_with_repository_and_limits(
+            config.home_path.join("volumes/catalog"),
+            snapshot_manager.repository(),
+            VolumeLimits {
+                max_size_mb: config.volume.max_size_mb,
+                max_mounts: config.volume.max_volume_count,
+            },
+        )
+        .await?,
+    );
     let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
-    let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
+    let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
+        factory,
+        Arc::clone(&volume_manager),
+    )
+    .await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(
@@ -166,10 +186,15 @@ async fn main() -> anyhow::Result<()> {
         snapshot_manager,
         template_builder,
         image_resolver,
+        volume_manager,
         observability,
         config.sandbox_proxy.domains.clone(),
+        api_key,
     ));
-    let app = server::new(api_impl);
+    if let Err(error) = api_impl.recover_image_builds().await {
+        warn!(error = %format_args!("{error:#}"), "build recovery unavailable; will retry after startup");
+    }
+    let app = server::new(Arc::clone(&api_impl));
     let shutdown_orchestrator = Arc::clone(&orchestrator);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -182,9 +207,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     info!(target: "agentenv", addr = %addr, "API server listening");
+    let build_cleanup = api_impl.start_image_build_cleanup();
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
+            // Stop new startup-manifest continuations, then drain the
+            // in-flight ones (bounded): their manifests still land instead
+            // of being canceled, while this shutdown cannot hang on
+            // dying-daemon RPC timeouts.
+            agentenv::snapshot::drain_startup_manifest_tasks(std::time::Duration::from_secs(15))
+                .await;
+            build_cleanup.abort();
+            let _ = build_cleanup.await;
             if let Some(mut handle) = reporter.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {

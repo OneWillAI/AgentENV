@@ -9,7 +9,7 @@ This document lists AgentENV artifacts that can remain on disk or in object stor
 | `home_path` | `/var/lib/aenv` | `src/cfg.rs` | Base for paths containing the literal `$AENV_HOME` placeholder. `AENV_HOME_PATH` overrides it before placeholder expansion. |
 | `runtime_path` | `/run/aenv` | `src/cfg.rs`, `src/sandbox/network/*` | Base for transient namespace mount points and daemon sockets. `AENV_RUNTIME_PATH` overrides it. |
 | `deps_path` | `$AENV_HOME/deps` | `src/cfg.rs`, `src/setup/*` | Base for downloaded runtime dependencies. `AENV_DEPS_PATH` can place these rebuildable assets outside `home_path`. |
-| Managed envd access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | `src/sandbox/access.rs` | Node-local secret used when `[sandbox].access_token_hash_seed` is unset. It must be preserved with persisted secure sandboxes. |
+| Managed sandbox access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | `src/sandbox/access.rs` | Node-local secret used to derive envd and traffic tokens when `[sandbox].access_token_hash_seed` is unset. It must be preserved with persisted secure or private-ingress sandboxes. |
 | Firecracker sandbox work dirs | `$AENV_HOME/firecracker-work` with `agentenv-fc-` children | `src/sandbox/firecracker/*` | Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (`overlaybd/upper.data`, `overlaybd/upper.index`). An explicit `[firecracker].work_dir` overrides the root. |
 | `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
 | `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
@@ -37,7 +37,7 @@ Owned by `src/setup/*` and `src/cfg.rs`.
 | Overlaybd package downloads | `<deps_path>/overlaybd/downloads/*` | Temporary downloaded package archives | Setup staging for overlaybd release packages | Removed after a successful install. |
 | Generated overlaybd config | `$AENV_HOME/overlaybd/overlaybd-global.json`, `$AENV_HOME/overlaybd/mem-overlaybd-global.json`, `$AENV_HOME/overlaybd/convert-overlaybd-global.json`, `$AENV_HOME/overlaybd/resize-overlaybd-global.json` | Runtime global config, cache path, credentials config | Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (`overlaybd-apply`, `overlaybd-resize`), which get dedicated configs with isolated cacheDirs (`convert-blocks`, `resize-blocks`) and download disabled | Rewritten during setup/startup. |
 | Overlaybd runtime log | `$AENV_HOME/overlaybd/overlaybd.log` | Overlaybd runtime logs | Debugging | Appended by overlaybd runtime; no automatic GC. |
-| Managed envd access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | 32 random bytes encoded as lowercase hexadecimal | Derives stable per-sandbox envd access tokens when no explicit seed is configured | Atomically created with mode `0600` during normal startup and reused thereafter. Must not be deleted while secure sandboxes are persisted. |
+| Managed sandbox access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | 32 random bytes encoded as lowercase hexadecimal | Derives stable per-sandbox envd and traffic access tokens when no explicit seed is configured | Atomically created with mode `0600` during normal startup and reused thereafter. Must not be deleted while secure or private-ingress sandboxes are persisted. |
 
 ## Firecracker Sandbox
 
@@ -56,7 +56,7 @@ Owned by `src/sandbox/firecracker/*`.
 | Inherited runtime layers     | snapshot artifact dir `rootfs/inherited-layers/{index}/{source-file}` | Snapshot-owned hard links or copies of inherited runtime-created lower suffixes | Removes dependence on previous managed snapshot or persisted sandbox artifact roots | Created during pause when inherited lowers come from the managed snapshot root or another sandbox/generation under the same persisted `artifacts` root. | No.                                                          |
 | Attached-drive snapshot dirs | snapshot artifact dir `drives/{drive_id}/...`                | Per-drive image config and snapshot layer                 | Captures writable attached-drive state                       | Created alongside rootfs snapshot for each drive.            | No.                                                          |
 | Firecracker work dir         | configured work root, or consumed pool tempfile dir       | API socket, symlinks, runtime dirs, local logs            | Firecracker CWD for a sandbox                                | Created when sandbox handle is built, or moved from a warm pool entry; removed by owning `TempDir`. | Yes, except live state.                                      |
-| Firecracker serial logs      | `firecracker.serial_dir/{sandbox_id}/*`, or warm pool work dir logs | Firecracker stdout/stderr                                 | Debugging                                                    | Opened on spawn and appended. Warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC'd. | No, but disposable.                                          |
+| Firecracker serial logs      | `firecracker.serial_dir/{sandbox_id}/*`, or warm pool work dir logs | Firecracker stdout/stderr                                 | Debugging                                                    | Opened on spawn and appended only when `firecracker.log_level` is non-empty or an explicit Rust capture destination is set. Enabled warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC'd. | No, but disposable.                                          |
 | Firecracker logger output    | `firecracker.log` in the same per-sandbox log directory as the serial logs | Firecracker internal logger (`PUT /logger`)               | Debugging                                                    | Only created when `firecracker.log_level` is set to a non-empty level. Written by Firecracker itself; not automatically GC'd. | No, but disposable.                                          |
 
 ### Firecracker Pool
@@ -66,7 +66,7 @@ Owned by `src/sandbox/firecracker/pool.rs`.
 | Artifact           | Location                                                     | Contents                                               | Purpose                             | Lifecycle                                                    |
 | ------------------ | ------------------------------------------------------------ | ------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------ |
 | Warm pool work dir | system tempfile dir | Firecracker socket and warm process logs               | Pre-spawned Firecracker process CWD | Created by pool maintenance as a `TempDir`. Removed when warm entry is cleaned up, or moved into the consuming sandbox and later dropped there. |
-| Warm pool logs     | warm pool work dir `firecracker-stdout.log`, `firecracker-stderr.log` | Firecracker output before the warm process is consumed | Debugging warm startup              | Created on warm spawn. Relocated into sandbox log path when consumed if no explicit stdout/stderr override. |
+| Warm pool logs     | warm pool work dir `firecracker-stdout.log`, `firecracker-stderr.log` | Firecracker output before the warm process is consumed | Debugging warm startup              | Created on warm spawn only when `firecracker.log_level` is non-empty. Relocated into sandbox log path when consumed if no explicit stdout/stderr override. |
 
 ## Extra Drives
 
@@ -78,6 +78,35 @@ Owned by `src/sandbox/extra_drive.rs` and Firecracker snapshot code.
 | Extra-drive symlink           | sandbox work dir `extra-drive-{drive_id}`          | Symlink to `/dev/ublkbN` device path             | Firecracker drive attachment path                            | Created after ublk runtime device creation. Removed on rollback or work dir cleanup. | Yes.                                      |
 | Extra-drive snapshot artifact | snapshot artifact dir `drives/{drive_id}/...`      | Captured drive overlaybd config and commit layer | Preserve attached-drive writable state across pause/resume/publish | Created during sandbox snapshot/pause. Later owned by persister, managed root, or repository publish flow. | No.                                       |
 
+## Snapshot Storage Model
+
+Snapshot data passes through three storage layers with different ownership and
+lifetime rules:
+
+1. **Builder staging** is a manager-owned temporary workspace under
+   `<snapshot.local_cache_path>/snapshots/<id>/`. It holds local rootfs,
+   memory, VM-state, and attached-drive artifacts while a build or capture is
+   in progress. It is not the durable snapshot record.
+2. **The committed snapshot repository** stores the snapshot catalog,
+   aliases, `snapshot.json`, `firecracker-manifest.json`, `vm_state.bin`, and
+   referenced managed layers. This is the durable source of truth exposed by
+   the template and snapshot APIs.
+3. **The node-local runtime cache** materializes runnable rootfs, memory, and
+   drive `image.json` files under
+   `<snapshot.local_cache_path>/runtime/<id>/` before launch. These files are
+   derived runtime inputs and can be rebuilt from committed state.
+
+The committed `snapshot.json` records the captured runtime context, startup
+configuration, and rootfs, drive, and memory layer references. The Firecracker
+manifest records launch metadata such as virtual sizes and attached-drive
+configuration. Temporary upper files and generated `image.json` files are not
+committed snapshot truth.
+
+During runtime resolution, AgentENV converts the committed layer references
+into node-local rootfs, memory, and attached-drive configs, hydrates the
+Firecracker manifest with node-local paths, and resolves the committed
+`vm_state.bin` into a runnable path.
+
 ## Image Resolver
 
 Owned by `src/image/*`.
@@ -88,6 +117,7 @@ Owned by `src/image/*`.
 | Image metadata sidecar | `<image.cache.root_dir>/configs/*.metadata.json` | Base env/workdir metadata from OCI image config | Preserves image launch context beside cached image config | Written after image config. Rebuilt if missing while image config is usable. |
 | Overlaybd commit cache | `<image.cache.root_dir>/commits/{digest-slug}/overlaybd.commit` | Content-addressed overlaybd commit layers from standard OCI conversion, and target dirs for remote overlaybd-native layers | Node-local reusable layer store for user image layers | Standard OCI conversion writes commits. Remote overlaybd-native configs point `dir` here for runtime population. No unified GC today. |
 | OCI conversion index | `<image.cache.root_dir>/indexes/{source-digest}/...json` | Mapping from OCI source layer/context to overlaybd commit digest and size | Skips repeated layer conversion when converted commits exist | Written after successful standard OCI conversion. No unified GC today. |
+| Converted OCI layer P2P artifact | P2P catalog key `oci-layer/v1/{context-hash}` | A completed OverlayBD commit plus its conversion context and output digest/size | Lets another node reuse a compatible standard-OCI conversion | Published as a Reference after the local commit is durable; ownership is persisted on the hard-commit record and removed by image-cache GC. |
 | Temporary OCI pull/conversion work | process temp dir | OCI layout and per-layer conversion workspace | Intermediate input for standard OCI conversion | Owned by `TempDir`; removed after conversion scope exits. |
 
 ## Snapshot Repository

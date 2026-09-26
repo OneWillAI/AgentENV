@@ -112,6 +112,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub sandbox: SandboxConfig,
     #[config(nested)]
+    pub volume: VolumeConfig,
+    #[config(nested)]
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
     pub snapshot: SnapshotConfig,
@@ -125,6 +127,8 @@ pub struct AppConfig {
     pub cluster: ClusterConfig,
     #[config(nested)]
     pub node_identity: NodeIdentityConfig,
+    #[config(nested)]
+    pub template_build: TemplateBuildConfig,
     #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
     #[config(nested)]
@@ -174,12 +178,12 @@ pub struct FirecrackerConfig {
     pub work_dir: Option<PathBuf>,
     /// Optional override for the persistent Firecracker serial output directory.
     /// Defaults to `$AENV_HOME/logs/serial` after normalization.
-    /// Files are grouped under `{serial_dir}/{sandbox_id}/`.
+    /// Files are grouped under `{serial_dir}/{sandbox_id}/` when logging is enabled.
     #[config(env = "AENV_FIRECRACKER_SERIAL_DIR", parse_env = parse_required_path)]
     pub serial_dir: Option<PathBuf>,
     /// Optional Firecracker log level (e.g. "Error", "Warning", "Info", "Debug", "Trace").
-    /// When set (non-empty), Firecracker logging is enabled and written to a
-    /// `firecracker.log` file in the same directory as the Firecracker stdout log.
+    /// When set (non-empty), enables stdout/stderr capture and Firecracker logging
+    /// to `firecracker.log` in the same directory. Unset/empty disables all three.
     pub log_level: Option<String>,
 }
 
@@ -322,6 +326,16 @@ impl std::fmt::Debug for SandboxConfig {
 }
 
 #[derive(Debug, Config, Clone)]
+pub struct VolumeConfig {
+    /// Operator-configured maximum persistent volume size in MiB.
+    #[config(default = 262144u64)]
+    pub max_size_mb: u64,
+    /// Maximum number of persistent volumes a sandbox may mount.
+    #[config(default = 4usize)]
+    pub max_volume_count: usize,
+}
+
+#[derive(Debug, Config, Clone)]
 pub struct MachineConfig {
     #[config(default = 2u32)]
     pub vcpu_count: u32,
@@ -371,6 +385,10 @@ pub struct SnapshotConfig {
     pub p2p_enabled: bool,
     #[config(nested)]
     pub image_publish: SnapshotImagePublishConfig,
+    #[config(nested)]
+    pub publish_compression: SnapshotPublishCompressionConfig,
+    #[config(nested)]
+    pub memory_startup_pack: SnapshotStartupPackConfig,
 }
 
 #[derive(Debug, Clone, Config)]
@@ -388,6 +406,73 @@ pub struct SnapshotImagePublishConfig {
     pub enabled: bool,
 }
 
+/// Publish-time compression for snapshot layers uploaded to OSS/ACR. Local
+/// layers always stay raw so local resume pays no decompression cost; when
+/// enabled, memory layers and incremental read-write layers are compressed
+/// once as they are uploaded, cutting network bytes for cross-node resume.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotPublishCompressionConfig {
+    #[config(default = true)]
+    pub enabled: bool,
+    #[config(default = "lz4")]
+    pub algorithm: OverlaybdCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub workers: usize,
+}
+
+/// Bucket addressing style for the S3-compatible snapshot backend.
+///
+/// When unset, the backend auto-detects the style: Alibaba OSS and
+/// bucket-in-endpoint hosts use virtual-host addressing, and everything else
+/// falls back to path style. Set this explicitly when a provider's required
+/// or preferred style differs from that default.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OssAddressingStyle {
+    Path,
+    Virtual,
+}
+
+/// Publish-time startup memory manifest (OSS backend only). Records the
+/// pages touched during a short local re-resume at capture, uploads a tiny
+/// v3 page manifest in first-touch order, and prefetches the listed
+/// positions concurrently on cold resume. Pages not yet prefetched fall back
+/// to the normal OverlayBD demand path immediately.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotStartupPackConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Minimum observation window after the recording device's first read.
+    #[config(default = 200u64)]
+    pub record_min_window_ms: u64,
+    /// Stop recording when no new page AND no in-flight read persists for
+    /// this long (in-flight reads never count as quiet).
+    #[config(default = 300u64)]
+    pub record_quiet_ms: u64,
+    /// Hard cap of the recording window.
+    #[config(default = 2000u64)]
+    pub record_max_window_ms: u64,
+    /// Best-effort budget for prepare + record + package; aborts the pack
+    /// (not the publish) when exceeded. Cleanup is NOT bounded by this.
+    #[config(default = 10u64)]
+    pub record_budget_secs: u64,
+    /// Per-pack page-data cap (hard truncation in the pack writer).
+    #[config(default = 1073741824u64)]
+    pub max_pack_bytes: u64,
+    /// Consume startup manifests at resume time (A/B switch, independent of
+    /// recording): register the manifest's layers with the shared layer cache
+    /// and prefetch their listed blocks. Legacy v1/v2 records and missing
+    /// descriptors always fall back to plain on-demand resume.
+    #[config(default = false)]
+    pub consume_enabled: bool,
+    /// Hard bound on a manifest's queueing plus download time; an overdue
+    /// manifest fails and resume proceeds on-demand.
+    #[config(default = 30u64)]
+    pub consume_timeout_secs: u64,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct OssBackendConfig {
     pub endpoint: String,
@@ -401,6 +486,8 @@ pub struct OssBackendConfig {
     pub access_key_secret: Option<String>,
     pub security_token: Option<String>,
     pub region: Option<String>,
+    #[serde(alias = "addressingStyle", alias = "addressing-style")]
+    pub addressing_style: Option<OssAddressingStyle>,
     pub cache_max_size_gb: Option<u64>,
 }
 
@@ -453,6 +540,11 @@ pub struct UblkOverlaybdTomlConfig {
     /// Timeout for the OverlayBD resize tool. Default: `120`.
     #[config(default = 120u64)]
     pub resize_timeout_secs: u64,
+    /// Worker threads of the overlaybd runtime's dedicated remote-I/O
+    /// runtime (OSS/registry downloads); written as `remoteIoWorkers` into
+    /// generated overlaybd global configs. Default: `4`.
+    #[config(default = 4u64)]
+    pub remote_io_workers: u64,
     /// Enable overlaybd layer-level background download. Default: `false`.
     #[config(default = false)]
     pub download_enable: bool,
@@ -466,7 +558,7 @@ pub struct UblkOverlaybdTomlConfig {
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MemorySnapshotCompressionAlgorithm {
+pub enum OverlaybdCompressionAlgorithm {
     #[default]
     Lz4,
     Zstd,
@@ -477,19 +569,28 @@ pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
-    /// Default: false, preserving the mincore-based path.
-    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = false)]
+    /// Default: true; set the environment variable to false to use mincore.
+    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
-    #[config(default = false)]
-    pub compression_enabled: bool,
-    #[config(default = "lz4")]
-    pub compression_algorithm: MemorySnapshotCompressionAlgorithm,
-    /// Number of blocking threads used to compress 4KiB blocks within a
-    /// memory layer. 1 = sequential (identical output layout at any value).
-    #[config(default = 1)]
-    pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
+}
+
+/// Resources for managed Dockerfile build workers.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    /// Maximum managed builds admitted per node, including publication and cleanup.
+    #[config(default = 4usize)]
+    pub max_concurrent_builds: usize,
+    #[config(default = "docker.io/moby/buildkit:v0.33.0")]
+    pub builder_image: String,
+    #[config(default = 16u32)]
+    pub builder_cpu_count: u32,
+    #[config(default = 32768u32)]
+    pub builder_memory_mb: u32,
+    /// Capacity of each build's writable clone of the repository's shared cache seed.
+    #[config(default = 65536u64)]
+    pub cache_size_mb: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -575,6 +676,11 @@ pub struct NodeIdentityConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct OrchestratorConfig {
+    #[config(default = 15u64)]
+    pub metrics_interval_secs: u64,
+    #[config(default = 3600u64)]
+    pub metrics_retention_secs: u64,
+
     #[config(default = 1000u64)]
     pub auto_evict_interval_ms: u64,
     #[config(default = 15u64)]
@@ -651,12 +757,15 @@ impl_config_default!(
     SandboxProxyConfig,
     EnvdConfig,
     SandboxConfig,
+    VolumeConfig,
     MachineConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
+    SnapshotPublishCompressionConfig,
     UblkTomlConfig,
     UblkOverlaybdTomlConfig,
     MemorySnapshotConfig,
+    TemplateBuildConfig,
     MemorySnapshotBackgroundDownloadConfig,
     ObservabilityConfig,
     ObservabilitySchedulerReportConfig,
@@ -917,6 +1026,13 @@ impl AppConfig {
         }
 
         self.p2p.store_dir = resolve_path(&self.home_path, config_dir, &self.p2p.store_dir);
+
+        // Dirty-page tracking is a KVM-only default. Disable it before
+        // validation so an existing PVM configuration needs no new override.
+        if self.virtualization_mode == VirtualizationMode::Pvm {
+            self.memory_snapshot.track_dirty_pages = false;
+        }
+
         self.cluster.normalize();
         self.sandbox_proxy.normalize()?;
 
@@ -947,9 +1063,58 @@ impl AppConfig {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
         self.validate_memory_snapshot_options()?;
+        if self.ublk.overlaybd.remote_io_workers == 0 {
+            bail!("invalid ublk.overlaybd config: remote_io_workers must be > 0");
+        }
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_volume_limits()?;
+        self.validate_template_builder()?;
+        Ok(())
+    }
+
+    fn validate_template_builder(&self) -> Result<()> {
+        let builder = &self.template_build;
+        if builder.max_concurrent_builds == 0 {
+            bail!("template_build.max_concurrent_builds must be greater than 0");
+        }
+        if builder.builder_image.trim().is_empty() {
+            bail!("template_build.builder_image must not be empty");
+        }
+        if !(1..=255).contains(&builder.builder_cpu_count) {
+            bail!("template_build.builder_cpu_count must be between 1 and 255");
+        }
+        if !(256..=i32::MAX as u32).contains(&builder.builder_memory_mb) {
+            bail!(
+                "template_build.builder_memory_mb must be between 256 and {} MiB",
+                i32::MAX
+            );
+        }
+        if builder.cache_size_mb < 1024 {
+            bail!("template_build.cache_size_mb must be at least 1024 MiB");
+        }
+        Ok(())
+    }
+
+    fn validate_volume_limits(&self) -> Result<()> {
+        if self.volume.max_size_mb == 0 {
+            bail!("volume.max_size_mb must be greater than 0");
+        }
+        if self.volume.max_size_mb > u64::MAX / (1024 * 1024) {
+            bail!(
+                "volume.max_size_mb must be at most {}",
+                u64::MAX / (1024 * 1024)
+            );
+        }
+        if self.volume.max_volume_count == 0
+            || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
+        {
+            bail!(
+                "volume.max_volume_count must be between 1 and {}",
+                crate::volume::MAX_VOLUME_MOUNTS
+            );
+        }
         Ok(())
     }
 
@@ -1364,11 +1529,61 @@ mod tests {
     }
 
     #[test]
+    fn pvm_config_disables_dirty_page_tracking() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("pvm.toml");
+        std::fs::write(&path, "virtualization_mode = \"pvm\"")?;
+
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(config.config().virtualization_mode, VirtualizationMode::Pvm);
+        assert!(!config.config().memory_snapshot.track_dirty_pages);
+        Ok(())
+    }
+
+    #[test]
     fn sandbox_access_token_seed_is_redacted() {
         let config = SandboxConfig {
             access_token_hash_seed: Some("cluster-secret".to_string()),
         };
         assert!(!format!("{config:?}").contains("cluster-secret"));
+    }
+
+    #[test]
+    fn template_builder_defaults_and_validation() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.template_build.builder_cpu_count, 16);
+        assert_eq!(config.template_build.builder_memory_mb, 32768);
+        assert_eq!(config.template_build.max_concurrent_builds, 4);
+        assert_eq!(config.template_build.cache_size_mb, 65536);
+        assert_eq!(
+            config.template_build.builder_image,
+            format!(
+                "docker.io/moby/buildkit:{}",
+                include_str!("../config/buildkit-version").trim()
+            )
+        );
+        config.validate_template_builder().unwrap();
+        config.template_build.max_concurrent_builds = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.max_concurrent_builds = 1;
+        config.validate_template_builder().unwrap();
+        config.template_build.builder_cpu_count = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_cpu_count = 16;
+        config.template_build.builder_memory_mb = 255;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_memory_mb = i32::MAX as u32;
+        config.validate_template_builder().unwrap();
+        config.template_build.builder_memory_mb += 1;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_memory_mb = 32768;
+        config.volume.max_size_mb = 8192;
+        config.validate().unwrap();
+        config.template_build.cache_size_mb = 1023;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.cache_size_mb = 65536;
+        config.template_build.builder_image = " ".into();
+        assert!(config.validate_template_builder().is_err());
     }
 
     #[test]
@@ -1486,6 +1701,29 @@ mod tests {
         config
             .validate()
             .expect("consistent disk rate limit config passes");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_volume_limits() {
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = u64::MAX;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
     }
 
     #[test]

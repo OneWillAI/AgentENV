@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn cold_boot_upper_uses_requested_format_and_never_replaces_existing_state() -> Result<()> {
         use overlaybd::config::{load_image_config, UpperMode};
-        use overlaybd::lsmt::file::{validate_rw_header_pair_paths, RwLayout};
+        use overlaybd::index_file::{validate_rw_header_pair_paths, RwLayout};
 
         for mode in [
             UpperMode::LogStructured,
@@ -133,7 +133,14 @@ mod tests {
         ] {
             let root = tempfile::tempdir()?;
             let image = root.path().join("image.json");
-            std::fs::write(&image, b"{}")?;
+            let lower = root.path().join("disk.commit");
+            std::fs::write(&lower, b"retained immutable disk layer")?;
+            std::fs::write(
+                &image,
+                serde_json::to_vec(&serde_json::json!({
+                    "lowers": [{"file": lower}]
+                }))?,
+            )?;
             prepare_writable_disk(&image, 1024 * 1024, mode)?;
             let config = load_image_config(&image)?;
             assert_eq!(config.upper.mode, Some(mode));

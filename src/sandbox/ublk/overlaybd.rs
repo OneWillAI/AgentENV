@@ -12,29 +12,32 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::device::UblkDevice;
-use crate::cfg::{MemorySnapshotCompressionAlgorithm, MemorySnapshotConfig};
+use crate::cfg::{OverlaybdCompressionAlgorithm, SnapshotPublishCompressionConfig};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OverlaybdCompactOutput {
     Raw,
     ZFile {
-        algorithm: MemorySnapshotCompressionAlgorithm,
+        algorithm: OverlaybdCompressionAlgorithm,
         workers: usize,
     },
 }
 
 impl OverlaybdCompactOutput {
     /// Maximum persistent compression threads. Prevents absurd config values
-    /// from spawning thousands of OS threads during a production pause.
+    /// from spawning thousands of OS threads during layer upload.
     const MAX_COMPRESSION_WORKERS: usize = 64;
 
-    pub(crate) fn from_memory_snapshot_config(config: &MemorySnapshotConfig) -> Self {
-        if config.compression_enabled {
+    /// Resolve the `[snapshot.publish_compression]` switch into the layer
+    /// output mode applied when recontainerizing local raw layers for upload.
+    /// Capture paths never consult this: local layers always stay raw.
+    pub(crate) fn from_publish_compression_config(
+        config: &SnapshotPublishCompressionConfig,
+    ) -> Self {
+        if config.enabled {
             Self::ZFile {
-                algorithm: config.compression_algorithm,
-                workers: config
-                    .compression_workers
-                    .clamp(1, Self::MAX_COMPRESSION_WORKERS),
+                algorithm: config.algorithm,
+                workers: config.workers.clamp(1, Self::MAX_COMPRESSION_WORKERS),
             }
         } else {
             Self::Raw
@@ -51,8 +54,8 @@ pub(crate) async fn create_commit_args(
         OverlaybdCompactOutput::Raw => CommitArgs::new(output),
         OverlaybdCompactOutput::ZFile { algorithm, workers } => {
             let algorithm = match algorithm {
-                MemorySnapshotCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
-                MemorySnapshotCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
+                OverlaybdCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
+                OverlaybdCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
             };
             let mut compress_args = CompressArgs::new(CompressOptions::new(
                 algorithm,
@@ -104,14 +107,11 @@ pub(crate) async fn compact_layers(
         return Ok(None);
     }
 
-    let io_ring = overlaybd::transient_io_ring::shared_transient_io_ring();
-
     let mut src_files: Vec<Arc<dyn VirtualFile>> = Vec::with_capacity(layers.len());
     for layer in layers {
         let path = Path::new(&layer.file);
         let local: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(path, io_ring.clone())
-                .await
+            LocalFile::open_ro(path)
                 .with_context(|| format!("open layer for compaction: {}", path.display()))?,
         );
         let tar_adapted = overlaybd::backend::tar::new_tar_file_adaptor(local)
@@ -127,11 +127,8 @@ pub(crate) async fn compact_layers(
 
     let lower_tmp = output_path.with_extension(format!("commit.{}.tmp", Uuid::now_v7()));
     let build_result: Result<()> = async {
-        let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring)
-                .await
-                .context("create compacted layer output file")?,
-        );
+        let output_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::new(&lower_tmp).context("create compacted layer output file")?);
         let commit_args = create_commit_args(output_file, mode, 32).await?;
         merge_files_ro(&src_files, commit_args)
             .await
@@ -167,7 +164,6 @@ mod tests {
     use overlaybd::backend::switch::new_switch_file;
     use overlaybd::backend::tar::new_tar_file_adaptor;
     use overlaybd::index_file::{LSMTFile, LSMTReadOnlyFile};
-    use overlaybd::transient_io_ring::shared_transient_io_ring;
     use overlaybd::zfile::is_zfile;
 
     async fn create_sealed_layer(
@@ -177,16 +173,11 @@ mod tests {
         writes: &[(u64, u8)],
         zfile_algo: Option<u8>,
     ) -> PathBuf {
-        let io_ring = shared_transient_io_ring();
         let data = Arc::new(
-            LocalFile::new(dir.join(format!("{name}.data")), io_ring.clone())
-                .await
-                .expect("create layer data file"),
+            LocalFile::new(dir.join(format!("{name}.data"))).expect("create layer data file"),
         );
         let index = Arc::new(
-            LocalFile::new(dir.join(format!("{name}.index")), io_ring.clone())
-                .await
-                .expect("create layer index file"),
+            LocalFile::new(dir.join(format!("{name}.index"))).expect("create layer index file"),
         );
         let layer = LSMTFile::create(data, Some(index), vsize, false)
             .await
@@ -198,11 +189,8 @@ mod tests {
                 .expect("write layer page");
         }
         let commit_path = dir.join(format!("{name}.commit"));
-        let output: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&commit_path, io_ring)
-                .await
-                .expect("create layer commit output"),
-        );
+        let output: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::new(&commit_path).expect("create layer commit output"));
         match zfile_algo {
             Some(algo) => {
                 let compress_args = CompressArgs::new(CompressOptions::new(
@@ -231,11 +219,8 @@ mod tests {
     }
 
     async fn read_sealed_layer(path: &Path, len: usize) -> (i32, Vec<u8>) {
-        let local: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(path, shared_transient_io_ring())
-                .await
-                .expect("open sealed layer"),
-        );
+        let local: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(path).expect("open sealed layer"));
         let zfile_flag = is_zfile(local.clone()).await.expect("probe zfile header");
         let display = path.display().to_string();
         let tar_adapted = new_tar_file_adaptor(local).await.expect("tar adaptor");
@@ -300,7 +285,7 @@ mod tests {
             (
                 "lz4",
                 OverlaybdCompactOutput::ZFile {
-                    algorithm: MemorySnapshotCompressionAlgorithm::Lz4,
+                    algorithm: OverlaybdCompressionAlgorithm::Lz4,
                     // Exercise the segmented parallel compression path.
                     workers: 2,
                 },
@@ -309,7 +294,7 @@ mod tests {
             (
                 "zstd",
                 OverlaybdCompactOutput::ZFile {
-                    algorithm: MemorySnapshotCompressionAlgorithm::Zstd,
+                    algorithm: OverlaybdCompressionAlgorithm::Zstd,
                     workers: 1,
                 },
                 1,
@@ -343,5 +328,45 @@ mod tests {
             before
         );
         assert!(!output_path.with_extension("commit.tmp").exists());
+    }
+
+    #[test]
+    fn compact_output_from_publish_compression_config() {
+        let disabled = SnapshotPublishCompressionConfig {
+            enabled: false,
+            algorithm: OverlaybdCompressionAlgorithm::Lz4,
+            workers: 1,
+        };
+        assert_eq!(
+            OverlaybdCompactOutput::from_publish_compression_config(&disabled),
+            OverlaybdCompactOutput::Raw
+        );
+
+        let zstd = SnapshotPublishCompressionConfig {
+            enabled: true,
+            algorithm: OverlaybdCompressionAlgorithm::Zstd,
+            // Zero workers clamps to sequential.
+            workers: 0,
+        };
+        assert_eq!(
+            OverlaybdCompactOutput::from_publish_compression_config(&zstd),
+            OverlaybdCompactOutput::ZFile {
+                algorithm: OverlaybdCompressionAlgorithm::Zstd,
+                workers: 1,
+            }
+        );
+
+        let clamped = SnapshotPublishCompressionConfig {
+            enabled: true,
+            algorithm: OverlaybdCompressionAlgorithm::Lz4,
+            workers: usize::MAX,
+        };
+        assert_eq!(
+            OverlaybdCompactOutput::from_publish_compression_config(&clamped),
+            OverlaybdCompactOutput::ZFile {
+                algorithm: OverlaybdCompressionAlgorithm::Lz4,
+                workers: OverlaybdCompactOutput::MAX_COMPRESSION_WORKERS,
+            }
+        );
     }
 }

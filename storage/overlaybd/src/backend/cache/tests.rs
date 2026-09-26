@@ -1,7 +1,8 @@
 use super::super::local::LocalFile;
 use super::*;
+use crate::backend::cache::full_file_cache::cache_store::CacheAdvice;
 use crate::io::virtual_file::VirtualFile;
-use crate::test_utils::test_io_ring;
+use crate::sys;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -414,7 +415,7 @@ fn uniform_char_random_data(size: usize, seed: u64) -> Vec<u8> {
 }
 
 async fn write_local_file(path: &Path, data: &[u8]) -> Result<()> {
-    let file = LocalFile::new(path, test_io_ring()).await?;
+    let file = LocalFile::new(path)?;
     let _ = file.write_at(0, data).await?;
     file.sync().await?;
     Ok(())
@@ -685,11 +686,7 @@ async fn test_background_download_saturated_scheduler_completes_all_tasks() {
         write_local_file(&src_path, &payload)
             .await
             .expect("write source");
-        let source = Arc::new(
-            LocalFile::open_ro(&src_path, test_io_ring())
-                .await
-                .expect("open source"),
-        );
+        let source = Arc::new(LocalFile::open_ro(&src_path).expect("open source"));
         let file = backend
             .open_file_with_source_size(format!("saturated-{index}"), source, payload.len() as u64)
             .await
@@ -1327,11 +1324,7 @@ async fn test_ro_cached_fs_basic() {
         .await
         .expect("write source");
 
-    let source = Arc::new(
-        LocalFile::open_ro(&src_path, test_io_ring())
-            .await
-            .expect("open source"),
-    );
+    let source = Arc::new(LocalFile::open_ro(&src_path).expect("open source"));
     let mut opt = test_options(tmp.path());
     opt.block_size = 1024 * 1024;
     opt.capacity_bytes = 512 * 1024 * 1024;
@@ -1408,11 +1401,7 @@ async fn test_ro_cached_fs_basic() {
     write_local_file(&small_path, &small_payload)
         .await
         .expect("write small source");
-    let small_source = Arc::new(
-        LocalFile::open_ro(&small_path, test_io_ring())
-            .await
-            .expect("open small"),
-    );
+    let small_source = Arc::new(LocalFile::open_ro(&small_path).expect("open small"));
     let small_cached = backend
         .open_file("/testDir/small", small_source)
         .await
@@ -1433,11 +1422,7 @@ async fn test_ro_cached_fs_basic() {
     write_local_file(&refill_path, &refill_payload)
         .await
         .expect("write refill source");
-    let refill_source = Arc::new(
-        LocalFile::open_ro(&refill_path, test_io_ring())
-            .await
-            .expect("open refill"),
-    );
+    let refill_source = Arc::new(LocalFile::open_ro(&refill_path).expect("open refill"));
     let refill_cached = backend
         .open_file("/testDir/refill", refill_source)
         .await
@@ -1473,14 +1458,14 @@ async fn test_ro_cached_fs_basic() {
     assert_eq!(prefetched.as_ref(), &payload[page_size..page_size * 3]);
 
     cached
-        .fadvise(234, (5000 * page_size) as u64, libc::POSIX_FADV_WILLNEED)
+        .fadvise(234, (5000 * page_size) as u64, CacheAdvice::WillNeed)
         .await
         .expect("fadvise large prefetch");
     cached
         .fadvise(
             (aligned_size - page_size) as u64,
             (5000 * page_size) as u64,
-            libc::POSIX_FADV_WILLNEED,
+            CacheAdvice::WillNeed,
         )
         .await
         .expect("fadvise tail prefetch");
@@ -1626,44 +1611,29 @@ async fn test_ro_cached_fs_xattr() {
     let name = CString::new("user.testxattr").expect("name cstr");
     let value = b"yes";
 
-    unsafe {
-        // SAFETY: pointers are valid and lengths are exact for libc xattr calls.
-        let ret = libc::setxattr(
-            path_c.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr() as *const libc::c_void,
-            value.len(),
-            0,
-        );
-        if ret != 0 {
-            let err = Errno::last();
-            let unsupported = err == Errno::ENOTSUP
-                || (libc::EOPNOTSUPP != libc::ENOTSUP && err == Errno::EOPNOTSUPP);
-            if unsupported {
-                return;
-            }
+    // Set the attribute out of band so the cached-fs layer has a real one to
+    // read back. Going through `crate::sys` rather than raw libc keeps this
+    // portable and drops the `unsafe` block.
+    if let Err(err) = sys::setxattr(&path_c, &name, value, 0) {
+        let sys::SysError::Errno(errno) = err else {
             panic!("setxattr failed: {err}");
+        };
+        // Compared rather than matched: `ENOTSUP` and `EOPNOTSUPP` share a value
+        // on Linux, so listing both as match arms would be an unreachable arm
+        // there while still being two distinct codes elsewhere.
+        if errno == Errno::ENOTSUP || errno == Errno::EOPNOTSUPP {
+            // This filesystem has no xattr support; nothing to exercise.
+            return;
         }
-
-        let mut out = [0u8; 32];
-        let got = libc::getxattr(
-            path_c.as_ptr(),
-            name.as_ptr(),
-            out.as_mut_ptr() as *mut libc::c_void,
-            out.len(),
-        );
-        assert_eq!(got as usize, value.len());
-        assert_eq!(&out[..value.len()], value);
-
-        let ret = libc::removexattr(path_c.as_ptr(), name.as_ptr());
-        assert_eq!(ret, 0);
+        panic!("setxattr failed: {errno}");
     }
 
-    let source = Arc::new(
-        LocalFile::open_rw(&path, false, test_io_ring())
-            .await
-            .expect("open source"),
-    );
+    let got = sys::getxattr(&path_c, &name).expect("getxattr");
+    assert_eq!(got, value);
+
+    sys::removexattr(&path_c, &name).expect("removexattr");
+
+    let source = Arc::new(LocalFile::open_rw(&path, false).expect("open source"));
     let backend = FileCacheBackend::with_options(test_options(tmp.path()))
         .await
         .expect("backend");
@@ -2108,7 +2078,7 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs.clone()), backend.clone());
 
     let cached = cached_fs.open("/dir/file", 0).await.expect("open cached");
@@ -2212,7 +2182,7 @@ async fn test_cached_fs_facade_unlink_prefers_source_fs_status() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend.clone());
 
     let cached = cached_fs.open("/unlink-me", 0).await.expect("open cached");
@@ -2249,7 +2219,7 @@ async fn test_cached_fs_facade_path_xattr_passthrough() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend);
 
     let name = "user.cachedfsxattr";
@@ -2310,7 +2280,7 @@ async fn test_cached_fs_facade_source_fs_passthrough_misc() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend);
 
     cached_fs
@@ -2688,5 +2658,102 @@ async fn test_eviction_clears_bitmap_before_destroying_data() {
             .as_ref(),
         payload.as_slice(),
         "reads after a failed eviction must fall back to the source"
+    );
+}
+
+#[tokio::test]
+async fn test_reserve_range_guard_punches_unless_committed() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![1u8; 8192], 4096));
+    let _file = backend
+        .open_file_with_source_size("reserve-guard", source, 8192)
+        .await
+        .expect("open cached file");
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("reserve-guard"))
+        .expect("entry");
+    let data_path = entry.paths.data_path.clone();
+    let allocated_blocks = move || {
+        std::fs::metadata(&data_path)
+            .expect("stat cache data file")
+            .blocks()
+    };
+
+    let baseline = allocated_blocks();
+    let reservation = entry.reserve_range(0, 4096).expect("reserve");
+    if allocated_blocks() == baseline {
+        // Filesystem without fallocate support: reservation and punch are
+        // no-ops and there is nothing further to verify.
+        return;
+    }
+
+    drop(reservation);
+    assert_eq!(
+        allocated_blocks(),
+        baseline,
+        "dropping an uncommitted reservation must punch the range back"
+    );
+
+    entry.reserve_range(0, 4096).expect("reserve").commit();
+    assert!(
+        allocated_blocks() > baseline,
+        "a committed reservation must keep the disk blocks"
+    );
+}
+
+#[tokio::test]
+async fn test_failed_foreground_refill_leaves_no_reserved_blocks() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = uniform_char_random_data(8192, 42);
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    // Fail the refill's source read once; the foreground read then falls
+    // back to a second, successful source read.
+    source.fail_block(0, 1);
+    let file = backend
+        .open_file_with_source_size("refill-rollback", source.clone(), payload.len() as u64)
+        .await
+        .expect("open cached file");
+
+    let bytes = file
+        .read_at(0, 4096)
+        .await
+        .expect("read must fall back to the source after the failed refill");
+    assert_eq!(bytes.as_ref(), &payload[..4096]);
+    assert_eq!(source.calls(0), 2, "refill attempt plus fallback read");
+
+    // The failed refill must neither publish the block nor account bytes...
+    let stats = backend.file_stats("refill-rollback").expect("file stats");
+    assert_eq!(stats.bytes_used, 0, "failed refill must not publish blocks");
+    assert_eq!(
+        backend.stats().bytes_used,
+        0,
+        "failed refill must not change capacity accounting"
+    );
+
+    // ...and must roll its reservation back: no allocated disk blocks may
+    // remain in the sparse data file.
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("refill-rollback"))
+        .expect("entry");
+    assert_eq!(
+        std::fs::metadata(&entry.paths.data_path)
+            .expect("stat cache data file")
+            .blocks(),
+        0,
+        "failed refill must leave the data file fully sparse"
     );
 }

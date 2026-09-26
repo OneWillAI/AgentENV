@@ -6,6 +6,7 @@ use envd::process::StartResponse;
 
 #[derive(ClapArgs)]
 pub struct Args {
+    #[arg(add = crate::commands::completion::add_running_sandbox_candidates())]
     sandbox_id: String,
     /// Command and arguments to run. Flags intended for the remote command
     /// that collide with aenv's own flags can be escaped with a leading `--`.

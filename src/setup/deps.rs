@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{bail, Context, Result};
 use object_store_operator::{
@@ -11,8 +12,8 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::cfg::{
-    AppConfig, OssBackendConfig, OverlaybdDependencyConfig, ResolvedImageCacheConfig,
-    SnapshotRepositoryBackendKind,
+    AppConfig, OssAddressingStyle, OssBackendConfig, OverlaybdDependencyConfig,
+    ResolvedImageCacheConfig, SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
 use crate::virtualization::VirtualizationMode;
@@ -96,7 +97,6 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
     // regctl is a runtime dependency for all registry access, not just tools
     // drive extraction, so it remains provisioned for explicit tools drives.
     ensure_regctl(deps_path).await?;
-    ensure_tools(config, deps_path, manifest)?;
 
     // Overlaybd runtime configs and CLI tools are required before request-time
     // image resolution, since OCI → overlaybd conversion shells out to
@@ -105,6 +105,7 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
     std::fs::create_dir_all(&overlaybd_dir)?;
     let overlaybd_config = config.overlaybd.as_ref().unwrap_or(&manifest.overlaybd);
     super::overlaybd::ensure_release_tools(overlaybd_config, &overlaybd_dir, &arch).await?;
+    ensure_tools(config)?;
 
     info!(path = %deps_path.display(), "dependencies ready");
     Ok(())
@@ -181,20 +182,113 @@ async fn ensure_kernel(
     config.kernel.verify_image(&kernel_path)
 }
 
-fn ensure_tools(
-    config: &AppConfig,
-    deps_path: &Path,
-    manifest: &SetupDependencyManifest,
-) -> Result<()> {
+fn ensure_tools(config: &AppConfig) -> Result<()> {
     if config.tools.version.is_none()
         && (config.tools.drive_path.is_some() || config.tools.url.is_some())
     {
         bail!("tools.version is required when tools.drive_path or tools.url is configured");
     }
-    let version = config.resolved_tools_version();
     let tools_path = config.resolved_tools_drive_path()?;
     if let Some(source) = config.tools.drive_path.as_deref() {
-        return install_explicit_tools_drive(source, &tools_path, version);
+        install_explicit_tools_drive(source, &tools_path, config.resolved_tools_version())?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn resolve_tools_image(
+    config: &AppConfig,
+    version: &str,
+) -> Result<Option<PathBuf>> {
+    static PREPARATIONS: LazyLock<dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> =
+        LazyLock::new(dashmap::DashMap::new);
+
+    let tools_path = config.resolved_tools_drive_path_for_version(version)?;
+    let lock = PREPARATIONS.entry(tools_path.clone()).or_default().clone();
+    let _guard = lock.lock().await;
+    if file_exists_nonempty(&tools_path) {
+        return Ok(None);
+    }
+    if version == config.resolved_tools_version() && config.tools.drive_path.is_some() {
+        ensure_legacy_tools_drive(config, version).await?;
+        return Ok(None);
+    }
+    let image_path = tools_path.with_file_name("image.json");
+    if file_exists_nonempty(&image_path) {
+        return Ok(Some(image_path));
+    }
+    let template = config
+        .tools
+        .url
+        .as_deref()
+        .unwrap_or(&bundled_manifest().tools.url);
+    let image_ref = resolve_url(template, &[("version", version)]);
+    match crate::image::ImageResolver::new(config)
+        .resolve_tools(&image_ref)
+        .await?
+    {
+        Some(resolved) => {
+            let destination = image_path.clone();
+            tokio::task::spawn_blocking(move || {
+                install_tools_image(&resolved.overlaybd_config_path, &destination)
+            })
+            .await
+            .context("join tools image installation")??;
+            Ok(Some(image_path))
+        }
+        None => {
+            ensure_legacy_tools_drive(config, version).await?;
+            Ok(None)
+        }
+    }
+}
+
+fn install_tools_image(source: &Path, destination: &Path) -> Result<()> {
+    let mut image = overlaybd::config::load_image_config(source)?;
+    // Always prefetch tools independently of user disks and memory.
+    image.download_override = Some(DownloadConfig {
+        enable: true,
+        delay: 0,
+        delay_extra: 1,
+        ..Default::default()
+    });
+    let parent = destination.parent().context("tools image directory")?;
+    std::fs::create_dir_all(parent)?;
+    // Like tools.ext4, installed releases outlive image-cache eviction.
+    // Relative paths also keep dependency bundles relocatable.
+    for layer in &mut image.lowers {
+        if layer.file.is_empty() {
+            continue;
+        }
+        let name = format!("{}.commit", layer.digest.replace(':', "-"));
+        let installed = parent.join(&name);
+        if !installed.exists() && std::fs::hard_link(&layer.file, &installed).is_err() {
+            let copy = tempfile::NamedTempFile::new_in(parent)?;
+            std::fs::copy(&layer.file, copy.path()).context("copy tools layer")?;
+            set_file_mode(copy.path(), 0o644)?;
+            copy.persist(&installed).context("install tools layer")?;
+        }
+        layer.file = name;
+    }
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(temp.as_file(), &image)?;
+    set_file_mode(temp.path(), 0o644)?;
+    temp.persist(destination)
+        .context("cache tools image config")?;
+    Ok(())
+}
+
+fn ensure_tools_version(
+    config: &AppConfig,
+    deps_path: &Path,
+    manifest: &SetupDependencyManifest,
+    version: &str,
+) -> Result<()> {
+    let tools_path = config.resolved_tools_drive_path_for_version(version)?;
+    // A configured local file only identifies the release declared beside it.
+    if version == config.resolved_tools_version() {
+        if let Some(source) = config.tools.drive_path.as_deref() {
+            return install_explicit_tools_drive(source, &tools_path, version);
+        }
     }
     if file_exists_nonempty(&tools_path) {
         debug!(path = %tools_path.display(), "tools drive already present");
@@ -210,8 +304,26 @@ fn ensure_tools(
     std::fs::create_dir_all(tools_dir)?;
     let ghcr_image = resolve_url(tools_url_template, &[("version", version)]);
     let regctl_path = crate::cfg::regctl_path(deps_path);
-    extract_ext4_from_ghcr(&regctl_path, &ghcr_image, "tools.ext4", &tools_path)?;
+    let staging = tempfile::tempdir_in(tools_dir).context("stage legacy tools download")?;
+    let staged_path = staging.path().join("tools.ext4");
+    extract_ext4_from_ghcr(&regctl_path, &ghcr_image, "tools.ext4", &staged_path)
+        .with_context(|| format!("download legacy tools drive version '{version}'"))?;
+    anyhow::ensure!(
+        file_exists_nonempty(&staged_path),
+        "tools drive version '{version}' is empty"
+    );
+    std::fs::rename(&staged_path, &tools_path).context("publish downloaded tools drive")?;
     Ok(())
+}
+
+async fn ensure_legacy_tools_drive(config: &AppConfig, version: &str) -> Result<()> {
+    let config = config.clone();
+    let version = version.to_string();
+    tokio::task::spawn_blocking(move || {
+        ensure_tools_version(&config, &config.deps_path, bundled_manifest(), &version)
+    })
+    .await
+    .context("join tools ext4 download")?
 }
 
 fn install_explicit_tools_drive(source: &Path, destination: &Path, version: &str) -> Result<()> {
@@ -661,17 +773,14 @@ fn write_generated_overlaybd_global_config(
 ) -> Result<()> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let log_path = config_dir.join("overlaybd.log");
-    let credential_config = match detect_docker_credential_config() {
-        Some(credential_path) => {
-            info!("found docker credential file; wiring overlaybd runtime to reuse it for registry auth");
-            serde_json::json!({
-                "mode": "file",
-                "path": credential_path.to_string_lossy(),
-                "timeout": 5
-            })
-        }
-        None => serde_json::json!({"mode": "", "path": "", "timeout": 1}),
-    };
+    let credential_path = detect_docker_credential_config();
+    if credential_path.is_some() {
+        info!(
+            "found docker credential file; wiring overlaybd runtime to reuse it for registry auth"
+        );
+    }
+    let (credential_file_path, credential_config) =
+        overlaybd_credential_fields(credential_path.as_deref());
     let p2p_config = match p2p_facade_address {
         Some(address) => serde_json::json!({
             "enable": true,
@@ -695,12 +804,14 @@ fn write_generated_overlaybd_global_config(
             "refillSize": 262144,
             "blockSize": 65536
         },
+        "credentialFilePath": credential_file_path,
         "credentialConfig": credential_config,
         "ioEngine": 0,
         "download": download,
         "p2pConfig": p2p_config,
         "enableAudit": false,
-        "registryFsVersion": "v2"
+        "registryFsVersion": "v2",
+        "remoteIoWorkers": app_config.ublk.overlaybd.remote_io_workers,
     });
 
     if app_config.snapshot.repository_backend == SnapshotRepositoryBackendKind::Oss {
@@ -722,6 +833,26 @@ fn write_generated_overlaybd_global_config(
         .with_context(|| format!("write overlaybd global config {}", path.display()))?;
     set_file_mode(path, 0o600)?;
     Ok(())
+}
+
+fn overlaybd_credential_fields(credential_path: Option<&Path>) -> (String, serde_json::Value) {
+    match credential_path {
+        Some(credential_path) => {
+            let credential_path = credential_path.to_string_lossy().into_owned();
+            (
+                credential_path.clone(),
+                serde_json::json!({
+                    "mode": "file",
+                    "path": credential_path,
+                    "timeout": 5
+                }),
+            )
+        }
+        None => (
+            String::new(),
+            serde_json::json!({"mode": "", "path": "", "timeout": 1}),
+        ),
+    }
 }
 
 fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Value> {
@@ -747,11 +878,19 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
         .filter(|region| !region.is_empty())
         .context("backend.oss.region must be set when generating overlaybd OSS config")?;
     let endpoint = oss.endpoint.trim();
+    let addressing_style = match oss.addressing_style {
+        Some(OssAddressingStyle::Path) => "path",
+        Some(OssAddressingStyle::Virtual) => "virtual",
+        None => "",
+    };
 
     let mut config = serde_json::json!({
         "enable": true,
         "defaultRegion": region,
         "defaultEndpoint": endpoint,
+        // Empty string means the overlaybd runtime auto-detects the style per
+        // endpoint, matching the snapshot repository client's behavior.
+        "defaultAddressingStyle": addressing_style,
     });
 
     match credential_source {
@@ -801,11 +940,12 @@ fn detect_docker_credential_config() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bundled_manifest, ensure_firecracker, ensure_kernel, ensure_tools, file_exists_nonempty,
+        bundled_manifest, ensure_firecracker, ensure_kernel, ensure_legacy_tools_drive,
+        ensure_tools, file_exists_nonempty, overlaybd_credential_fields,
         overlaybd_runtime_oss_config, validate_explicit_file, version_output_mentions_exact_token,
         write_generated_overlaybd_global_configs,
     };
-    use overlaybd::config::DownloadConfig;
+    use overlaybd::config::{load_global_config, DownloadConfig};
 
     use crate::cfg::{
         AppConfig, MemorySnapshotConfig, OssBackendConfig, UblkOverlaybdTomlConfig, UblkTomlConfig,
@@ -822,6 +962,7 @@ mod tests {
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
             region: Some(" cn-hangzhou ".to_string()),
+            addressing_style: None,
             cache_max_size_gb: Some(4),
         }
     }
@@ -875,6 +1016,18 @@ mod tests {
             config["defaultEndpoint"],
             "https://oss-cn-hangzhou.aliyuncs.com"
         );
+        assert_eq!(config["defaultAddressingStyle"], "");
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_propagates_addressing_style() {
+        use crate::cfg::OssAddressingStyle;
+
+        let mut oss = sample_oss_config();
+        oss.addressing_style = Some(OssAddressingStyle::Virtual);
+
+        let config = overlaybd_runtime_oss_config(&oss).expect("derive overlaybd oss config");
+        assert_eq!(config["defaultAddressingStyle"], "virtual");
     }
 
     #[test]
@@ -997,7 +1150,12 @@ mod tests {
         ensure_kernel(&config, bundled_manifest(), "x86_64")
             .await
             .expect("accept explicit kernel");
-        ensure_tools(&config, &deps_path, bundled_manifest()).expect("import explicit tools");
+        tokio::try_join!(
+            ensure_legacy_tools_drive(&config, "0.1.0"),
+            ensure_legacy_tools_drive(&config, "0.1.0"),
+        )
+        .expect("concurrent imports of the same tools release");
+        ensure_tools(&config).expect("reuse imported tools");
 
         assert!(!deps_path.join("firecracker").exists());
         assert!(!deps_path.join("kernel").exists());
@@ -1019,16 +1177,16 @@ mod tests {
         config.tools.drive_path = Some(source.clone());
         config.tools.version = Some("0.1.0".to_string());
 
-        ensure_tools(&config, &config.deps_path, bundled_manifest()).expect("install tools drive");
+        ensure_tools(&config).expect("install tools drive");
         std::fs::write(&source, b"second").expect("replace tools source");
 
-        let error = ensure_tools(&config, &config.deps_path, bundled_manifest())
-            .expect_err("reusing a version for different content must fail");
+        let error =
+            ensure_tools(&config).expect_err("reusing a version for different content must fail");
         assert!(error.to_string().contains("publish a new version"));
     }
 
     #[test]
-    fn tools_url_override_requires_explicit_version_before_cache_hit() {
+    fn tools_url_requires_a_version_but_defers_download_until_launch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut config = AppConfig {
             deps_path: temp.path().join("deps"),
@@ -1040,14 +1198,86 @@ mod tests {
         std::fs::create_dir_all(tools_path.parent().expect("tools directory"))
             .expect("create tools directory");
         std::fs::write(&tools_path, b"cached tools").expect("write cached tools");
-        config.tools.url = Some("registry.example.com/custom/tools:{version}".to_string());
+        config.tools.url = Some("registry.unavailable.example/tools:{version}".to_string());
 
-        let error = ensure_tools(&config, &config.deps_path, bundled_manifest())
-            .expect_err("custom tools URL must declare its release version");
+        let error =
+            ensure_tools(&config).expect_err("custom tools URL must declare its release version");
 
         assert!(error.to_string().contains(
             "tools.version is required when tools.drive_path or tools.url is configured"
         ));
+        config.tools.version = Some("0.2.0".into());
+        ensure_tools(&config).expect("tools are resolved when starting a fresh sandbox");
+        assert!(!config.resolved_tools_drive_path().unwrap().exists());
+    }
+
+    #[test]
+    fn installed_tools_layers_survive_cache_removal_and_bundle_relocation() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = temp.path().join("image-cache");
+        std::fs::create_dir_all(&cache)?;
+        let layer = cache.join("layer.commit");
+        std::fs::write(&layer, b"immutable tools layer")?;
+        let source = cache.join("image.json");
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "lowers": [{"file": layer, "digest": "sha256:tools"}],
+                "download": {"enable": false}
+            }))?,
+        )?;
+        let installed = temp.path().join("tools/1.0.0/image.json");
+        super::install_tools_image(&source, &installed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&installed)?.permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert!(
+            !overlaybd::config::load_image_config(&source)?
+                .download_override
+                .unwrap()
+                .enable
+        );
+        std::fs::remove_dir_all(cache)?;
+        let relocated = temp.path().join("relocated-tools");
+        std::fs::rename(installed.parent().unwrap(), &relocated)?;
+        let image = overlaybd::config::load_image_config(relocated.join("image.json"))?;
+        assert_eq!(
+            std::fs::read(&image.lowers[0].file)?,
+            b"immutable tools layer"
+        );
+        assert!(image.download_override.unwrap().enable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_restore_never_substitutes_the_current_local_tools_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("current.ext4");
+        std::fs::write(&source, b"current tools").unwrap();
+        let mut config = AppConfig {
+            deps_path: temp.path().join("deps"),
+            ..AppConfig::default()
+        };
+        config.tools.version = Some("0.2.0".into());
+        config.tools.drive_path = Some(source);
+
+        let error = ensure_legacy_tools_drive(&config, "0.1.0")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("download legacy tools drive version '0.1.0'"));
+        let old_path = config
+            .resolved_tools_drive_path_for_version("0.1.0")
+            .unwrap();
+        assert!(!old_path.exists());
+
+        std::fs::write(&old_path, b"old tools").unwrap();
+        ensure_legacy_tools_drive(&config, "0.1.0").await.unwrap();
+        assert_eq!(std::fs::read(old_path).unwrap(), b"old tools");
     }
 
     #[test]
@@ -1100,6 +1330,61 @@ mod tests {
     fn read_global_config_value(path: &std::path::Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(path).expect("read generated global config"))
             .expect("parse generated global config")
+    }
+
+    #[test]
+    fn overlaybd_credential_fields_keep_legacy_and_modern_modes_aligned() {
+        let (legacy_path, modern) = overlaybd_credential_fields(None);
+        assert!(legacy_path.is_empty());
+        assert_eq!(modern["mode"], "");
+        assert_eq!(modern["path"], legacy_path);
+        assert_eq!(modern["timeout"], 1);
+
+        let path = std::path::Path::new("/tmp/docker-config.json");
+        let (legacy_path, modern) = overlaybd_credential_fields(Some(path));
+        assert_eq!(legacy_path, path.to_string_lossy());
+        assert_eq!(modern["mode"], "file");
+        assert_eq!(modern["path"], legacy_path);
+        assert_eq!(modern["timeout"], 5);
+    }
+
+    #[test]
+    fn generated_overlaybd_global_configs_preserve_effective_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let memory = temp.path().join("mem-overlaybd-global.json");
+        let config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), memory.clone());
+        let convert = config.resolved_overlaybd_convert_global_config_path();
+        let resize = config.resolved_overlaybd_resize_global_config_path();
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        for path in [&rootfs, &memory, &convert, &resize] {
+            let value = read_global_config_value(path);
+            assert_eq!(
+                value["credentialFilePath"],
+                value["credentialConfig"]["path"],
+                "legacy and modern credential paths differ in {}",
+                path.display()
+            );
+
+            let loaded = load_global_config(path).expect("reload generated global config");
+            assert_eq!(
+                loaded.credential_config.mode,
+                value["credentialConfig"]["mode"]
+                    .as_str()
+                    .expect("credential mode is a string"),
+                "effective credential mode changed while loading {}",
+                path.display()
+            );
+            assert_eq!(
+                loaded.credential_config.path,
+                loaded.credential_file_path,
+                "effective credential paths differ after loading {}",
+                path.display()
+            );
+        }
     }
 
     fn assert_download_json(value: &serde_json::Value, expected: &DownloadConfig) {
@@ -1309,6 +1594,7 @@ mod tests {
                 "http://127.0.0.1:12345/p2p-http"
             );
             assert_eq!(value["registryFsVersion"], "v2");
+            assert_eq!(value["remoteIoWorkers"], 4);
         }
     }
 

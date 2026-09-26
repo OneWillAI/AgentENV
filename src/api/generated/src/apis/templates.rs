@@ -39,6 +39,45 @@ pub enum TemplatesGetResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse {
+    /// Builder released
+    Status204_BuilderReleased,
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum TemplatesTemplateIdBuildsBuildIdBuilderPutResponse {
+    /// Builder preparation accepted
+    Status202_BuilderPreparationAccepted {
+        body: models::TemplateBuilder,
+        x_agentenv_build_id: Option<String>,
+    },
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Concurrent build limit reached
+    Status429_ConcurrentBuildLimitReached(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum TemplatesTemplateIdBuildsBuildIdStatusGetResponse {
     /// Successfully returned the template
     Status200_SuccessfullyReturnedTheTemplate(models::TemplateBuildInfo),
@@ -60,6 +99,8 @@ pub enum TemplatesTemplateIdDeleteResponse {
     Status204_TheTemplateWasDeletedSuccessfully,
     /// Authentication error
     Status401_AuthenticationError(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -69,7 +110,10 @@ pub enum TemplatesTemplateIdDeleteResponse {
 #[allow(clippy::large_enum_variant)]
 pub enum TemplatesTemplateIdGetResponse {
     /// Successfully returned the template with its builds
-    Status200_SuccessfullyReturnedTheTemplateWithItsBuilds(models::TemplateWithBuilds),
+    Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
+        body: models::TemplateWithBuilds,
+        x_next_token: Option<String>,
+    },
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Not found
@@ -160,6 +204,33 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         query_params: &models::TemplatesGetQueryParams,
     ) -> Result<TemplatesGetResponse, E>;
+
+    /// Cancel a template build and release its worker.
+    ///
+    /// TemplatesTemplateIdBuildsBuildIdBuilderDelete - DELETE /templates/{templateID}/builds/{buildID}/builder
+    async fn templates_template_id_builds_build_id_builder_delete(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, E>;
+
+    /// Prepare the BuildKit worker for a template build.
+    ///
+    /// TemplatesTemplateIdBuildsBuildIdBuilderPut - PUT /templates/{templateID}/builds/{buildID}/builder
+    async fn templates_template_id_builds_build_id_builder_put(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
+        body: &models::TemplateBuilderRequest,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, E>;
 
     /// Template build status.
     ///

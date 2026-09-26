@@ -1,3 +1,4 @@
+pub(crate) mod buildkit;
 pub(crate) mod cache;
 pub(crate) mod commit_index;
 pub(crate) mod local_layer;
@@ -68,4 +69,14 @@ impl ImageError {
             Self::Other(err) => Self::Other(err.context(context.to_string())),
         }
     }
+}
+
+/// Initialize the shared image-cache P2P transport during server startup.
+pub fn initialize_image_cache_p2p_transport(
+    transport: std::sync::Arc<dyn crate::p2p::P2pTransport>,
+) {
+    let cache = cache::ImageCacheService::shared_from_app_config(
+        crate::cfg::ConfigManager::global_config(),
+    );
+    cache.initialize_p2p_transport(transport);
 }

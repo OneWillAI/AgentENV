@@ -212,6 +212,9 @@ pub struct OssConfig {
     pub google_service_account: bool,
     pub default_region: String,
     pub default_endpoint: String,
+    /// Bucket addressing style: `"virtual"`, `"path"`, or empty to use
+    /// endpoint-based auto-detection.
+    pub default_addressing_style: String,
     /// Per-request timeout in seconds (connect + transfer). Default 30.
     pub timeout_secs: u64,
     /// Number of retries on transient failures. Default 3.
@@ -229,6 +232,7 @@ impl Default for OssConfig {
             google_service_account: false,
             default_region: String::new(),
             default_endpoint: String::new(),
+            default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
         }
@@ -367,8 +371,16 @@ pub struct GlobalConfig {
     pub user_agent: String,
     pub credential_config: CredentialConfig,
 
-    /// The number of io urings
+    /// Legacy compatibility field. Local files no longer allocate io_uring
+    /// workers through `ImageService`; ublk owns its queue-local rings.
     pub nr_io_rings: usize,
+
+    /// Worker threads of the dedicated runtime that drives all remote image
+    /// I/O (OSS/registry downloads and their reqwest connection tasks). `0`
+    /// (the default) dispatches remote I/O onto the runtime that constructed
+    /// the `ImageService` — adequate for tests and ad-hoc users; `> 0`
+    /// creates a dedicated runtime with that many worker threads.
+    pub remote_io_workers: usize,
 }
 
 impl Default for GlobalConfig {
@@ -398,6 +410,7 @@ impl Default for GlobalConfig {
             credential_config: CredentialConfig::default(),
 
             nr_io_rings: 4,
+            remote_io_workers: 0,
         }
     }
 }
@@ -598,8 +611,13 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
     );
 
     validate_oss_config(cfg)?;
-
-    ensure!(cfg.nr_io_rings != 0, "nr_io_rings cannot be zero");
+    if cfg.oss_config.enable {
+        ensure!(
+            matches!(cfg.oss_config.default_addressing_style.trim(), "" | "virtual" | "path"),
+            "ossConfig.defaultAddressingStyle must be 'virtual', 'path', or empty for auto-detection, got '{}'",
+            cfg.oss_config.default_addressing_style
+        );
+    }
 
     Ok(())
 }

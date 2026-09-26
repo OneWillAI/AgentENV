@@ -12,21 +12,29 @@ use tracing::{debug, info, warn};
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
-use crate::cfg::SnapshotImageStoragePolicy;
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
+use crate::sandbox::{OverlaybdCompactOutput, SandboxSnapshotManifest};
 use crate::snapshot::repository::backends::common::acr::{
     AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
 };
-use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
-use crate::snapshot::repository::interfaces::SnapshotRepository;
-use crate::snapshot::repository::{RepositoryError, RepositoryResult};
-use crate::snapshot::{
-    CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
-    PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+use crate::snapshot::repository::backends::common::recontainerize::{
+    prepare_layer_upload, PreparedLayerUpload,
 };
+use crate::snapshot::repository::backends::common::{
+    materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
+};
+use crate::snapshot::repository::interfaces::SnapshotRepository;
+use crate::snapshot::repository::{
+    BuildCacheState, RepositoryError, RepositoryResult, VolumeRecordPage,
+};
+use crate::snapshot::{
+    CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, MemoryStartupPackInfo,
+    OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotAlias, SnapshotId,
+    SnapshotListFilter, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
+    SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo,
+    TemplateBuildStatus, MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
+};
+use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeStatus};
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
 ///
@@ -34,7 +42,9 @@ use crate::snapshot::{
 ///
 /// ```text
 /// catalog/aliases/{name}.json              → "snapshot-id"
-/// artifacts/{id}/firecracker-manifest.json → FirecrackerSnapshotManifest (paths omitted)
+/// volumes/records/{volume-id}.json         → VolumeRecord
+/// volumes/aliases/{volume-name}.json       → "volume-id"
+/// artifacts/{id}/firecracker-manifest.json → SandboxSnapshotManifest (paths omitted)
 /// artifacts/{id}/vm_state.bin
 /// managed-layers/{digest}
 /// ```
@@ -42,19 +52,25 @@ pub(crate) struct OssSnapshotRepository {
     client: Arc<OssClient>,
     snapshot_image_storage: SnapshotImageStoragePolicy,
     acr_exporter: AcrDiskImageExporter,
+    publish_compression: OverlaybdCompactOutput,
 }
 
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
+const MAX_VOLUME_CAS_ATTEMPTS: usize = 5;
 
 impl OssSnapshotRepository {
     pub(crate) fn new(
         client: Arc<OssClient>,
         snapshot_image_storage: SnapshotImageStoragePolicy,
+        publish_compression: &SnapshotPublishCompressionConfig,
     ) -> Self {
+        let publish_compression =
+            OverlaybdCompactOutput::from_publish_compression_config(publish_compression);
         Self {
             client,
             snapshot_image_storage,
-            acr_exporter: AcrDiskImageExporter::new(),
+            acr_exporter: AcrDiskImageExporter::new(publish_compression),
+            publish_compression,
         }
     }
 
@@ -68,6 +84,43 @@ impl OssSnapshotRepository {
             .await
             .map_err(|e| RepositoryError::backend(format!("check snapshot record '{id}'"), e))
     }
+
+    async fn update_build_cache<T>(
+        &self,
+        update: impl Fn(&mut BuildCacheState) -> RepositoryResult<T>,
+    ) -> RepositoryResult<T> {
+        let key = "template-build/cache-head.json";
+        for _ in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let (mut state, etag) = match self.client.get_bytes_with_etag(key).await {
+                Ok((bytes, Some(etag))) => (BuildCacheState::decode(&bytes)?, Some(etag)),
+                Ok((_, None)) => {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: "build cache publication requires object storage ETags".to_owned(),
+                    })
+                }
+                Err(error) if OssClient::is_not_found_error(&error) => {
+                    (BuildCacheState::default(), None)
+                }
+                Err(error) => {
+                    return Err(RepositoryError::backend("read build cache state", error))
+                }
+            };
+            let result = update(&mut state)?;
+            let bytes = serde_json::to_vec(&state)
+                .map_err(|error| RepositoryError::backend("encode build cache state", error))?;
+            if self
+                .client
+                .put_bytes_conditionally(key, bytes, etag.as_deref())
+                .await
+                .map_err(|error| RepositoryError::backend("update build cache state", error))?
+            {
+                return Ok(result);
+            }
+        }
+        Err(RepositoryError::InvalidRequest {
+            reason: "build cache state changed too often during publication".to_owned(),
+        })
+    }
 }
 
 fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
@@ -75,6 +128,40 @@ fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
         reason: format!("invalid alias '{alias}': {e}"),
     })?;
     Ok(OssSnapshotArtifactLayout::alias_key(alias))
+}
+
+fn validate_volume_id(volume_id: &str) -> RepositoryResult<()> {
+    validate_volume_component(volume_id, "id")
+}
+
+fn validate_volume_component(value: &str, kind: &str) -> RepositoryResult<()> {
+    if !is_valid_volume_component(value) {
+        return Err(RepositoryError::InvalidRequest {
+            reason: format!("invalid volume {kind} '{value}'"),
+        });
+    }
+    Ok(())
+}
+
+fn volume_id_from_record_key(key: &str) -> RepositoryResult<String> {
+    let file_name = key
+        .strip_prefix(OssSnapshotArtifactLayout::volume_records_prefix())
+        .ok_or_else(|| RepositoryError::InvalidRequest {
+            reason: format!("invalid volume record key '{key}'"),
+        })?;
+    if file_name.contains('/') {
+        return Err(RepositoryError::InvalidRequest {
+            reason: format!("invalid volume record key '{key}'"),
+        });
+    }
+    let volume_id =
+        file_name
+            .strip_suffix(".json")
+            .ok_or_else(|| RepositoryError::InvalidRequest {
+                reason: format!("invalid volume record key '{key}'"),
+            })?;
+    validate_volume_id(volume_id)?;
+    Ok(volume_id.to_string())
 }
 
 fn now_unix_ms() -> i64 {
@@ -191,7 +278,8 @@ impl SnapshotRepository for OssSnapshotRepository {
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
         let id = &metadata.id;
         let layout = self.layout(id);
@@ -276,6 +364,11 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .await
                 .map_err(|e| RepositoryError::backend("write firecracker manifest to oss", e))?;
 
+            // The startup manifest is fully decoupled from this flow: the
+            // detached continuation spawned after the record commits builds
+            // and uploads it, then attaches the descriptor to the record.
+            let memory_startup = None;
+
             // 3. Export attached-drive disk images and derive their committed metadata.
             let attached_drives = self
                 .export_attached_drives(id, &manifest, &mut disk_publications)
@@ -291,8 +384,10 @@ impl SnapshotRepository for OssSnapshotRepository {
                 custom_extension_params: metadata.custom_extension_params.clone(),
                 rootfs_layers,
                 attached_drives,
+                volume_snapshots: metadata.volume_snapshots.clone(),
                 memory_layers,
                 disk_publications: disk_publications.clone(),
+                memory_startup,
             };
 
             // 5. Bind alias (if present) with conflict detection.
@@ -342,6 +437,24 @@ impl SnapshotRepository for OssSnapshotRepository {
                 return Err(error);
             }
         };
+
+        // Fully decoupled startup manifest: the continuation joins the
+        // recording, builds and uploads the manifest, then attaches its
+        // descriptor to the record. Publish never waits on any of it.
+        if crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .enabled
+            && !crate::snapshot::startup_pack::startup_manifest_shutdown_requested()
+        {
+            if let Some(recording) = recording {
+                tokio::spawn(finish_startup_manifest(
+                    self.client.clone(),
+                    metadata.id.clone(),
+                    recording,
+                ));
+            }
+        }
 
         debug!(snapshot_id = %id, "published snapshot to oss");
         Ok(record)
@@ -515,11 +628,498 @@ impl SnapshotRepository for OssSnapshotRepository {
         record.updated_at_unix_ms = now;
         self.write_record(&record).await
     }
+
+    async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        validate_volume_component(reference, "reference")?;
+        if let Some(record) = self.read_volume_record(reference).await? {
+            return Ok(Some(record));
+        }
+        let alias_key = OssSnapshotArtifactLayout::volume_alias_key(reference);
+        let volume_id = match self.client.get_bytes(&alias_key).await {
+            Ok(bytes) => serde_json::from_slice::<String>(&bytes).map_err(|error| {
+                RepositoryError::backend(format!("parse volume alias '{alias_key}'"), error)
+            })?,
+            Err(error) if OssClient::is_not_found_error(&error) => return Ok(None),
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read volume alias '{alias_key}'"),
+                    error,
+                ))
+            }
+        };
+        self.read_volume_record(&volume_id).await
+    }
+
+    async fn list_volumes_page(
+        &self,
+        after_volume_id: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        if limit == 0 {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "volume page limit must be greater than zero".to_string(),
+            });
+        }
+        if let Some(volume_id) = after_volume_id {
+            validate_volume_id(volume_id)?;
+        }
+        let start_after = after_volume_id.map(OssSnapshotArtifactLayout::volume_record_key);
+        let mut keys = self
+            .client
+            .list_keys_page(
+                OssSnapshotArtifactLayout::volume_records_prefix(),
+                start_after.as_deref(),
+                limit.saturating_add(1),
+            )
+            .await
+            .map_err(|error| RepositoryError::backend("list volume records", error))?;
+        let has_more = keys.len() > limit;
+        keys.truncate(limit);
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            let volume_id = volume_id_from_record_key(&key)?;
+            let record = self.read_volume_record(&volume_id).await?.ok_or_else(|| {
+                RepositoryError::VolumeNotFound {
+                    lookup: volume_id.clone(),
+                }
+            })?;
+            records.push(record);
+        }
+        let next_volume_id = if has_more {
+            records.last().map(|record| record.id.clone())
+        } else {
+            None
+        };
+        Ok(VolumeRecordPage {
+            records,
+            next_volume_id,
+        })
+    }
+
+    async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        validate_volume_id(&record.id)?;
+        validate_volume_component(&record.name, "name")?;
+        let mut record = record;
+        record.backing_image_config = None;
+        if self.read_volume_record(&record.name).await?.is_some()
+            || self
+                .client
+                .exists(&OssSnapshotArtifactLayout::volume_alias_key(&record.id))
+                .await
+                .map_err(|error| RepositoryError::backend("check volume ID namespace", error))?
+        {
+            return Err(RepositoryError::VolumeNameConflict {
+                name: record.name.clone(),
+            });
+        }
+        if !self.claim_volume_alias(&record.name, &record.id).await? {
+            return Err(RepositoryError::VolumeNameConflict {
+                name: record.name.clone(),
+            });
+        }
+        match self.write_volume_record_conditionally(&record, None).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{}' already exists", record.id),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn put_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        validate_volume_id(&record.id)?;
+        let mut record = record;
+        record.backing_image_config = None;
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let (next, etag) = match self.read_volume_record_versioned(&record.id).await? {
+                Some((existing, etag)) => {
+                    existing
+                        .validate_catalog_update(&record)
+                        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+                    let mut next = record.clone();
+                    // Reservation state is owned exclusively by the
+                    // reservation APIs. A concurrent backing/status update
+                    // must not restore a released owner.
+                    next.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
+                    next.read_only_mounts = existing.read_only_mounts;
+                    (next, etag)
+                }
+                None => {
+                    return Err(RepositoryError::VolumeNotFound {
+                        lookup: record.id.clone(),
+                    })
+                }
+            };
+            if self
+                .write_volume_record_conditionally(&next, etag.as_deref())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(RepositoryError::Backend {
+            message: format!(
+                "volume record '{}' changed too often while publishing",
+                record.id
+            ),
+            source: None,
+        })
+    }
+
+    async fn get_build_cache_state(&self) -> RepositoryResult<BuildCacheState> {
+        match self
+            .client
+            .get_bytes("template-build/cache-head.json")
+            .await
+        {
+            Ok(bytes) => BuildCacheState::decode(&bytes),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(BuildCacheState::default()),
+            Err(error) => Err(RepositoryError::backend("read build cache head", error)),
+        }
+    }
+
+    async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
+        self.update_build_cache(|state| state.replace(volume_id))
+            .await
+    }
+
+    async fn forget_retired_build_cache(&self, volume_id: &str) -> RepositoryResult<()> {
+        self.update_build_cache(|state| {
+            state.retired.remove(volume_id);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn publish_volume_backing(
+        &self,
+        _volume_id: &str,
+        image_config_path: &std::path::Path,
+    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+        self.derive_and_upload_volume_layers(image_config_path)
+            .await
+    }
+
+    async fn materialize_volume_backing(
+        &self,
+        _volume_id: &str,
+        layers: &[OverlaybdLayerRef],
+        destination: &std::path::Path,
+    ) -> RepositoryResult<std::path::PathBuf> {
+        let managed_url = self.client.managed_layers_repo_blob_url();
+        materialize_volume_image_config(layers, destination, |layer| LayerConfig {
+            repo_blob_url: managed_url.clone(),
+            digest: layer.digest.clone(),
+            size: layer.size,
+            uuid: layer.uuid.clone().unwrap_or_default(),
+            ..LayerConfig::default()
+        })
+        .await
+    }
+
+    async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
+        validate_volume_id(volume_id)?;
+        let mut deleted_record = None;
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
+            else {
+                return Ok(());
+            };
+            if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' is reserved by sandbox '{owner}'"),
+                });
+            }
+            if let Some(owner) = record.read_only_mounts.first() {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!(
+                        "volume '{volume_id}' is mounted read-only by sandbox '{owner}'"
+                    ),
+                });
+            }
+            if !record.deleting {
+                record.deleting = true;
+                record.status = VolumeStatus::Failed;
+                if !self
+                    .write_volume_record_conditionally(&record, etag.as_deref())
+                    .await?
+                {
+                    continue;
+                }
+            }
+            deleted_record = Some(record);
+            break;
+        }
+        let record = deleted_record.ok_or_else(|| RepositoryError::Backend {
+            message: format!("volume '{volume_id}' changed too often while deleting"),
+            source: None,
+        })?;
+        self.client
+            .delete(&OssSnapshotArtifactLayout::volume_record_key(volume_id))
+            .await
+            .map_err(|error| RepositoryError::backend("delete volume record", error))?;
+        let alias_key = OssSnapshotArtifactLayout::volume_alias_key(&record.name);
+        let owns_alias = match self.client.get_bytes(&alias_key).await {
+            Ok(bytes) => {
+                serde_json::from_slice::<String>(&bytes)
+                    .map_err(|error| RepositoryError::backend("parse volume alias", error))?
+                    == volume_id
+            }
+            Err(error) if OssClient::is_not_found_error(&error) => false,
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    "read volume alias before delete",
+                    error,
+                ))
+            }
+        };
+        if owns_alias {
+            self.client
+                .delete(&alias_key)
+                .await
+                .map_err(|error| RepositoryError::backend("delete volume alias", error))?;
+        }
+        Ok(())
+    }
+
+    async fn reserve_volume(
+        &self,
+        volume_id: &str,
+        owner: &str,
+    ) -> RepositoryResult<Option<String>> {
+        validate_volume_id(volume_id)?;
+        validate_volume_component(owner, "owner")?;
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
+            else {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' does not exist in the repository"),
+                });
+            };
+            if record.deleting || record.status != VolumeStatus::Ready {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' is not usable"),
+                });
+            }
+            if record.mode == VolumeMode::ReadOnly {
+                return Ok(None);
+            }
+            if let Some(existing) = record.reserved_by_sandbox_id.as_deref() {
+                if existing != owner {
+                    return Ok(Some(existing.to_owned()));
+                }
+                return Ok(None);
+            }
+            record.reserved_by_sandbox_id = Some(owner.to_owned());
+            if self
+                .write_volume_record_conditionally(&record, etag.as_deref())
+                .await?
+            {
+                return Ok(None);
+            }
+        }
+        Err(RepositoryError::Backend {
+            message: format!("volume '{volume_id}' changed too often while reserving"),
+            source: None,
+        })
+    }
+
+    async fn reserve_read_only_volume(&self, volume_id: &str, owner: &str) -> RepositoryResult<()> {
+        validate_volume_id(volume_id)?;
+        validate_volume_component(owner, "owner")?;
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
+            else {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' does not exist in the repository"),
+                });
+            };
+            if record.deleting || record.status != VolumeStatus::Ready {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' is not usable"),
+                });
+            }
+            if record.mode != VolumeMode::ReadOnly {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' is not read-only"),
+                });
+            }
+            if record.read_only_mounts.iter().any(|entry| entry == owner) {
+                return Ok(());
+            }
+            record.read_only_mounts.push(owner.to_owned());
+            if self
+                .write_volume_record_conditionally(&record, etag.as_deref())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(RepositoryError::Backend {
+            message: format!("volume '{volume_id}' changed too often while reserving read-only"),
+            source: None,
+        })
+    }
+
+    async fn replace_volume_owner_for(
+        &self,
+        volume_id: &str,
+        from: &str,
+        to: Option<&str>,
+    ) -> RepositoryResult<()> {
+        validate_volume_id(volume_id)?;
+        validate_volume_component(from, "owner")?;
+        if let Some(to) = to {
+            validate_volume_component(to, "owner")?;
+        }
+        if to == Some(from) {
+            return Ok(());
+        }
+        self.replace_volume_record_owner(volume_id, from, to).await
+    }
 }
 
 // ── private helpers ────────────────────────────────────────────────────
 
 impl OssSnapshotRepository {
+    async fn claim_volume_alias(&self, name: &str, volume_id: &str) -> RepositoryResult<bool> {
+        let key = OssSnapshotArtifactLayout::volume_alias_key(name);
+        let bytes = serde_json::to_vec(volume_id)
+            .map_err(|error| RepositoryError::backend("serialize volume alias", error))?;
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let etag = match self.client.get_bytes_with_etag(&key).await {
+                Ok((existing, etag)) => {
+                    let existing_id = serde_json::from_slice::<String>(&existing)
+                        .map_err(|error| RepositoryError::backend("parse volume alias", error))?;
+                    validate_volume_id(&existing_id)?;
+                    if existing_id == volume_id {
+                        return Ok(true);
+                    }
+                    if self
+                        .read_volume_record(&existing_id)
+                        .await?
+                        .is_some_and(|record| !record.deleting)
+                    {
+                        return Ok(false);
+                    }
+                    etag
+                }
+                Err(error) if OssClient::is_not_found_error(&error) => None,
+                Err(error) => return Err(RepositoryError::backend("read volume alias", error)),
+            };
+            if self
+                .client
+                .put_bytes_conditionally(&key, bytes.clone(), etag.as_deref())
+                .await
+                .map_err(|error| RepositoryError::backend("claim volume alias", error))?
+            {
+                return Ok(true);
+            }
+        }
+        Err(RepositoryError::Backend {
+            message: format!("volume alias '{name}' changed too often while claiming it"),
+            source: None,
+        })
+    }
+
+    async fn read_volume_record(&self, volume_id: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        validate_volume_id(volume_id)?;
+        let key = OssSnapshotArtifactLayout::volume_record_key(volume_id);
+        match self.client.get_bytes(&key).await {
+            Ok(bytes) => {
+                let record: VolumeRecord = serde_json::from_slice(&bytes)
+                    .map_err(|error| RepositoryError::backend("parse volume record", error))?;
+                validate_volume_id(&record.id)?;
+                if record.id != volume_id {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!(
+                            "volume record id '{}' does not match key '{volume_id}'",
+                            record.id
+                        ),
+                    });
+                }
+                Ok(Some(record))
+            }
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend("read volume record", error)),
+        }
+    }
+
+    async fn replace_volume_record_owner(
+        &self,
+        volume_id: &str,
+        from: &str,
+        to: Option<&str>,
+    ) -> RepositoryResult<()> {
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
+            else {
+                return Ok(());
+            };
+            if record.deleting {
+                return Ok(());
+            }
+            if !record.replace_owner(from, to) {
+                return Ok(());
+            }
+            if self
+                .write_volume_record_conditionally(&record, etag.as_deref())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(RepositoryError::Backend {
+            message: format!("volume '{volume_id}' changed too often while updating its owner"),
+            source: None,
+        })
+    }
+
+    async fn read_volume_record_versioned(
+        &self,
+        volume_id: &str,
+    ) -> RepositoryResult<Option<(VolumeRecord, Option<String>)>> {
+        let key = OssSnapshotArtifactLayout::volume_record_key(volume_id);
+        match self.client.get_bytes_with_etag(&key).await {
+            Ok((bytes, etag)) => {
+                let record: VolumeRecord = serde_json::from_slice(&bytes)
+                    .map_err(|error| RepositoryError::backend("parse volume record", error))?;
+                validate_volume_id(&record.id)?;
+                if record.id != volume_id {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!(
+                            "volume record id '{}' does not match key '{volume_id}'",
+                            record.id
+                        ),
+                    });
+                }
+                let etag = etag.ok_or_else(|| RepositoryError::Unsupported {
+                    feature: "OSS volume CAS requires ETags".to_string(),
+                })?;
+                Ok(Some((record, Some(etag))))
+            }
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend("read volume record", error)),
+        }
+    }
+
+    async fn write_volume_record_conditionally(
+        &self,
+        record: &VolumeRecord,
+        etag: Option<&str>,
+    ) -> RepositoryResult<bool> {
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|error| RepositoryError::backend("serialize volume record", error))?;
+        self.client
+            .put_bytes_conditionally(
+                &OssSnapshotArtifactLayout::volume_record_key(&record.id),
+                bytes,
+                etag,
+            )
+            .await
+            .map_err(|error| RepositoryError::backend("conditionally write volume record", error))
+    }
+
     async fn read_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
         let key = OssSnapshotArtifactLayout::record_key(id);
         match self.client.get_bytes(&key).await {
@@ -699,6 +1299,28 @@ impl OssSnapshotRepository {
         image_config_path: &Path,
         artifact: OssUploadArtifact,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+        self.derive_and_upload_disk_image_layers_mode(image_config_path, artifact, false)
+            .await
+    }
+
+    async fn derive_and_upload_volume_layers(
+        &self,
+        image_config_path: &Path,
+    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+        self.derive_and_upload_disk_image_layers_mode(
+            image_config_path,
+            OssUploadArtifact::RootfsLayer,
+            true,
+        )
+        .await
+    }
+
+    async fn derive_and_upload_disk_image_layers_mode(
+        &self,
+        image_config_path: &Path,
+        artifact: OssUploadArtifact,
+        allow_descriptorless: bool,
+    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let image_config = load_overlaybd_image_config(image_config_path).map_err(|e| {
             RepositoryError::backend(
                 format!(
@@ -727,6 +1349,13 @@ impl OssSnapshotRepository {
                     continue;
                 }
                 if crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(layer_path) {
+                    let managed = self
+                        .import_descriptorless_rootfs_layer(layer_path, artifact)
+                        .await?;
+                    layers.push(OverlaybdLayerRef::Managed(managed));
+                    continue;
+                }
+                if allow_descriptorless {
                     let managed = self
                         .import_descriptorless_rootfs_layer(layer_path, artifact)
                         .await?;
@@ -891,7 +1520,7 @@ impl OssSnapshotRepository {
     async fn export_attached_drives(
         &self,
         snapshot_id: &SnapshotId,
-        manifest: &crate::sandbox::FirecrackerSnapshotManifest,
+        manifest: &crate::sandbox::SandboxSnapshotManifest,
         publications: &mut Vec<PersistedDiskImagePublication>,
     ) -> RepositoryResult<Vec<CommittedAttachedDrive>> {
         let mut drives = Vec::new();
@@ -1051,14 +1680,14 @@ impl OssSnapshotRepository {
                     e,
                 )
             })?;
-        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.digest);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &dense_path, artifact).await?;
-
-        Ok(ManagedLayer {
-            digest: descriptor.digest,
-            size: descriptor.size,
-            uuid: None,
-        })
+        let upload = prepare_layer_upload(
+            &dense_path,
+            self.publish_compression,
+            Some((&descriptor.digest, descriptor.size)),
+        )
+        .await?;
+        // Dense-exported layers never carry a layer uuid, recontainerized or not.
+        self.upload_prepared_layer(upload, None, artifact).await
     }
 
     async fn import_managed_layer_by_hash(
@@ -1072,22 +1701,9 @@ impl OssSnapshotRepository {
                 e,
             )
         })?;
-        let descriptor = crate::digest::FileDigest::describe(&canonical)
-            .await
-            .map_err(|e| {
-                RepositoryError::backend(
-                    format!("describe managed layer '{}'", canonical.display()),
-                    e,
-                )
-            })?;
-        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.sha256);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
-
-        Ok(ManagedLayer {
-            digest: descriptor.sha256,
-            size: descriptor.size,
-            uuid: overlaybd_layer_uuid(&canonical),
-        })
+        let upload = prepare_layer_upload(&canonical, self.publish_compression, None).await?;
+        let uuid = overlaybd_layer_uuid(upload.path());
+        self.upload_prepared_layer(upload, uuid, artifact).await
     }
 
     async fn import_managed_layer_with_descriptor(
@@ -1125,13 +1741,31 @@ impl OssSnapshotRepository {
 
         // Descriptor-backed imports intentionally trust internally generated
         // content digests and only validate the cheap size invariant here.
-        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(digest);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
+        // Publish compression recontainerizes raw layers as zfile, which
+        // changes the physical bytes, so `prepare_layer_upload` re-hashes the
+        // compressed output instead of trusting this descriptor.
+        let upload =
+            prepare_layer_upload(&canonical, self.publish_compression, Some((digest, size)))
+                .await?;
+        let uuid = overlaybd_layer_uuid(upload.path());
+        self.upload_prepared_layer(upload, uuid, artifact).await
+    }
 
+    /// Upload a prepared layer under its content-addressed key and build the
+    /// committed managed-layer reference. The object key, digest, and size all
+    /// describe exactly the prepared (possibly recontainerized) bytes.
+    async fn upload_prepared_layer(
+        &self,
+        upload: PreparedLayerUpload,
+        uuid: Option<String>,
+        artifact: OssUploadArtifact,
+    ) -> RepositoryResult<ManagedLayer> {
+        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(upload.digest());
+        upload_managed_layer_if_missing(&self.client, &oss_key, upload.path(), artifact).await?;
         Ok(ManagedLayer {
-            digest: digest.to_string(),
-            size,
-            uuid: overlaybd_layer_uuid(&canonical),
+            digest: upload.digest().to_string(),
+            size: upload.size(),
+            uuid,
         })
     }
 }
@@ -1176,7 +1810,7 @@ async fn upload_managed_layer_if_missing(
 }
 
 fn validate_publish_manifest_image_configs(
-    manifest: &FirecrackerSnapshotManifest,
+    manifest: &SandboxSnapshotManifest,
 ) -> RepositoryResult<()> {
     load_overlaybd_image_config(&manifest.rootfs.image_config_path).map_err(|e| {
         RepositoryError::backend(
@@ -1211,10 +1845,249 @@ fn validate_publish_manifest_image_configs(
     Ok(())
 }
 
+// ── Detached startup-manifest continuation ─────────────────────────────────
+
+/// Detached startup-manifest continuation: joins the recording, builds and
+/// uploads the manifest, then attaches its descriptor to the already
+/// committed record. Best-effort throughout — any failure only means the
+/// snapshot resumes on-demand.
+async fn finish_startup_manifest(
+    client: std::sync::Arc<OssClient>,
+    id: SnapshotId,
+    recording: crate::snapshot::StartupRecording,
+) {
+    let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+    // Hold the captured artifacts alive until the manifest is uploaded, and
+    // count this continuation for the shutdown drain.
+    let _keep_alive = keep_alive;
+    let _guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::new();
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    let trace_path = match tokio::select! {
+        joined = trace => joined,
+        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => return,
+    } {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            debug!(snapshot_id = %id, "startup manifest recording produced no trace");
+            return;
+        }
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup manifest recording join failed");
+            return;
+        }
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    let layout = OssSnapshotArtifactLayout::new(&id);
+    let Some(info) = build_and_upload_manifest(&client, &layout, &id, &trace_path).await else {
+        return;
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    attach_memory_startup_descriptor(&client, &id, info).await;
+}
+
+/// Best-effort: build the v3 startup manifest (exact-order prefix pages
+/// plus merged ranges) from the recorded first-touch trace and upload it.
+/// No layer bytes are read, packed, or uploaded — the resume side prefetches
+/// the listed positions through the normal read path.
+async fn build_and_upload_manifest(
+    client: &OssClient,
+    layout: &OssSnapshotArtifactLayout<'_>,
+    id: &SnapshotId,
+    trace_path: &std::path::Path,
+) -> Option<MemoryStartupPackInfo> {
+    let pack_config = &crate::cfg::ConfigManager::global_config()
+        .snapshot
+        .memory_startup_pack;
+    let build = async {
+        let trace = match tokio::fs::read(trace_path).await {
+            Ok(trace) => trace,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    debug!(
+                        %error,
+                        snapshot_id = %id,
+                        "read startup trace failed; publishing without a manifest"
+                    );
+                }
+                return None;
+            }
+        };
+        let (mem_virtual_size, offsets) = match overlaybd::startup_pack::decode_trace(&trace) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                warn!(
+                    %error,
+                    snapshot_id = %id,
+                    "startup trace undecodable; publishing without a manifest"
+                );
+                return None;
+            }
+        };
+        let manifest_doc =
+            match overlaybd::startup_manifest::build_manifest(mem_virtual_size, &offsets) {
+                Ok(doc) => doc,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        snapshot_id = %id,
+                        "build startup manifest failed (best-effort)"
+                    );
+                    return None;
+                }
+            };
+        let manifest_bytes = match overlaybd::startup_manifest::encode_manifest(&manifest_doc) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    %error,
+                    snapshot_id = %id,
+                    "encode startup manifest failed (best-effort)"
+                );
+                return None;
+            }
+        };
+        info!(
+            snapshot_id = %id,
+            pages = offsets.len(),
+            prefix_pages = manifest_doc.prefix_pages.len(),
+            ranges = manifest_doc.ranges.len(),
+            manifest_bytes = manifest_bytes.len(),
+            "startup manifest built"
+        );
+
+        let info = MemoryStartupPackInfo {
+            pack_size: manifest_bytes.len() as u64,
+            mem_virtual_size,
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(&manifest_bytes),
+        };
+        if let Err(error) = client
+            .put_bytes(
+                &layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT),
+                manifest_bytes,
+                OssUploadArtifact::StartupPack,
+            )
+            .await
+        {
+            warn!(
+                %error,
+                snapshot_id = %id,
+                "upload startup manifest failed (best-effort)"
+            );
+            return None;
+        }
+        Some(info)
+    }
+    .await;
+
+    if build.is_none() && pack_config.enabled {
+        delete_stale_startup_pack(client, layout, id).await;
+    }
+    build
+}
+
+/// Attach the uploaded manifest's descriptor to the committed record via a
+/// read-modify-write pass. Alibaba OSS has no conditional-write CAS on the
+/// S3-compatible path (see `bind_alias`), so a delete racing this update can
+/// resurrect the record — accepted with the same documented model as alias
+/// binding. A missing record (deleted meanwhile) aborts and drops the
+/// manifest instead of resurrecting anything.
+async fn attach_memory_startup_descriptor(
+    client: &OssClient,
+    id: &SnapshotId,
+    info: MemoryStartupPackInfo,
+) {
+    let layout = OssSnapshotArtifactLayout::new(id);
+    let cleanup_manifest = || async {
+        if let Err(error) = client
+            .delete(&layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT))
+            .await
+        {
+            debug!(%error, snapshot_id = %id, "delete manifest after aborted attach failed");
+        }
+    };
+    let record_key = OssSnapshotArtifactLayout::record_key(id);
+    let bytes = match client.get_bytes(&record_key).await {
+        Ok(bytes) => bytes,
+        Err(error) if OssClient::is_not_found_error(&error) => {
+            debug!(
+                snapshot_id = %id,
+                "record deleted while attaching startup manifest; dropping the manifest"
+            );
+            cleanup_manifest().await;
+            return;
+        }
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "read record for startup manifest attach failed");
+            return;
+        }
+    };
+    let mut record: SnapshotRecord = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "parse record for startup manifest attach failed");
+            return;
+        }
+    };
+    let Some(committed) = record.committed.as_mut() else {
+        cleanup_manifest().await;
+        return;
+    };
+    if committed.memory_startup.is_some() {
+        return;
+    }
+    committed.memory_startup = Some(info);
+    record.updated_at_unix_ms = now_unix_ms();
+    let bytes = match serde_json::to_vec_pretty(&record) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "serialize record for startup manifest attach failed");
+            return;
+        }
+    };
+    if let Err(error) = client
+        .put_bytes(&record_key, bytes, OssUploadArtifact::CatalogRecord)
+        .await
+    {
+        warn!(
+            %error,
+            snapshot_id = %id,
+            "attach startup manifest descriptor failed (best-effort)"
+        );
+    }
+}
+
+/// Clean a possible stale startup artifact when the feature expected one
+/// (a publish retry after a crash with recording enabled); a manifest-less
+/// publish with the feature off must not pay an extra OSS request. A None
+/// `memory_startup` descriptor already prevents consumption either way.
+async fn delete_stale_startup_pack(
+    client: &OssClient,
+    layout: &OssSnapshotArtifactLayout<'_>,
+    id: &SnapshotId,
+) {
+    if let Err(error) = client
+        .delete(&layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT))
+        .await
+    {
+        debug!(
+            %error,
+            snapshot_id = %id,
+            "delete stale startup pack failed (best-effort)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store_operator::CredentialSource;
+    use overlaybd::config::ImageConfig;
     use serde_json::json;
 
     fn write_test_image(path: &Path, value: serde_json::Value) {
@@ -1232,9 +2105,73 @@ mod tests {
             "region".to_string(),
             "prefix".to_string(),
             CredentialSource::Anonymous,
+            None,
         )
         .expect("oss client");
-        OssSnapshotRepository::new(Arc::new(client), SnapshotImageStoragePolicy::ObjectStorage)
+        OssSnapshotRepository::new(
+            Arc::new(client),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            &SnapshotPublishCompressionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn publish_compression_config_resolves_into_compact_output() {
+        let client = || {
+            Arc::new(
+                OssClient::new(
+                    "bucket".to_string(),
+                    "https://oss.example.com".to_string(),
+                    "region".to_string(),
+                    "prefix".to_string(),
+                    CredentialSource::Anonymous,
+                    None,
+                )
+                .expect("oss client"),
+            )
+        };
+
+        let disabled = OssSnapshotRepository::new(
+            client(),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            &SnapshotPublishCompressionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(disabled.publish_compression, OverlaybdCompactOutput::Raw);
+
+        let enabled = OssSnapshotRepository::new(
+            client(),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            &SnapshotPublishCompressionConfig {
+                enabled: true,
+                algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Zstd,
+                workers: 4,
+            },
+        );
+        assert_eq!(
+            enabled.publish_compression,
+            OverlaybdCompactOutput::ZFile {
+                algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Zstd,
+                workers: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn volume_keys_use_separate_flat_namespaces() {
+        let key = OssSnapshotArtifactLayout::volume_record_key("vol_test");
+        assert_eq!(key, "volumes/records/vol_test.json");
+        assert_eq!(
+            OssSnapshotArtifactLayout::volume_alias_key("test-data"),
+            "volumes/aliases/test-data.json"
+        );
+        assert_eq!(volume_id_from_record_key(&key).unwrap(), "vol_test");
+        assert!(volume_id_from_record_key("volumes/records/ab/vol_test.json").is_err());
     }
 
     #[test]
@@ -1266,7 +2203,7 @@ mod tests {
             }),
         );
 
-        let mut manifest = FirecrackerSnapshotManifest::for_test(1024, &[]);
+        let mut manifest = SandboxSnapshotManifest::for_test(1024, &[]);
         manifest.rootfs.image_config_path = rootfs_image_config;
         manifest.memory.image_config_path = memory_image_config;
 
@@ -1390,5 +2327,41 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn materializes_volume_backing_with_backend_layer_urls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = test_repository();
+        let destination = temp.path().join("volume/image.json");
+        let layers = vec![
+            OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: "sha256:managed".to_string(),
+                size: 12,
+                uuid: None,
+            }),
+            OverlaybdLayerRef::External(ExternalLayer {
+                digest: "sha256:external".to_string(),
+                repo_blob_url: "https://registry.example/v2/data/blobs".to_string(),
+                size: 24,
+            }),
+        ];
+
+        repository
+            .materialize_volume_backing("vol_test", &layers, &destination)
+            .await
+            .expect("materialize volume config");
+        let config: ImageConfig =
+            serde_json::from_slice(&tokio::fs::read(&destination).await.unwrap()).unwrap();
+        assert_eq!(config.lowers.len(), 2);
+        assert_eq!(
+            config.lowers[0].repo_blob_url,
+            "s3://bucket/prefix/managed-layers"
+        );
+        assert_eq!(
+            config.lowers[1].repo_blob_url,
+            "https://registry.example/v2/data/blobs"
+        );
+        assert!(config.lowers.iter().all(|layer| layer.file.is_empty()));
     }
 }

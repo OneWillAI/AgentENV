@@ -76,6 +76,12 @@ pub enum SandboxLaunchSource {
 #[derive(Clone)]
 pub struct CreateSandboxRequest {
     pub source: SandboxLaunchSource,
+    /// Launch-time drives that are not part of the source snapshot.
+    pub extra_drives: Vec<crate::sandbox::ExtraDrive>,
+    /// Whether `extra_drives` already occupy reserved slots in the source
+    /// Firecracker state. Restored volume snapshots can be bound before load;
+    /// newly requested volumes must replace placeholders after load.
+    pub extra_drives_in_snapshot: bool,
     pub timeout: Option<Duration>,
     pub timeout_action: super::SandboxTimeoutAction,
     pub auto_resume: bool,
@@ -87,6 +93,17 @@ pub struct CreateSandboxRequest {
     pub idempotency: Option<CreateSandboxIdempotency>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Volume mounts requested for this sandbox, keyed by guest path.
+    pub volume_mounts: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SandboxForkChildSpec {
+    pub sandbox_id: SandboxId,
+    pub volume_mounts: HashMap<String, String>,
+    pub extra_drives: Vec<crate::sandbox::ExtraDrive>,
+    /// Pairs of `(source_drive_id, replacement_drive_id)`.
+    pub replace_drive_ids: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

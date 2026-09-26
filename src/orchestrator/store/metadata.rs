@@ -30,6 +30,9 @@ pub enum NewTimeout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxMetadata {
     pub id: SandboxId,
+    /// Server-owned template builder, excluded from public sandbox APIs.
+    #[serde(default)]
+    pub template_builder: bool,
     pub snapshot_id: String,
     pub snapshot_alias: Option<String>,
     pub state: SandboxState,
@@ -69,6 +72,9 @@ pub struct SandboxMetadata {
     /// unless overridden at create time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Independently managed volume mounts keyed by guest path.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub volume_mounts: HashMap<String, String>,
     /// Whether envd requires the access token derived from this sandbox's ID.
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
@@ -83,6 +89,7 @@ impl Default for SandboxMetadata {
     fn default() -> Self {
         Self {
             id: SandboxId::new(),
+            template_builder: false,
             snapshot_id: "unknown".to_string(),
             snapshot_alias: None,
             state: SandboxState::Creating,
@@ -109,6 +116,7 @@ impl Default for SandboxMetadata {
             resume_recovery_pending: false,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
+            volume_mounts: HashMap::new(),
             secure: false,
             paused_state: None,
         }

@@ -1,3 +1,3 @@
-pub mod transient_io_ring;
+pub mod dispatch_file;
 pub mod vfile_io;
 pub mod virtual_file;

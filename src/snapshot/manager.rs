@@ -9,11 +9,11 @@ use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
 use crate::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
+    CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
+use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
     SnapshotRecord,
@@ -37,6 +37,22 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
         .iter()
         .filter_map(|layer| layer.uuid.clone())
         .collect()
+}
+
+/// Every layer digest the committed record references for one snapshot
+/// subject (rootfs or one attached drive), managed and external alike.
+fn committed_layer_digests(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
+    layers
+        .iter()
+        .map(|layer| match layer {
+            OverlaybdLayerRef::Managed(managed) => managed.digest.clone(),
+            OverlaybdLayerRef::External(external) => external.digest.clone(),
+        })
+        .collect()
+}
+
+fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
+    layers.iter().map(|layer| layer.digest.clone()).collect()
 }
 
 #[derive(Clone)]
@@ -77,6 +93,12 @@ impl SnapshotManager {
         }
     }
 
+    /// Returns the configured durable repository so sibling resource catalogs
+    /// can share the same PosixFS/OSS source of truth.
+    pub fn repository(&self) -> Arc<dyn SnapshotRepository> {
+        Arc::clone(&self.repository)
+    }
+
     pub async fn create(
         &self,
         record: SnapshotRecord,
@@ -84,15 +106,16 @@ impl SnapshotManager {
         self.repository.create(record).await
     }
 
-    #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
+    #[tracing::instrument(skip(self, metadata, manifest, recording), fields(snapshot_id = %metadata.id))]
     pub async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let record = self
             .repository
-            .publish(metadata.clone(), manifest.clone())
+            .publish(metadata.clone(), manifest.clone(), recording)
             .await?;
         self.publish_p2p_artifacts(&record, &manifest).await;
         Ok(record)
@@ -104,16 +127,27 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let manifest = captured_snapshot
-            .downcast_ref::<FirecrackerCapturedSnapshot>()
-            .map(|snapshot| snapshot.manifest().clone())
-            .ok_or_else(|| RepositoryError::Unsupported {
-                feature: "publishing captured snapshots for this sandbox backend".to_string(),
-            })?;
+        let manifest = captured_snapshot.manifest().clone();
+
+        // Spawn the startup-manifest recording up front (a no-op task when
+        // the feature is disabled): the throwaway recording VM overlaps the
+        // backend's layer uploads, and a detached continuation uploads the
+        // manifest once the trace lands — publish never waits on it. The
+        // capture root guard travels with the task so the artifacts outlive
+        // the whole continuation.
+        let recording = captured_snapshot
+            .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
+            .map(|artifacts| crate::snapshot::StartupRecording {
+                trace: tokio::spawn(crate::sandbox::record_startup_pack(
+                    artifacts.snapshot_config().clone(),
+                    artifacts.snapshot_dir().to_path_buf(),
+                )),
+                keep_alive: Box::new(artifacts.snapshot_root_guard()),
+            });
 
         let record = self
             .repository
-            .publish(metadata.clone(), manifest.clone())
+            .publish(metadata.clone(), manifest.clone(), recording)
             .await?;
         self.publish_p2p_artifacts(&record, &manifest).await;
         Ok(record)
@@ -124,7 +158,7 @@ impl SnapshotManager {
     async fn publish_p2p_artifacts(
         &self,
         record: &SnapshotRecord,
-        manifest: &FirecrackerSnapshotManifest,
+        manifest: &SandboxSnapshotManifest,
     ) {
         let Some(transport) = self.p2p_transport.as_ref() else {
             return;
@@ -151,28 +185,35 @@ impl SnapshotManager {
 
         // Collect any overlaybd layers referenced by this snapshot's runtime images.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
+        let rootfs_digests = committed_layer_digests(&committed.rootfs_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.rootfs.image_config_path,
+            &rootfs_digests,
             &rootfs_uuids,
         ));
         let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
+        let memory_digests = committed_memory_layer_digests(&committed.memory_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.memory.image_config_path,
+            &memory_digests,
             &memory_uuids,
         ));
         for drive in &manifest.attached_drives {
-            let drive_uuids = committed
+            let (drive_digests, drive_uuids) = committed
                 .attached_drives
                 .iter()
                 .find_map(|committed_drive| match committed_drive {
                     crate::snapshot::CommittedAttachedDrive::Overlaybd {
                         drive_id, layers, ..
-                    } if drive_id == &drive.drive_id => Some(managed_layer_uuids(layers)),
+                    } if drive_id == &drive.drive_id => {
+                        Some((committed_layer_digests(layers), managed_layer_uuids(layers)))
+                    }
                     _ => None,
                 })
                 .unwrap_or_default();
             artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
                 &drive.image_config_path,
+                &drive_digests,
                 &drive_uuids,
             ));
         }
@@ -316,7 +357,7 @@ mod tests {
             ..SnapshotPublishMetadata::mock()
         };
         manager
-            .publish(metadata, manifest)
+            .publish(metadata, manifest, None)
             .await
             .expect("seed publish should work");
     }
@@ -396,7 +437,7 @@ mod tests {
         };
 
         manager
-            .publish(metadata, manifest)
+            .publish(metadata, manifest, None)
             .await
             .expect("publish should commit");
 

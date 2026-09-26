@@ -1,5 +1,4 @@
 use std::fmt;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,6 +6,7 @@ use std::time::Duration;
 
 use crate::backend::cache::{
     BkDownloadSubmitError, CacheFnTransFunc, CachedFile, FileCacheBackend, FileCacheBackendOptions,
+    StartupPackHandle, StartupPackLayer, StartupPackSubmission,
 };
 use crate::backend::local::LocalFile;
 use crate::backend::oss::OssBackend;
@@ -16,14 +16,29 @@ use crate::config::{
     GlobalConfig, ImageConfig,
 };
 use crate::image::image_file::ImageFile;
+use crate::io::dispatch_file::{build_remote_io_runtime, RuntimeDispatchFile};
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::file::CommitArgs;
 use anyhow::{bail, Context, Result};
-use storage_util::io_ring::IoRingHandle;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Upload shape for [`ImageService::export_upper_as_oss_sealed`].
+///
+/// Sized for the ceiling rather than for memory, because this entry point is
+/// library surface: it can be handed an image of any size, and the part size is
+/// what bounds how large that may be. S3 allows 10,000 parts, so 64 MiB caps a
+/// single object at ~625 GiB, where 16 MiB would cap it at 156 GiB — and
+/// exceeding the cap is not caught up front, it fails partway through the upload.
+///
+/// The price is memory: peak is `(2 * concurrency + 2) * part_size`, so ~640 MiB
+/// here. Concurrency stays at 4 to keep that from doubling; past the point where
+/// it covers the round-trip time, more parts in flight buy little. See
+/// `backend::oss::upload_file_streaming` for both derivations.
+const OSS_SEALED_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
+const OSS_SEALED_UPLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RemoteOpenMode {
@@ -37,7 +52,29 @@ struct ImageServiceInner {
     p2p_publish_url: Option<String>,
     remote_runtime: OnceCell<RemoteRuntime>,
     remote_mode: parking_lot::RwLock<RemoteOpenMode>,
-    io_rings: Vec<IoRingHandle>,
+    /// Handle to the runtime all remote network I/O is dispatched onto: the
+    /// dedicated `remote_io_runtime` when the global config sets
+    /// `remoteIoWorkers` > 0, otherwise the runtime that constructed this
+    /// service (e.g. unit tests). Either way, remote I/O never runs on
+    /// per-device ublk queue runtimes (dropped on device teardown).
+    remote_io_handle: tokio::runtime::Handle,
+    /// The dedicated remote-I/O runtime, created only when the global config
+    /// sets `remoteIoWorkers` > 0. `Option` so `Drop` can move it out for a
+    /// non-blocking shutdown.
+    remote_io_runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Drop for ImageServiceInner {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.remote_io_runtime.take() {
+            // `Runtime::drop` blocks during shutdown and panics inside an
+            // async context (tests, the daemon's main runtime); shut down in
+            // the background instead. In-flight tasks are cancelled, and a
+            // stale `RuntimeDispatchFile` handle spawning afterwards simply
+            // yields cancelled join errors.
+            runtime.shutdown_background();
+        }
+    }
 }
 
 struct RemoteRuntime {
@@ -89,15 +126,16 @@ impl ImageService {
         config_path: PathBuf,
         p2p_publish_url: Option<String>,
     ) -> Result<Self> {
-        let mut io_rings = Vec::with_capacity(global_config.nr_io_rings);
-        for id in 0..global_config.nr_io_rings {
-            let (io_ring, _) =
-                storage_util::io_ring::spawn_io_ring_worker::<io_uring::squeue::Entry>(id);
-            io_rings.push(io_ring);
-        }
-        if io_rings.is_empty() {
-            bail!("zero io urings");
-        }
+        let (remote_io_runtime, remote_io_handle) = if global_config.remote_io_workers > 0 {
+            // Production deployments: dedicated runtime sized by the config.
+            let runtime = build_remote_io_runtime(global_config.remote_io_workers)?;
+            let handle = runtime.handle().clone();
+            (Some(runtime), handle)
+        } else {
+            // No dedicated runtime requested: dispatch onto the runtime that
+            // constructs this service (e.g. unit tests).
+            (None, tokio::runtime::Handle::current())
+        };
 
         Ok(Self {
             inner: Arc::new(ImageServiceInner {
@@ -106,7 +144,8 @@ impl ImageService {
                 p2p_publish_url,
                 remote_runtime: OnceCell::new(),
                 remote_mode: parking_lot::RwLock::new(RemoteOpenMode::Cached),
-                io_rings,
+                remote_io_handle,
+                remote_io_runtime,
             }),
         })
     }
@@ -137,16 +176,6 @@ impl ImageService {
     /// [`GlobalConfig`] via [`ImageService::new`].
     pub fn config_path(&self) -> &Path {
         &self.inner.config_path
-    }
-
-    /// Return a clone of the stored [`IoRingHandle`].
-    pub fn io_ring<H: Hash>(&self, key: H) -> IoRingHandle {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % self.inner.io_rings.len();
-        // SAFETY: the idx is generated by mod on io_ring.len()
-        // and we already check nr_io_rings when validate global config
-        self.inner.io_rings[idx].clone()
     }
 
     async fn build_file_cache(cfg: &GlobalConfig) -> Result<Option<FileCacheBackend>> {
@@ -212,12 +241,42 @@ impl ImageService {
         let service = self.clone();
         self.inner
             .remote_runtime
-            .get_or_try_init(move || async move { service.build_remote_runtime().await })
+            .get_or_try_init(move || async move {
+                // Run the whole construction on the service's dedicated
+                // remote-I/O runtime: the cache spawns its background workers
+                // (download scheduler, eviction/checkpoint loops) with a bare
+                // `tokio::spawn` / `Handle::try_current` during construction,
+                // which must bind to that runtime rather than the first
+                // caller's — the remote runtime is initialized lazily and
+                // the caller may be a per-device ublk queue runtime that is
+                // dropped on device teardown.
+                let handle = service.inner.remote_io_handle.clone();
+                handle
+                    .spawn(async move { service.build_remote_runtime().await })
+                    .await
+                    .context("remote runtime init task failed to join")?
+            })
             .await
     }
 
     pub fn global_config(&self) -> &GlobalConfig {
         &self.inner.global_config
+    }
+
+    /// The object-store backend, or `None` when `ossConfig.enable` is false.
+    ///
+    /// Exposed so a caller that needs object storage for its own purposes — reading
+    /// a metadata object, uploading a sealed layer — shares this one instead of
+    /// constructing a second `OssBackend` from the same `ossConfig`. A second one
+    /// would work, but it would carry its own operator cache and its own resolved
+    /// credentials, and a `credentialProcess` costs a subprocess per cache miss.
+    /// `OssBackend` is `Arc`-backed, so a clone of the returned value shares both.
+    ///
+    /// **This initializes the whole remote runtime**, including the registry client
+    /// and the file cache, because they share one `OnceCell` with the backend. A
+    /// caller serving only local images should check `ossConfig.enable` and not ask.
+    pub async fn oss_backend(&self) -> Result<Option<&OssBackend>> {
+        Ok(self.remote_runtime().await?.oss_backend.as_ref())
     }
 
     pub fn io_engine(&self) -> u32 {
@@ -385,12 +444,27 @@ impl ImageService {
             .as_ref()
             .context("background download requires a file cache backend")?;
         let request_count = requests.len();
-        let result = cache.submit_bk_download_batch(
-            requests
-                .into_iter()
-                .map(|request| (request.file, request.config, device_key.clone()))
-                .collect(),
-        );
+        // Submit on the service's dedicated remote-I/O runtime: the
+        // scheduler spawns its per-task readiness timers with a bare
+        // `tokio::spawn` during submission, which must bind to that runtime
+        // rather than the caller's (a per-device ublk queue runtime is
+        // dropped on device teardown, which would silently strand the
+        // timers).
+        let cache = cache.clone();
+        let submit_device_key = device_key.clone();
+        let result = self
+            .inner
+            .remote_io_handle
+            .spawn(async move {
+                cache.submit_bk_download_batch(
+                    requests
+                        .into_iter()
+                        .map(|request| (request.file, request.config, submit_device_key.clone()))
+                        .collect(),
+                )
+            })
+            .await
+            .context("background download submit task failed to join")?;
         match result {
             Ok(()) => Ok(()),
             Err(error) => match error.downcast_ref::<BkDownloadSubmitError>() {
@@ -411,6 +485,55 @@ impl ImageService {
                 None => Err(error).context("submit background downloads"),
             },
         }
+    }
+
+    /// Register a v2 startup memory pack prefetch for the memory image at
+    /// `image_config_path`: binds the pack's objects to the image's OSS
+    /// lowers through the same cache entries the on-demand path uses, then
+    /// hands the download to the cache scheduler. Returns `None` (no pack)
+    /// when the image has no bindable OSS lowers or the cache backend is
+    /// missing. The prefetch is best-effort: on-demand reads and background
+    /// downloads proceed regardless.
+    pub async fn prefetch_startup_pack(
+        &self,
+        image_config_path: impl AsRef<Path>,
+        pack: StartupPackPrefetch,
+    ) -> Result<Option<StartupPackHandle>> {
+        let remote_runtime = self.remote_runtime().await?;
+        let Some(cache) = remote_runtime.file_cache.as_ref() else {
+            return Ok(None);
+        };
+        let image_config = self.load_image_config(image_config_path.as_ref())?;
+        let Some(refs) = collect_startup_pack_layers(&image_config) else {
+            return Ok(None);
+        };
+        let mut layers = Vec::with_capacity(refs.len());
+        for (url, digest, size) in refs {
+            let source = self.open_backend_source_with_size(&url, Some(size)).await?;
+            let file = Self::open_cached_blob(cache, &url, source.clone(), Some(size)).await?;
+            layers.push(StartupPackLayer {
+                digest,
+                size,
+                file,
+                source,
+            });
+        }
+        // The pack object itself bypasses the file cache: it is consumed
+        // exactly once, and only its layer blocks belong in the cache. The
+        // size hint avoids a stat probe.
+        let pack_source = self
+            .open_backend_source_with_size(&pack.url, Some(pack.pack_size))
+            .await?;
+        let handle = cache.submit_startup_pack(StartupPackSubmission {
+            task_key: format!("startup-pack:{}", pack.index_sha256),
+            pack_source,
+            pack_size: pack.pack_size,
+            index_sha256: pack.index_sha256,
+            mem_virtual_size: pack.mem_virtual_size,
+            layers,
+            timeout: pack.timeout,
+        })?;
+        Ok(Some(handle))
     }
 
     async fn open_cached_blob(
@@ -457,25 +580,39 @@ impl ImageService {
         source_size: Option<u64>,
     ) -> Result<Arc<dyn VirtualFile>> {
         let remote_runtime = self.remote_runtime().await?;
-        if Self::is_oss_url(url) {
-            let oss = remote_runtime
-                .oss_backend
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("OSS backend not enabled in config"))?;
-            return oss.open_with_size_hint(url, source_size);
-        }
-
-        match source_size {
-            Some(size) => Ok(remote_runtime
-                .underlay_registryfs
-                .open_with_size_hint(url.to_string(), Some(size))),
-            None => {
-                remote_runtime
-                    .underlay_registryfs
-                    .open(url.to_string())
-                    .await
-            }
-        }
+        let oss_backend = remote_runtime.oss_backend.clone();
+        let registryfs = remote_runtime.underlay_registryfs.clone();
+        let url = url.to_string();
+        // Run the open itself on the pinned runtime as well: opening may
+        // issue requests (e.g. the eager size fetch in `RegistryFsV2::open`
+        // when no hint is available), and any pooled connection used there
+        // must live on the pinned runtime. Dispatching the whole open keeps
+        // that guarantee regardless of what the open path does internally.
+        let source: Arc<dyn VirtualFile> = self
+            .inner
+            .remote_io_handle
+            .spawn(async move {
+                if Self::is_oss_url(&url) {
+                    let oss = oss_backend
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("OSS backend not enabled in config"))?;
+                    oss.open_with_size_hint(&url, source_size)
+                } else {
+                    match source_size {
+                        Some(size) => Ok(registryfs.open_with_size_hint(url, Some(size))),
+                        None => registryfs.open(url).await,
+                    }
+                }
+            })
+            .await
+            .context("remote blob open task failed to join")??;
+        // Pin all subsequent remote network I/O (opendal/reqwest connection
+        // tasks) to the service's remote-I/O runtime so per-device ublk
+        // queue runtimes never own pooled HTTP connections. See
+        // `io::dispatch_file`.
+        let wrapped: Arc<dyn VirtualFile> =
+            RuntimeDispatchFile::new(source, self.inner.remote_io_handle.clone());
+        Ok(wrapped)
     }
 
     pub async fn export_upper_as_oss_sealed(
@@ -497,8 +634,7 @@ impl ImageService {
         std::fs::create_dir_all(&stage_dir)
             .with_context(|| format!("create oss stage dir {}", stage_dir.display()))?;
         let stage_path = stage_dir.join(format!("{}.lsmt", Uuid::new_v4()));
-        let stage_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(&stage_path, self.io_ring(dest_url)).await?);
+        let stage_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&stage_path)?);
 
         let export_result = image
             .export_upper_as_sealed(CommitArgs::new(stage_file.clone()))
@@ -509,7 +645,15 @@ impl ImageService {
         }
 
         stage_file.sync().await?;
-        let upload_result = oss.upload_path(dest_url, &stage_path).await;
+        let upload_result = oss
+            .upload_path(
+                dest_url,
+                &stage_path,
+                OSS_SEALED_UPLOAD_PART_SIZE,
+                OSS_SEALED_UPLOAD_CONCURRENCY,
+                None,
+            )
+            .await;
         // Always clean up the staging file regardless of upload outcome.
         // The staging file is a full copy of the sealed upper layer and can
         // be large; leaving it on disk across failures would accumulate waste.
@@ -528,6 +672,47 @@ impl ImageService {
         }
         Ok(std::fs::write(filename, data.as_bytes())?)
     }
+}
+
+/// Parameters for one startup pack prefetch (see
+/// [`ImageService::prefetch_startup_pack`]).
+pub struct StartupPackPrefetch {
+    pub url: String,
+    pub pack_size: u64,
+    pub index_sha256: String,
+    pub mem_virtual_size: u64,
+    /// Hard bound on queueing plus downloading.
+    pub timeout: std::time::Duration,
+}
+
+/// Collect the OSS lowers of a memory image config as `(url, digest, size)`
+/// in bottom-to-top order, with URLs built exactly like the image-open path
+/// (`{repo_blob_url}/{digest}`). Returns `None` when any lower cannot be
+/// bound (no remote URL, missing descriptor, or a non-OSS URL): the pack
+/// binds by exact object-table match, so a partial binding is useless.
+fn collect_startup_pack_layers(image_config: &ImageConfig) -> Option<Vec<(String, String, u64)>> {
+    if image_config.lowers.is_empty() {
+        return None;
+    }
+    let mut refs = Vec::with_capacity(image_config.lowers.len());
+    for lower in &image_config.lowers {
+        // A local-file lower is read from local bytes, not from the OSS
+        // object: prefetching that object would warm a cache the device
+        // never touches.
+        if !lower.file.is_empty() {
+            return None;
+        }
+        let base = lower.effective_repo_blob_url(&image_config.repo_blob_url);
+        if base.is_empty() || lower.digest.is_empty() || lower.size == 0 {
+            return None;
+        }
+        let url = format!("{}/{}", base.trim_end_matches('/'), lower.digest);
+        if !ImageService::is_oss_url(&url) {
+            return None;
+        }
+        refs.push((url, lower.digest.clone(), lower.size));
+    }
+    Some(refs)
 }
 
 fn check_accelerate_url(address: &str) -> bool {
@@ -558,6 +743,7 @@ mod tests {
     use axum::http::{HeaderMap as HttpHeaderMap, Response, StatusCode as HttpStatusCode};
     use axum::routing::any;
     use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
@@ -568,6 +754,86 @@ mod tests {
             serde_json::to_vec_pretty(value).expect("serialize json"),
         )
         .expect("write json");
+    }
+
+    fn remote_lower(digest: &str, size: u64) -> crate::config::LayerConfig {
+        crate::config::LayerConfig {
+            digest: digest.to_string(),
+            size,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn startup_pack_layers_builds_urls_like_image_open() {
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/aenv-bk/managed-layers".to_string(),
+            lowers: vec![
+                remote_lower("sha256:aa", 100),
+                remote_lower("sha256:bb", 200),
+            ],
+            ..Default::default()
+        };
+        let refs = collect_startup_pack_layers(&config).expect("all remote lowers bind");
+        assert_eq!(
+            refs,
+            vec![
+                (
+                    "s3://bucket/aenv-bk/managed-layers/sha256:aa".to_string(),
+                    "sha256:aa".to_string(),
+                    100
+                ),
+                (
+                    "s3://bucket/aenv-bk/managed-layers/sha256:bb".to_string(),
+                    "sha256:bb".to_string(),
+                    200
+                ),
+            ]
+        );
+
+        // A per-layer repo_blob_url wins over the config-level base.
+        let mut layered = remote_lower("sha256:cc", 300);
+        layered.repo_blob_url = "s3://bucket/other".to_string();
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/aenv-bk/managed-layers".to_string(),
+            lowers: vec![layered],
+            ..Default::default()
+        };
+        let refs = collect_startup_pack_layers(&config).expect("layer-level url binds");
+        assert_eq!(refs[0].0, "s3://bucket/other/sha256:cc");
+    }
+
+    #[test]
+    fn startup_pack_layers_rejects_unbindable_lowers() {
+        // Empty lowers.
+        assert!(collect_startup_pack_layers(&ImageConfig::default()).is_none());
+        // Local-file lower (no remote identity).
+        let local = crate::config::LayerConfig {
+            file: "/layers/a.commit".to_string(),
+            digest: "sha256:aa".to_string(),
+            size: 100,
+            ..Default::default()
+        };
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/prefix".to_string(),
+            lowers: vec![local],
+            ..Default::default()
+        };
+        assert!(collect_startup_pack_layers(&config).is_none());
+        // Missing descriptor.
+        let config = ImageConfig {
+            repo_blob_url: "s3://bucket/prefix".to_string(),
+            lowers: vec![crate::config::LayerConfig::default()],
+            ..Default::default()
+        };
+        assert!(collect_startup_pack_layers(&config).is_none());
+        // Non-OSS URL scheme.
+        let config = ImageConfig {
+            repo_blob_url: "https://registry/v2/repo/blobs".to_string(),
+            lowers: vec![remote_lower("sha256:aa", 100)],
+            ..Default::default()
+        };
+        assert!(collect_startup_pack_layers(&config).is_none());
     }
 
     async fn spawn_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -589,6 +855,26 @@ mod tests {
     #[derive(Clone, Debug)]
     struct OssObjectState {
         blob: Arc<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct CountedBlobState {
+        blob: Arc<Vec<u8>>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    async fn handle_counted_blob(
+        State(state): State<CountedBlobState>,
+        request: Request,
+    ) -> Response<Body> {
+        state.hits.fetch_add(1, Ordering::Relaxed);
+        handle_oss_object(
+            State(OssObjectState {
+                blob: state.blob.clone(),
+            }),
+            request,
+        )
+        .await
     }
 
     async fn handle_oss_object(
@@ -920,6 +1206,95 @@ mod tests {
             .await
             .expect("open source blob with size");
         let got = file.read_at(0, object.len()).await.expect("read object");
+        assert_eq!(&got[..], object.as_slice());
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_zero_remote_io_workers_uses_current_runtime() {
+        let service = ImageService::new(GlobalConfig::default())
+            .await
+            .expect("service");
+        assert!(service.inner.remote_io_runtime.is_none());
+        assert_eq!(
+            service.inner.remote_io_handle.id(),
+            tokio::runtime::Handle::current().id()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_service_in_async_context_shuts_down_remote_io() {
+        let config = GlobalConfig {
+            remote_io_workers: 2,
+            ..GlobalConfig::default()
+        };
+        let service = ImageService::new(config).await.expect("service");
+        let handle = service.inner.remote_io_handle.clone();
+        // Dropping the service inside an async context must not panic: the
+        // remote-io runtime is shut down in the background by
+        // `ImageServiceInner`'s `Drop`.
+        drop(service);
+        // After shutdown, tasks spawned via a stale handle never run and
+        // their join handles resolve to cancelled.
+        let err = handle
+            .spawn(async { 42 })
+            .await
+            .expect_err("spawn on a shut-down runtime must cancel");
+        assert!(err.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_open_source_blob_without_size_hint_dispatches_open() {
+        let tmp = TempDir::new().expect("tempdir");
+        let global_path = tmp.path().join("overlaybd.json");
+        let object = b"dispatched registryfs open".to_vec();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/ns/repo/blobs/sha256:abc", any(handle_counted_blob))
+            .with_state(CountedBlobState {
+                blob: Arc::new(object.clone()),
+                hits: hits.clone(),
+            });
+        let (endpoint, server_handle) = spawn_server(app).await;
+
+        write_json(
+            &global_path,
+            &serde_json::json!({
+                "registryFsVersion": "v2",
+                "ioEngine": 0,
+                "remoteIoWorkers": 2,
+                "cacheConfig": {
+                    "cacheType": "file",
+                    "cacheDir": tmp.path().join("cache"),
+                    "cacheSizeGB": 1,
+                    "refillSize": 262144,
+                    "blockSize": 65536
+                }
+            }),
+        );
+
+        let service = ImageService::from_config_path(&global_path)
+            .await
+            .expect("service");
+        let url = format!("{endpoint}/ns/repo/blobs/sha256:abc");
+        let file = service
+            .open_source_blob_with_size(&url, None)
+            .await
+            .expect("open source blob without size hint");
+        // Without a hint the open eagerly fetches the size — issued from
+        // inside the pinned remote-io runtime, not the caller's runtime.
+        // (A fresh registry origin may additionally probe for its auth
+        // challenge, so only a lower bound is asserted.)
+        let hits_after_open = hits.load(Ordering::Relaxed);
+        assert!(hits_after_open >= 1);
+
+        let size = file.size().await.expect("size");
+        assert_eq!(size, object.len() as u64);
+        // The size was fetched eagerly during open; asking for it again
+        // must not hit the server.
+        assert_eq!(hits.load(Ordering::Relaxed), hits_after_open);
+        let got = file.read_at(0, object.len()).await.expect("read");
         assert_eq!(&got[..], object.as_slice());
 
         server_handle.abort();

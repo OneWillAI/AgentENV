@@ -1,6 +1,10 @@
 use crate::backend::local::LocalFile;
-use crate::io::vfile_io::{read_exact, CtxRead, DirectRead, FileReader};
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+#[cfg(feature = "io-uring")]
+use crate::io::vfile_io::CtxRead;
+use crate::io::vfile_io::{read_exact, DirectRead, FileReader};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 use crate::metrics::{ZFileCodec, ZFileReadMetrics, ZFileReadStats, ZFileReadStatus};
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
@@ -855,6 +859,19 @@ impl ZFileRO {
         self.ht.opt
     }
 
+    /// Compressed extent `(offset, len)` of the zfile block covering
+    /// `logical_offset`. Read-only metadata query for publish-side planning;
+    /// does not read or decompress any payload.
+    pub fn compressed_block_extent(&self, logical_offset: u64) -> Result<(u64, u64)> {
+        let block_size = u64::from(self.options().block_size);
+        ensure!(block_size != 0, "zfile block size is zero");
+        let idx =
+            usize::try_from(logical_offset / block_size).context("zfile block index overflow")?;
+        let begin = self.jump_table.offset_at(idx)?;
+        let end = self.jump_table.offset_at(idx + 1)?;
+        Ok((begin, end.saturating_sub(begin)))
+    }
+
     pub fn set_crc_check_only(&mut self) {
         self.valid_mode = ValidMode::CrcOnly;
     }
@@ -867,6 +884,7 @@ impl ZFileRO {
     /// file go through `read_at_into_with_ctx`, allowing a ublk queue to drive
     /// the disk IO submission on its own io_uring thread. The decompression
     /// path is unchanged.
+    #[cfg(feature = "io-uring")]
     pub async fn pread_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1228,6 +1246,7 @@ impl VirtualFile for ZFileRO {
         Ok(self.original_size())
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1242,6 +1261,7 @@ impl VirtualFile for ZFileRO {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1317,8 +1337,8 @@ async fn load_jump_table(file: Arc<dyn VirtualFile>) -> Result<(HeaderTrailer, J
     );
 
     let mut ibuf = Vec::with_capacity(nindex);
-    for chunk in index_raw.chunks_exact(4) {
-        ibuf.push(u32::from_le_bytes(chunk.try_into().expect("u32 chunk")));
+    for chunk in index_raw.as_chunks::<4>().0 {
+        ibuf.push(u32::from_le_bytes(*chunk));
     }
 
     let mut jump_table = JumpTable::default();
@@ -2411,7 +2431,6 @@ pub async fn is_zfile(file: Arc<dyn VirtualFile>) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::backend::local::LocalFile;
-    use crate::test_utils::test_io_ring;
     use rand::{rngs::StdRng, Rng, RngExt, SeedableRng};
     use std::sync::Arc;
     use tempfile::NamedTempFile;
@@ -2439,11 +2458,7 @@ mod tests {
         let tmp = NamedTempFile::new().expect("create temp file");
         let path = tmp.path().to_path_buf();
         drop(tmp);
-        Arc::new(
-            LocalFile::new(path, test_io_ring())
-                .await
-                .expect("create local vfile"),
-        )
+        Arc::new(LocalFile::new(path).expect("create local vfile"))
     }
 
     fn sample_data(size: usize) -> Vec<u8> {
@@ -2740,11 +2755,7 @@ mod tests {
         let tmp = NamedTempFile::new().expect("create temp file");
         let path = tmp.path().to_path_buf();
         drop(tmp);
-        let local = Arc::new(
-            LocalFile::new(&path, test_io_ring())
-                .await
-                .expect("create local file"),
-        );
+        let local = Arc::new(LocalFile::new(&path).expect("create local file"));
         let mut builder = ZFileBuilder::new(local.clone(), &args)
             .await
             .expect("create builder over local file");

@@ -13,8 +13,8 @@ use tracing::{debug, warn};
 
 use super::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pByteStream, P2pEndpoint, P2pError, P2pPublishRequest, P2pPublishSource, P2pResult,
-    P2pTransport,
+    P2pByteStream, P2pEndpoint, P2pError, P2pFetchOptions, P2pPublishRequest, P2pPublishSource,
+    P2pResult, P2pTransport,
 };
 
 #[derive(Clone, Default)]
@@ -26,6 +26,8 @@ pub(crate) struct MockTransport {
     pub(crate) fetch_bytes_count: Arc<AtomicUsize>,
     pub(crate) fetch_range_count: Arc<AtomicUsize>,
     pub(crate) publish_count: Arc<AtomicUsize>,
+    pub(crate) unpublish_count: Arc<AtomicUsize>,
+    pub(crate) unpublished_keys: Arc<RwLock<Vec<P2pArtifactKey>>>,
     pub(crate) lookup_delay: Option<Duration>,
     pub(crate) fetch_range_delay: Option<Duration>,
     pub(crate) fail_lookup: Arc<AtomicBool>,
@@ -55,10 +57,11 @@ impl P2pTransport for MockTransport {
         Ok(result)
     }
 
-    async fn fetch(
+    async fn fetch_with_options(
         &self,
         descriptor: &P2pArtifactDescriptor,
         destination: &Path,
+        _options: P2pFetchOptions,
     ) -> P2pResult<u64> {
         debug!(key = ?descriptor.key, dest = %destination.display(), "fetching");
         self.fetch_count.fetch_add(1, Ordering::Relaxed);
@@ -75,7 +78,11 @@ impl P2pTransport for MockTransport {
         Ok(bytes.len() as u64)
     }
 
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> P2pResult<Bytes> {
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        _options: P2pFetchOptions,
+    ) -> P2pResult<Bytes> {
         debug!(key = ?descriptor.key, "fetch bytes");
         self.fetch_bytes_count.fetch_add(1, Ordering::Relaxed);
         let blobs = self.blobs.read().await;
@@ -180,6 +187,8 @@ impl P2pTransport for MockTransport {
     }
 
     async fn unpublish(&self, key: &P2pArtifactKey) -> P2pResult<bool> {
+        self.unpublish_count.fetch_add(1, Ordering::Relaxed);
+        self.unpublished_keys.write().await.push(key.clone());
         let removed = self.descriptors.write().await.remove(key).is_some();
         self.blobs.write().await.remove(key);
         debug!(?key, removed, "unpublished");

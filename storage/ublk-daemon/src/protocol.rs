@@ -60,11 +60,49 @@ pub enum DaemonRequest {
     NotifySandboxReady {
         device_key: String,
     },
+    /// Arm a startup-pack first-touch recorder on an existing device and
+    /// start the recording window state machine. When the window ends the
+    /// daemon writes the recorded first-touch trace into `output`
+    /// (atomically, via a `.tmp` sibling) and reports the result through
+    /// `PackRecordingStatus`.
+    StartPackRecording {
+        dev_id: u32,
+        /// Trace output path (the `memory-startup.trace` intermediate).
+        output: PathBuf,
+        max_pages: u32,
+        min_window_ms: u64,
+        quiet_ms: u64,
+        max_window_ms: u64,
+    },
+    /// Poll the state of the pack recording running on `dev_id`.
+    PackRecordingStatus {
+        dev_id: u32,
+    },
+    /// Abort a pack recording (idempotent): detach the recorder, stop the
+    /// window task, and remove any partial pack output.
+    AbortPackRecording {
+        dev_id: u32,
+    },
+    /// Best-effort: prefetch a v3 startup manifest for the memory image
+    /// at `image_config`, binding the manifest's layers to the image's OSS
+    /// lowers inside the cache of the `ImageService` for `global_config`.
+    /// Registration is deduplicated by pack identity; the daemon reports
+    /// failures in its log and always answers `Ok`.
+    PrefetchStartupPack {
+        image_config: PathBuf,
+        global_config: PathBuf,
+        url: String,
+        pack_size: u64,
+        index_sha256: String,
+        mem_virtual_size: u64,
+        timeout_secs: u64,
+    },
     /// Acquire a warm overlaybd device from the pool.
     AcquireOverlaybd {
         image_config: PathBuf,
         global_config: PathBuf,
-        virtual_size: u64,
+        /// Expected capacity; omit to use the published image capacity.
+        virtual_size: Option<u64>,
         access_mode: AccessMode,
     },
     /// Release an overlaybd device back to the pool.
@@ -105,6 +143,22 @@ pub enum AccessMode {
     Shared,
 }
 
+/// State of a daemon-side startup pack recording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PackRecordingState {
+    Recording,
+    Done {
+        pages: u32,
+        bytes: u64,
+        remote_bytes: u64,
+        path: PathBuf,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
@@ -137,6 +191,9 @@ pub enum DaemonResponse {
         /// Guest ext4 used bytes probed from the device, when it looks like ext4.
         #[serde(default)]
         ext4_used_bytes: Option<u64>,
+    },
+    PackRecording {
+        state: PackRecordingState,
     },
     Ok,
     TerminalError {
@@ -374,7 +431,7 @@ mod tests {
         let req = DaemonRequest::AcquireOverlaybd {
             image_config: PathBuf::from("/img.json"),
             global_config: PathBuf::from("/global.json"),
-            virtual_size: 1024 * 1024 * 1024,
+            virtual_size: Some(1024 * 1024 * 1024),
             access_mode: AccessMode::Exclusive,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -385,7 +442,7 @@ mod tests {
                 access_mode,
                 ..
             } => {
-                assert_eq!(virtual_size, 1024 * 1024 * 1024);
+                assert_eq!(virtual_size, Some(1024 * 1024 * 1024));
                 assert_eq!(access_mode, AccessMode::Exclusive);
             }
             _ => panic!("unexpected variant"),

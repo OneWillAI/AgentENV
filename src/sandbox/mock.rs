@@ -51,6 +51,9 @@ pub enum MockOperation {
     Pause,
     Resume,
     Snapshot,
+    CaptureToDir,
+    SnapshotVolumes,
+    ThawVolumes,
     Fork,
     ForkChild,
     BranchDisk,
@@ -67,11 +70,16 @@ pub enum MockAction {
     FailAfter { delay: Duration, message: String },
 }
 
+pub type MetricsSampler = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<super::SandboxMetric>> + Send + Sync,
+>;
+
 #[derive(Default)]
 pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
+    metrics_sampler: Mutex<Option<MetricsSampler>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     checkpoint_capacity: Mutex<Option<super::checkpoint_capacity::CheckpointCapacity>>,
     stop_calls: AtomicUsize,
@@ -84,6 +92,10 @@ impl MockBehavior {
         capacity: super::checkpoint_capacity::CheckpointCapacity,
     ) {
         *self.checkpoint_capacity.lock().unwrap() = Some(capacity);
+    }
+
+    pub fn set_metrics_sampler(&self, sampler: MetricsSampler) {
+        *self.metrics_sampler.lock().unwrap() = Some(sampler);
     }
 
     pub fn new() -> Self {
@@ -254,6 +266,7 @@ impl MockBehavior {
 pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
+    volumes_frozen: bool,
 }
 
 impl MockSandboxBackend {
@@ -265,7 +278,11 @@ impl MockSandboxBackend {
         behavior: Arc<MockBehavior>,
         host_ip: Option<std::net::Ipv4Addr>,
     ) -> Self {
-        Self { behavior, host_ip }
+        Self {
+            behavior,
+            host_ip,
+            volumes_frozen: false,
+        }
     }
 }
 
@@ -281,6 +298,13 @@ impl SandboxBackend for MockSandboxBackend {
         Ok(self.behavior.checkpoint_capacity.lock().unwrap().clone())
     }
 
+    fn metrics_sample(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<super::SandboxMetric>>> {
+        let sampler = self.behavior.metrics_sampler.lock().unwrap().clone();
+        sampler.map(|sample| sample())
+    }
+
     async fn start(&mut self) -> Result<()> {
         self.behavior.apply_async(MockOperation::Start).await
     }
@@ -291,6 +315,17 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn wait_for_ready(&self) -> Result<()> {
         self.behavior.apply_async(MockOperation::WaitForReady).await
+    }
+
+    async fn pause_for_cold_boot(
+        &mut self,
+        artifact_root: &Path,
+        _tools_version: &str,
+        _resources: crate::types::SandboxResources,
+    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        // The mock exercises lifecycle ordering; disk/RAM format behavior is
+        // covered by the real Firecracker backend's tests.
+        self.pause(Some(artifact_root)).await
     }
 
     async fn pause(
@@ -323,7 +358,32 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
-        Ok(CapturedSandboxSnapshot::new(MockCapturedSnapshot))
+        Ok(CapturedSandboxSnapshot::new(
+            crate::sandbox::manifest::SandboxSnapshotManifest::for_test(4096, &[]),
+            MockCapturedSnapshot,
+        ))
+    }
+
+    async fn capture_to_dir(
+        &mut self,
+        _at: &std::path::Path,
+    ) -> SandboxCaptureResult<(
+        crate::sandbox::SandboxSnapshotManifest,
+        Option<Box<dyn std::any::Any + Send>>,
+    )> {
+        self.behavior
+            .apply_capture_result(MockOperation::CaptureToDir)
+            .await?;
+        Ok((
+            crate::sandbox::SandboxSnapshotManifest::for_test(4096, &[]),
+            None,
+        ))
+    }
+
+    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        self.behavior
+            .apply_capture_result(MockOperation::SnapshotVolumes)
+            .await
     }
 
     async fn fork(
@@ -349,7 +409,28 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        self.behavior.apply_async(MockOperation::Stop).await
+        self.behavior.apply_async(MockOperation::Stop).await?;
+        self.volumes_frozen = false;
+        Ok(())
+    }
+
+    async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        assert!(!self.volumes_frozen, "volumes already frozen");
+        let result = self.snapshot_volumes().await;
+        self.volumes_frozen = result
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.is_terminal());
+        result
+    }
+
+    async fn thaw_volumes(&mut self) -> Result<()> {
+        anyhow::ensure!(self.volumes_frozen, "volumes are not frozen");
+        self.behavior
+            .apply_async(MockOperation::ThawVolumes)
+            .await?;
+        self.volumes_frozen = false;
+        Ok(())
     }
 
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {

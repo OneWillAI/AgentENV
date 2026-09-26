@@ -46,8 +46,8 @@ Firecracker VM binary and boot configuration.
 | `socket_timeout_secs` | integer | `3` | Max seconds to wait for the Firecracker API socket |
 | `socket_poll_ms` | integer | `1` | Poll interval (ms) for checking socket availability |
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
-| `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker serial output (per-sandbox subdirectories) |
-| `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). When set to a non-empty value, Firecracker's own logging is enabled and written to a `firecracker.log` file in each sandbox's log directory (alongside the serial output). Empty/unset disables it |
+| `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
+| `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
 
 ## `[kernel]`
 
@@ -63,6 +63,7 @@ Linux kernel image for microVMs.
 ## `[tools]`
 
 Tools drive image used to boot the AgentENV control plane inside each microVM.
+The default release is selected automatically; most deployments can leave this section unchanged.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -71,11 +72,22 @@ Tools drive image used to boot the AgentENV control plane inside each microVM.
 | `drive_path` | string | unset | Local tools ext4 source imported into the versioned dependency directory; requires an explicit `version` |
 | `control_plane_port` | integer | `49983` | Port used by envd inside the guest |
 
-Snapshots and paused sandboxes keep using the tools drive version they were
-created with. Launch does not download missing releases: operators must install
-the recorded version under `<deps_path>/tools/<version>/tools.ext4` before
-restore. Setup retains previously installed versions until they are removed
-manually.
+Snapshots and paused sandboxes record only `tools_drive_version`. Launch and
+restore fetch that version from the configured URL template when it is missing
+locally. Releases must be immutable and retained for the lifetime of their
+snapshots; changing the default version affects new sandboxes and templates.
+
+OCI tools rootfs images carry `io.agentenv.tools-drive.format=oci-rootfs-v1`
+(the tools Dockerfile adds it automatically). They are downloaded and converted
+locally with a stable, pinned conversion contract. Converted layers live in the
+versioned dependency directory, independently of image-cache eviction. Explicit
+`--setup-only` prepares the default release for dependency bundles.
+
+Native OverlayBD images keep lazy reads and automatically download tools layers
+in the background after envd is ready, independently of memory and user disks.
+Legacy images without the format label provide `tools.ext4`, which is downloaded
+and mounted read-only. Tools are not uploaded into snapshot storage. A local
+`drive_path` only identifies its declared version.
 
 ## Template Rootfs Images
 
@@ -264,11 +276,18 @@ Sandbox control communication settings.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `access_token_hash_seed` | string | auto-generated | Optional override for the secret used to derive secure sandbox envd access tokens. When unset, normal server startup creates and reuses `$AENV_HOME/secrets/sandbox-access-token-hash-seed`. Configure an explicit shared value when the deployment needs to recover the same sandbox ID on another node. |
+| `access_token_hash_seed` | string | auto-generated | Optional override for the secret used to derive sandbox envd and traffic access tokens. When unset, normal server startup creates and reuses `$AENV_HOME/secrets/sandbox-access-token-hash-seed`. Configure an explicit shared value for clustered deployments. |
 
-The managed seed is node-local persistent state and must be included in backups of `$AENV_HOME`. AgentENV refuses to generate a replacement when persisted secure sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates access tokens for existing secure sandboxes.
+The managed seed is node-local persistent state and must be included in backups of `$AENV_HOME`. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.
 
-Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every node when cross-node recovery of the same sandbox is required. Nodes use their own managed seed when it is unset.
+Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.
+
+## `[volume]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_size_mb` | integer | `262144` | Maximum persistent volume size in MiB (256 GiB). |
+| `max_volume_count` | integer | `4` | Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit. |
 
 ## `[orchestrator]`
 
@@ -277,6 +296,8 @@ Sandbox lifecycle management.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `auto_evict_interval_ms` | integer | `1000` | Poll interval (ms) for background timeout eviction |
+| `metrics_interval_secs` | integer | `15` | Guest metrics scan interval; 0 disables collection |
+| `metrics_retention_secs` | integer | `3600` | Node-local in-memory guest sample retention (seconds) |
 | `default_sandbox_timeout_secs` | integer | `15` | Default keep-alive timeout for sandboxes |
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
 | `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
@@ -296,7 +317,7 @@ Component sections:
 |---------|-----|------|---------|-------------|
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
-| `[pool.block]` | `startup_prewarm` | boolean | `true` | Prewarm block devices after the first reusable image shape is known |
+| `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
 | `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
@@ -374,7 +395,7 @@ snapshot publication/runtime resolution as an optional acceleration path.
 
 ## `[custom_extension]`
 
-Custom extension service configuration. When `url` is unset, the integration is fully disabled. See [Custom Extension](../concepts/custom-extension.md).
+Custom extension service configuration. When `url` is unset, the integration is fully disabled. See [Custom Extension](../concepts/custom-extension/index.md).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -403,6 +424,28 @@ Source-registry image publication. Only takes effect when `snapshot.repository_b
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | When enabled, publishing a snapshot also pushes its rootfs as an OverlayBD-native OCI image tag `agentenv-snapshot-{snapshot_id}` to the original source registry. Requires source images to be OverlayBD-native in that registry and push credentials in the Docker config (`~/.docker/config.json`). Existing remote layers are referenced by digest; only new delta layers are uploaded. The published reference is exposed as `imageRef` in snapshot APIs. Memory and VM-state artifacts always remain in the snapshot repository. |
 
+## `[snapshot.publish_compression]`
+
+Publish-time compression for snapshot layers uploaded to OSS/ACR. Local layers
+always stay raw, so local resume pays no decompression cost; enabled by default,
+memory layers and incremental read-write layers are compressed once as they
+are uploaded, cutting network bytes for cross-node resume. This is the only
+compression switch; the legacy capture-time knobs under `[memory_snapshot]`
+and `[template_build]` were removed from the configuration schema.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `true` | Compress memory layers and incremental read-write layers when uploading them to OSS/ACR. |
+| `algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. |
+| `workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |
+
+Known impact: compressed layers are recorded without a layer uuid (ZFile
+layers carry no LSMT uuid), so P2P uuid-keyed acceleration does not apply to
+them. Snapshot P2P publication also skips digest-keyed advertisements for
+local raw layers whose digest is absent from the committed record — the
+record names the compressed bytes, so the raw digest key would never be
+looked up by consumers.
+
 ## `[backend.posix_fs]`
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.
@@ -430,6 +473,7 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 | `access_key_secret` | string | unset | Static OSS access key secret. Required when `credential_process` is not set |
 | `security_token` | string | unset | Optional session token paired with static access key credentials |
 | `region` | string | none | Region passed to the S3-compatible object-store client; required for current OSS backend |
+| `addressing_style` | string | auto-detect | Bucket addressing style, `"virtual"` or `"path"`. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set either value when a provider's required or preferred style differs from the detected default |
 | `cache_max_size_gb` | integer | `10` | Maximum size of the node-local OSS artifact cache in GiB |
 
 Notes:
@@ -438,6 +482,18 @@ Notes:
 - `google_service_account = true` preserves the configured S3-compatible endpoint and `s3://` layer references; only transport authentication changes to OAuth.
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
+- Leave `addressing_style` unset when endpoint-based detection is correct. Set it to `"virtual"` or `"path"` when the provider's required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.
+- The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (`ossConfig.defaultAddressingStyle`), which the runtime uses when reading remote managed snapshot layers during sandbox restore.
+
+For an S3-compatible provider where virtual-host addressing is required or preferred — for example [Tigris](https://www.tigrisdata.com/docs/) — set `addressing_style` explicitly:
+
+```toml
+[backend.oss]
+endpoint = "https://t3.storage.dev"
+bucket = "agentenv-snapshots"
+region = "auto"
+addressing_style = "virtual"
+```
 
 Other path override:
 
@@ -512,9 +568,7 @@ the default path on every startup.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
-| `track_dirty_pages` | bool | `false` | Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true` to enable it. |
-| `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
-| `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
+| `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
 
 ## `[memory_snapshot.background_download]`
 
@@ -554,3 +608,20 @@ and are then re-fetched on demand.
 | `block_size` | integer | `16777216` | Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is `block_size × concurrency`. |
 | `concurrency` | integer | `4` | Maximum number of in-flight block remote reads within a single remote layer. `1` keeps the historical serial behavior. Must be greater than zero. |
 | `max_inflight_blocks` | integer | `16` | Cap on concurrently downloading chunks enforced by each file-cache backend's download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to `max_inflight_blocks` × the download chunk size (`block_size`). The value is fixed when the backend is created from the global config; a per-image `download` override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as `max_inflight_blocks_override_ignored`). Must be greater than zero. |
+
+## `[template_build]`
+
+Managed Dockerfile builder resources. The first Dockerfile
+build on a node prepares a reusable internal builder template. Each build mounts
+a separate clone of the repository's shared cache seed; concurrent builds do not
+queue for cache ownership. The last successfully published cache becomes the next
+seed, with best-effort reuse of concurrent branches.
+Builder resources do not change the resulting template's CPU or memory.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_concurrent_builds` | integer | `4` | Per-node limit for managed builds, including preparation, publication, and cleanup. Must be greater than zero. Excess builder PUT requests return HTTP 429 and leave the build waiting for retry. |
+| `builder_image` | string | `"docker.io/moby/buildkit:v0.33.0"` | Image containing the managed BuildKit daemon, client, and OCI runtime. |
+| `builder_cpu_count` | integer | `16` | Builder vCPUs, from 1 to 255. |
+| `builder_memory_mb` | integer | `32768` | Builder memory in MiB, from 256 to 2147483647. |
+| `cache_size_mb` | integer | `65536` | Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most `volume.max_size_mb`; changing it does not resize existing caches. |

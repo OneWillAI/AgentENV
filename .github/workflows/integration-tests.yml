@@ -34,8 +34,7 @@ permissions:
 
 jobs:
   agentenv-tests:
-    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
@@ -52,20 +51,14 @@ jobs:
 
   e2e-tests:
     name: e2e-tests (${{ matrix.e2e_name }})
-    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - e2e_name: single-node
-            make_target: test-e2e
-          - e2e_name: docker-compose
-            make_target: test-e2e-compose
+        e2e_name: [single-node, docker-compose]
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
-        if: ${{ matrix.e2e_name == 'single-node' }}
         with:
           ci_deps_target: ci-deps
       - uses: ./.github/actions/sandbox-ci-setup
@@ -121,12 +114,24 @@ jobs:
           python-version: "3.12"
       - name: Install e2b Python SDK
         run: python3 -m pip install --upgrade e2b e2b-code-interpreter
-      - name: E2E tests (${{ matrix.e2e_name }})
+      - name: Prepare BuildKit test client
         run: |
-          if [[ "${{ matrix.e2e_name }}" == "single-node" ]]; then
-            sg kvm -c "make ${{ matrix.make_target }} PROFILE=debug"
-          else
-            SKIP_BUILD=1 make ${{ matrix.make_target }} PROFILE=debug
-          fi
+          make build-aenv
+          bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
+      - name: Single-node E2E tests
+        if: ${{ matrix.e2e_name == 'single-node' }}
+        env:
+          BUILDCTL_BIN: ${{ runner.temp }}/buildkit/buildctl
+          CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml
+          AENV_HOME_PATH: ${{ runner.temp }}/aenv-e2e/home
+          AENV_RUNTIME_PATH: ${{ runner.temp }}/aenv-e2e/run
+        run: sg kvm -c "make test-e2e PROFILE=debug"
+      - name: Docker Compose E2E tests
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        env:
+          BUILDCTL_BIN: ${{ runner.temp }}/buildkit/buildctl
+          CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml
+          SKIP_BUILD: "1"
+        run: make test-e2e-compose PROFILE=debug
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()

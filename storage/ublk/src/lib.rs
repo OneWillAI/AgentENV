@@ -20,6 +20,9 @@ pub use ctrl::{
     load_ublk_module, ublk_available, ublk_module_loaded, UVMUblkCtrl, UVMUblkCtrlBuilder,
 };
 pub use dev::{UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget};
+pub use impls::startup_pack_recorder::{
+    tmp_pack_path, FinalizeOutcome, RecordingVerdict, StartupPackReadGuard, StartupPackRecorder,
+};
 pub use impls::{OverlaybdTarget, OverlaybdTargetConfig};
 pub use io_buffer::{AutoRegBuffer, IOBuffer, IOBufferView, UserBuffer};
 use queue::UBLK_QUEUE_URING;

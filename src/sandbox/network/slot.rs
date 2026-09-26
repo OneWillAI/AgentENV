@@ -3,7 +3,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -23,6 +22,7 @@ use rtnetlink::packet_core::{
 use rtnetlink::{new_connection, Handle};
 use tracing::{debug, info, warn};
 
+use super::egress_proxy::EgressProxy;
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::policy::{
     initialize_namespace_egress_chain, set_namespace_egress_policy, SandboxNetworkPolicy,
@@ -98,8 +98,11 @@ pub(crate) struct Slot {
     pub veth_vm_ip: Ipv4Addr,   // The IP on the VM/NS side interface (vpeer)
     address_plan: NetworkAddressPlan,
     netns_dir: PathBuf,
-    cleanup_armed: AtomicBool,
     arp_refresh_cancellation: Arc<ArpRefreshCancellation>,
+    egress_proxy: Arc<EgressProxy>,
+    cleanup_armed: bool,
+    /// Whether the warm namespace retains user egress rules from its tenant.
+    user_egress_rules_present: bool,
 }
 
 struct NamespaceSetup {
@@ -121,6 +124,7 @@ impl Slot {
         idx: u32,
         address_plan: NetworkAddressPlan,
         netns_dir: PathBuf,
+        egress_proxy: Arc<EgressProxy>,
     ) -> Result<Self, NetworkError> {
         // Validation for zero and overflow.
         if idx == 0 || idx >= (MAX_SLOTS as u32) {
@@ -143,8 +147,10 @@ impl Slot {
             veth_vm_ip,
             address_plan,
             netns_dir,
-            cleanup_armed: AtomicBool::new(false),
             arp_refresh_cancellation: Arc::new(ArpRefreshCancellation::default()),
+            egress_proxy,
+            cleanup_armed: false,
+            user_egress_rules_present: false,
         })
     }
 
@@ -159,10 +165,10 @@ impl Slot {
             host_interaction_ip = %self.host_interaction_ip
         )
     )]
-    pub(super) fn create_network(&self) -> Result<(), NetworkError> {
+    pub(super) fn create_network(&mut self) -> Result<(), NetworkError> {
         // Arm drop cleanup as soon as we begin touching kernel networking state.
         // If setup fails midway, Drop can still perform best-effort cleanup.
-        self.cleanup_armed.store(true, Ordering::Release);
+        self.cleanup_armed = true;
 
         // Capture individual fields rather than cloning `self`. Slot is not Clone
         // intentionally — a clone would carry Drop semantics and tear down the live
@@ -299,7 +305,7 @@ impl Slot {
         // IPTables Setup
         Self::configure_namespace_iptables_rules(
             host_interaction_ip,
-            veth_host_ip,
+            veth_vm_ip,
             address_plan.vm_ip(),
             &address_plan.internal_egress_denied_cidrs(),
         )
@@ -489,8 +495,37 @@ impl Slot {
         self.netns_dir.join(&self.namespace_id)
     }
 
-    pub(crate) fn set_egress_policy(&self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+    pub(crate) fn set_egress_policy(
+        &mut self,
+        policy: Option<&SandboxNetworkPolicy>,
+    ) -> Result<()> {
+        // Policy updates run through the owning FirecrackerSandbox's mutable
+        // operation lock; cleanup owns this Slot exclusively. Avoid holding a
+        // second lock across namespace I/O, iptables, or proxy joins.
+        let wants_rules = policy.is_some_and(SandboxNetworkPolicy::has_runtime_egress_rules);
+        if !wants_rules && !self.user_egress_rules_present {
+            return Ok(());
+        }
+
+        let requires_egress_proxy = policy.is_some_and(SandboxNetworkPolicy::requires_egress_proxy);
+        let had_active_proxy_policy = self.egress_proxy.has_active(self.host_interaction_ip);
+        if requires_egress_proxy {
+            self.egress_proxy
+                .ensure_listener(self.host_interaction_ip, &self.namespace_path())?;
+            self.egress_proxy.prepare(
+                self.host_interaction_ip,
+                policy.expect("proxy policy must be present when interception is requested"),
+            );
+            // There was no old proxy policy to preserve. Activating before the
+            // redirect is installed keeps the old default-allow behavior while
+            // the namespace rules are being committed.
+            if !had_active_proxy_policy {
+                self.egress_proxy.activate(self.host_interaction_ip);
+            }
+        }
+
         let netns_path = self.namespace_path();
+        let egress_proxy_port = self.egress_proxy.port();
         let policy = policy.cloned();
         let handle = thread::spawn(move || -> Result<()> {
             let netns = File::open(&netns_path).with_context(|| {
@@ -498,13 +533,28 @@ impl Slot {
             })?;
             nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
                 .context("failed to enter sandbox network namespace")?;
-            set_namespace_egress_policy(policy.as_ref())
+            set_namespace_egress_policy(policy.as_ref(), egress_proxy_port)
         });
 
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             Err(e) => Err(anyhow!("egress policy setup thread panicked: {:?}", e)),
+        };
+        if result.is_ok() {
+            self.user_egress_rules_present = wants_rules;
+            if requires_egress_proxy && had_active_proxy_policy {
+                self.egress_proxy.activate(self.host_interaction_ip);
+            } else if !requires_egress_proxy {
+                self.egress_proxy.deactivate(self.host_interaction_ip);
+            }
+        } else if requires_egress_proxy {
+            if had_active_proxy_policy {
+                self.egress_proxy.discard_pending(self.host_interaction_ip);
+            } else {
+                self.egress_proxy.teardown(self.host_interaction_ip);
+            }
         }
+        result
     }
 
     /// Configures iptables rules inside the namespace for VM traffic routing.
@@ -512,10 +562,10 @@ impl Slot {
     /// - Enabling IP forwarding so the namespace can route between tap0 and vpeer.
     /// - FORWARD rules to permit traffic between the VM (tap0) and the host veth (vpeer).
     /// - SNAT/DNAT for host<->VM communication via host_interaction_ip.
-    #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip, veth_host_ip = %veth_host_ip))]
+    #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip))]
     fn configure_namespace_iptables_rules(
         host_interaction_ip: Ipv4Addr,
-        veth_host_ip: Ipv4Addr,
+        veth_vm_ip: Ipv4Addr,
         vm_ip: Ipv4Addr,
         internal_egress_denied_cidrs: &[String],
     ) -> Result<()> {
@@ -540,6 +590,14 @@ impl Slot {
                 chain: "POSTROUTING",
                 rule: format!("-o vpeer -s {} -j SNAT --to {}", vm_ip, host_interaction_ip),
             },
+            // Namespace-local egress proxy connections originate from vpeer's
+            // address rather than the guest address above. Give them the same
+            // routable slot identity so host FORWARD/MASQUERADE rules apply.
+            IptablesRestoreCommand::Append {
+                table: "nat",
+                chain: "POSTROUTING",
+                rule: format!("-o vpeer -s {veth_vm_ip} -j SNAT --to {host_interaction_ip}"),
+            },
             // DNAT: Rewrite destination IP from the host interaction IP to the VM.
             // This allows the host to reach the VM using the unique HostIP.
             IptablesRestoreCommand::Append {
@@ -550,11 +608,7 @@ impl Slot {
         ];
 
         apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)?;
-        initialize_namespace_egress_chain(
-            veth_host_ip,
-            resolve_guest_dns_server(),
-            internal_egress_denied_cidrs,
-        )
+        initialize_namespace_egress_chain(resolve_guest_dns_server(), internal_egress_denied_cidrs)
     }
 
     /// Announce the TAP identity once before the first envd health probe.
@@ -855,14 +909,20 @@ impl Slot {
             force_sync
         )
     )]
-    pub(super) fn cleanup(&self, force_sync: bool) -> Result<(), NetworkError> {
+    pub(super) fn cleanup(&mut self, force_sync: bool) -> Result<(), NetworkError> {
         self.arp_refresh_cancellation.cancel();
 
         // Skip cleanup for slots that never attempted network setup.
         // This avoids touching host networking state for logical-only Slot values.
-        if !self.cleanup_armed.swap(false, Ordering::AcqRel) {
+        if !self.cleanup_armed {
             return Ok(());
         }
+        self.cleanup_armed = false;
+
+        // A namespace-local listener pins the namespace. Stop proxy acceptance
+        // before removing the veth and unmounting the namespace, including
+        // panic/drop cleanup paths that bypass the normal release path.
+        self.egress_proxy.teardown(self.host_interaction_ip);
 
         // 1. Delete Host Veth Interface (this destroys the pair)
         let delete_result = if force_sync {
@@ -871,7 +931,7 @@ impl Slot {
             Self::delete_host_veth_interface(self.idx)
         };
         if let Err(e) = delete_result {
-            self.cleanup_armed.store(true, Ordering::Release);
+            self.cleanup_armed = true;
             return Err(NetworkError::NamespaceError(e));
         }
 
@@ -885,7 +945,7 @@ impl Slot {
                     Err(nix::errno::Errno::EINVAL) => break, // Not mounted anymore
                     Err(nix::errno::Errno::ENOENT) => break, // File removed by another process
                     Err(e) => {
-                        self.cleanup_armed.store(true, Ordering::Release);
+                        self.cleanup_armed = true;
                         return Err(NetworkError::NamespaceError(anyhow!(
                             "Failed to unmount netns: {}",
                             e
@@ -899,7 +959,7 @@ impl Slot {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    self.cleanup_armed.store(true, Ordering::Release);
+                    self.cleanup_armed = true;
                     return Err(NetworkError::IoError(e));
                 }
             }
@@ -1155,6 +1215,7 @@ mod tests {
             idx,
             address_plan,
             std::env::temp_dir().join("aenv-network-tests/netns"),
+            EgressProxy::new(),
         )
     }
 
@@ -1308,13 +1369,48 @@ mod tests {
     }
 
     #[test]
+    fn empty_egress_policy_skips_known_clean_slot() {
+        let mut slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        let empty_policy = SandboxNetworkPolicy::default();
+
+        slot.set_egress_policy(None).unwrap();
+        slot.set_egress_policy(Some(&empty_policy)).unwrap();
+
+        assert!(!slot.user_egress_rules_present);
+    }
+
+    #[test]
+    fn failed_egress_cleanup_keeps_slot_marked_dirty() {
+        let mut slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        slot.user_egress_rules_present = true;
+
+        assert!(slot.set_egress_policy(None).is_err());
+
+        assert!(slot.user_egress_rules_present);
+    }
+
+    #[test]
+    fn failed_egress_apply_keeps_clean_slot_marked_clean() {
+        let mut slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        let policy = SandboxNetworkPolicy::new(
+            true,
+            crate::sandbox::network::BaseSandboxNetworkPolicy::Deny,
+            crate::sandbox::network::SandboxNetworkEgressPolicy::default(),
+        );
+
+        assert!(slot.set_egress_policy(Some(&policy)).is_err());
+
+        assert!(!slot.user_egress_rules_present);
+    }
+
+    #[test]
     #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and affects system configuration"]
     fn test_network_lifecycle() {
         crate::logging::init_for_tests();
 
         // Use a free high slot ID to avoid collisions with dev/prod and stale
         // devices from interrupted test runs.
-        let slot = unused_test_slot();
+        let mut slot = unused_test_slot();
 
         // 1. Create Network
         // This requires CAP_NET_ADMIN and CAP_SYS_ADMIN.

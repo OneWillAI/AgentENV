@@ -487,6 +487,7 @@ pub(super) struct PremergedIndexPruneState {
 struct PremergedIndexScanAccount {
     bytes_since_scan: u64,
     scan_in_progress: bool,
+    initial_scan_done: bool,
 }
 
 pub(super) async fn premerged_index_prune_state(cache_dir: &Path) -> Arc<PremergedIndexPruneState> {
@@ -502,6 +503,7 @@ pub(super) async fn premerged_index_prune_state(cache_dir: &Path) -> Arc<Premerg
                 account: StdMutex::new(PremergedIndexScanAccount {
                     bytes_since_scan: 0,
                     scan_in_progress: false,
+                    initial_scan_done: false,
                 }),
             })
         })
@@ -510,16 +512,22 @@ pub(super) async fn premerged_index_prune_state(cache_dir: &Path) -> Arc<Premerg
 
 impl PremergedIndexPruneState {
     /// Charge `written_bytes` and elect the single caller that runs the next scan.
+    /// The first charge on a fresh state always elects one seed scan, so a
+    /// cache dir already over budget at process start gets validated.
     pub(super) fn elect_scan(&self, written_bytes: u64, max_dir_bytes: u64) -> bool {
         let threshold = (max_dir_bytes / PREMERGED_INDEX_PRUNE_SCAN_FRACTION).max(1);
         let mut account = self.account.lock().unwrap_or_else(|err| err.into_inner());
         account.bytes_since_scan = account.bytes_since_scan.saturating_add(written_bytes);
-        if account.bytes_since_scan >= threshold && !account.scan_in_progress {
+        if account.scan_in_progress {
+            return false;
+        }
+        let elected = !account.initial_scan_done || account.bytes_since_scan >= threshold;
+        if elected {
+            account.initial_scan_done = true;
             account.bytes_since_scan = 0;
             account.scan_in_progress = true;
-            return true;
         }
-        false
+        elected
     }
 
     /// End the scan; returns true when growth charged while it ran crosses
@@ -815,6 +823,7 @@ pub(crate) fn initialize_file_rw_paths(
     virtual_size: u64,
     rw_layout: RwLayout,
 ) -> Result<()> {
+    let rw_layout = rw_layout.ensure_supported()?;
     let uuid = Uuid::new_v4();
     let header = rw_header(virtual_size, rw_layout, uuid, None, None);
     let data_file = open_truncated_rw_file(data_path)?;
@@ -854,6 +863,35 @@ pub(crate) fn initialize_file_rw_paths(
 ///   the logic offset in the SegmentMapping. For example, if start_offset is 4K, then the
 ///   logic offset in the returned SegmentMapping will minus 4K from physical offset from the
 ///   file.
+///
+/// # The caller decides what "this range is data" is allowed to mean
+///
+/// The extent map is accurate about what it actually claims: which ranges are
+/// *allocated*. The trap is that allocated is not the same as written. APFS
+/// speculatively allocates around scattered writes — a gap smaller than roughly
+/// 16-20 MiB between two written blocks gets allocated whole, see
+/// [`crate::sys::sparse_extents_are_reliable`] — so a range can be reported as
+/// data without anyone ever having written it.
+///
+/// This function therefore reports allocation and leaves the interpretation to
+/// the caller, because the two callers need different things from it:
+///
+/// - Recovering a Sparse upper's index (`LSMTFile::open`) needs **written**, and
+///   reading allocation as written is **catastrophic**: a speculatively
+///   allocated block gets claimed as owned by the upper, the upper holds a hole
+///   there, so the read returns zeros and masks every lower layer. That caller
+///   gates on [`crate::sys::sparse_extents_are_reliable`].
+/// - Packaging a raw image into a sealed layer
+///   ([`crate::tools::package_raw_as_overlaybd`]) only needs **allocated**, and
+///   is happy to copy more than necessary: every reported range is read out of
+///   the source, where an unwritten block reads as zeros, then written to the
+///   output and indexed as ordinary data. The result is byte-for-byte correct
+///   and merely larger. That caller deliberately does not gate — refusing would
+///   leave a fully dense copy as the only option.
+///
+/// The reverse error — written data reported as a hole — would be silent data
+/// loss for both callers, but that would be a filesystem bug rather than a
+/// documented allocation heuristic.
 pub async fn create_mappings_from_sparse(
     file: &Arc<dyn VirtualFile>,
     start_offset: u64,
@@ -889,6 +927,20 @@ pub async fn create_mappings_from_sparse(
             cursor = end.max(start_offset);
             continue;
         }
+
+        // The block arithmetic below truncates, and `end` is clamped to the file
+        // size, so an extent boundary that is not a multiple of ALIGNMENT would
+        // silently drop the trailing partial block: it would read back as zeros
+        // with no error raised anywhere. Both platforms report extent boundaries
+        // at filesystem-block granularity, so in practice this only fires on a
+        // source whose *size* is not a multiple of ALIGNMENT — which is worth
+        // rejecting loudly rather than truncating.
+        ensure!(
+            begin.is_multiple_of(ALIGNMENT) && end.is_multiple_of(ALIGNMENT),
+            "unaligned data extent [{begin}, {end}) reported for a file scanned by \
+             create_mappings_from_sparse: extent boundaries must be multiples of \
+             {ALIGNMENT} bytes"
+        );
 
         let mut logical = (begin - start_offset) / ALIGNMENT;
         let mut physical = begin / ALIGNMENT;
@@ -977,7 +1029,7 @@ async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<Read
     })
 }
 
-pub(super) async fn load_readonly_layers_metadata(
+pub(crate) async fn load_readonly_layers_metadata(
     files: &[Arc<dyn VirtualFile>],
 ) -> Result<Vec<ReadOnlyLayerMetadata>> {
     let s = stream::iter(files.iter().cloned().enumerate())

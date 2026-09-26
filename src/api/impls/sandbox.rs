@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
@@ -8,26 +8,30 @@ use headers::Host;
 use http::Method;
 
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxIdempotency, CreateSandboxRequest, NewTimeout, OrchestratorError,
-    SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    SandboxForkChildSpec, SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState,
+    SandboxTimeoutAction,
 };
-use crate::sandbox::CustomExtensionParams;
+use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::volume::{VolumeManager, VolumeMode};
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
+use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -102,6 +106,231 @@ fn end_at(expires_at: Option<SystemTime>) -> chrono::DateTime<chrono::Utc> {
         ))
 }
 
+fn volume_mounts_model(mounts: &HashMap<String, String>) -> Vec<models::SandboxVolumeMount> {
+    mounts
+        .iter()
+        .map(|(path, name)| models::SandboxVolumeMount::new(name.clone(), path.clone()))
+        .collect()
+}
+
+fn volume_mounts_from_model(
+    mounts: Option<&[models::SandboxVolumeMount]>,
+) -> Result<Option<HashMap<String, String>>, models::Error> {
+    let Some(mounts) = mounts.filter(|mounts| !mounts.is_empty()) else {
+        return Ok(None);
+    };
+
+    let mut result = HashMap::with_capacity(mounts.len());
+    for mount in mounts {
+        if result
+            .insert(mount.path.clone(), mount.name.clone())
+            .is_some()
+        {
+            return Err(ApiImpl::error(
+                400,
+                format!("duplicate volume mount path: {}", mount.path),
+            ));
+        }
+    }
+    Ok(Some(result))
+}
+
+#[derive(Default)]
+struct PreparedVolumeMounts {
+    owner: Option<String>,
+    drives: Vec<ExtraDrive>,
+    mounts: HashMap<String, String>,
+    volume_ids: Vec<String>,
+}
+
+async fn prepare_volume_mounts(
+    api: &ApiImpl,
+    mounts: Option<&HashMap<String, String>>,
+) -> Result<PreparedVolumeMounts, models::Error> {
+    let Some(mounts) = mounts.filter(|mounts| !mounts.is_empty()) else {
+        return Ok(PreparedVolumeMounts::default());
+    };
+    let owner = format!("pending-{}", Uuid::now_v7().simple());
+    let (drives, mounts) = resolve_volume_mounts(&api.volume_manager, mounts, &owner).await?;
+    Ok(PreparedVolumeMounts {
+        owner: Some(owner),
+        drives,
+        volume_ids: mounts.values().cloned().collect(),
+        mounts,
+    })
+}
+
+async fn finish_volume_reservation(
+    manager: &VolumeManager,
+    owner: Option<&str>,
+    sandbox_id: Option<SandboxId>,
+    volume_ids: &[String],
+) -> Result<(), crate::volume::VolumeError> {
+    let Some(owner) = owner else { return Ok(()) };
+    let sandbox_id = sandbox_id.map(|id| id.to_string());
+    manager
+        .replace_owner_for(owner, sandbox_id.as_deref(), volume_ids)
+        .await
+}
+
+async fn cleanup_fork_volume_children(
+    manager: &VolumeManager,
+    children: &HashMap<SandboxId, Vec<String>>,
+) {
+    for (owner, volume_ids) in children {
+        let _ = manager
+            .replace_owner_for(&owner.to_string(), None, volume_ids)
+            .await;
+        for volume_id in volume_ids {
+            let _ = manager.delete(volume_id).await;
+        }
+    }
+}
+
+async fn cleanup_volume_ids(manager: &VolumeManager, volume_ids: &[String]) {
+    for volume_id in volume_ids {
+        let _ = manager.delete(volume_id).await;
+    }
+}
+
+async fn prepare_volume_fork_specs(
+    api: &ApiImpl,
+    source: &SandboxMetadata,
+    count: u32,
+) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), models::Error> {
+    let source_owner = source.id.to_string();
+    let mut source_volumes = HashMap::with_capacity(source.volume_mounts.len());
+    for reference in source.volume_mounts.values() {
+        let volume = api
+            .volume_manager
+            .get(reference)
+            .await
+            .map_err(|error| volume_error_response(error).1)?;
+        source_volumes.insert(reference, volume);
+    }
+
+    let mut children = HashMap::new();
+    let mut specs = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let child_id = SandboxId::new();
+        let owner = child_id.to_string();
+        children.entry(child_id).or_default();
+        let mut volume_mounts = HashMap::with_capacity(source.volume_mounts.len());
+        let mut child_mounts = HashMap::new();
+        let mut replace_drive_ids = Vec::new();
+
+        for (mount_path, reference) in &source.volume_mounts {
+            let volume = source_volumes
+                .get(reference)
+                .expect("source volume was resolved above");
+            if volume.mode == VolumeMode::Exclusive {
+                let child_name = format!("volume-fork-{}", Uuid::now_v7().simple());
+                let child = match api
+                    .volume_manager
+                    .create_child_for_owner(
+                        &volume.id,
+                        child_name,
+                        VolumeMode::Exclusive,
+                        volume.size_mb,
+                        &source_owner,
+                        &owner,
+                    )
+                    .await
+                {
+                    Ok(child) => child,
+                    Err(error) => {
+                        cleanup_fork_volume_children(&api.volume_manager, &children).await;
+                        return Err(volume_error_response(error).1);
+                    }
+                };
+                children.entry(child_id).or_default().push(child.id.clone());
+                child_mounts.insert(mount_path.clone(), child.id.clone());
+                replace_drive_ids.push((volume.id.clone(), child.id.clone()));
+                volume_mounts.insert(mount_path.clone(), child.id);
+            } else {
+                volume_mounts.insert(mount_path.clone(), volume.id.clone());
+                child_mounts.insert(mount_path.clone(), volume.id.clone());
+            }
+        }
+
+        let (extra_drives, _) =
+            match resolve_volume_mounts(&api.volume_manager, &child_mounts, &owner).await {
+                Ok(result) => result,
+                Err(error) => {
+                    cleanup_fork_volume_children(&api.volume_manager, &children).await;
+                    return Err(error);
+                }
+            };
+
+        specs.push(SandboxForkChildSpec {
+            sandbox_id: child_id,
+            volume_mounts,
+            extra_drives,
+            replace_drive_ids,
+        });
+    }
+
+    Ok((specs, children))
+}
+
+async fn snapshot_sandbox_volumes(
+    api: &ApiImpl,
+    metadata: &SandboxMetadata,
+) -> Result<Vec<SnapshotVolume>, models::Error> {
+    let mut snapshots = Vec::with_capacity(metadata.volume_mounts.len());
+    for (mount_path, reference) in &metadata.volume_mounts {
+        let snapshot = api
+            .volume_manager
+            .snapshot_volume_state(reference)
+            .await
+            .map_err(|error| volume_error_response(error).1)?;
+        snapshots.push(SnapshotVolume {
+            mount_path: mount_path.clone(),
+            mode: snapshot.mode,
+            size_mb: snapshot.size_mb,
+            layers: snapshot.backing_layers,
+        });
+    }
+    Ok(snapshots)
+}
+
+async fn restore_snapshot_volume_mounts(
+    api: &ApiImpl,
+    snapshot: &crate::snapshot::RunnableSnapshot,
+) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
+    let mut mounts = HashMap::new();
+    let mut volume_ids = Vec::with_capacity(snapshot.committed().volume_snapshots.len());
+    for volume_snapshot in &snapshot.committed().volume_snapshots {
+        let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
+            Ok(path) => path,
+            Err(error) => {
+                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+                return Err(ApiImpl::error(400, error.to_string()));
+            }
+        };
+        let name = format!("volume-restore-{}", Uuid::now_v7().simple());
+        let child = match api
+            .volume_manager
+            .create_from_snapshot(
+                name,
+                volume_snapshot.mode,
+                volume_snapshot.size_mb,
+                volume_snapshot.layers.clone(),
+            )
+            .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+                return Err(volume_error_response(error).1);
+            }
+        };
+        volume_ids.push(child.id.clone());
+        mounts.insert(mount_path.to_string_lossy().into_owned(), child.id);
+    }
+    Ok((mounts, volume_ids))
+}
+
 impl From<SandboxTimeoutAction> for models::SandboxOnTimeout {
     fn from(action: SandboxTimeoutAction) -> Self {
         match action {
@@ -126,6 +355,7 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             metadata: m.user_metadata,
             state: m.state.into(),
             envd_version: m.runtime_versions.envd_version.clone(),
+            volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
         }
     }
 }
@@ -149,17 +379,23 @@ impl From<&SandboxNetworkPolicy> for models::SandboxNetworkConfig {
     fn from(policy: &SandboxNetworkPolicy) -> Self {
         let egress = &policy.egress;
         Self {
-            allow_public_traffic: Some(true),
+            allow_public_traffic: Some(policy.allow_public_traffic),
             allow_out: (!egress.allowed_cidrs.is_empty() || !egress.allowed_domains.is_empty())
                 .then(|| {
                     egress
                         .allowed_cidrs
                         .iter()
-                        .chain(egress.allowed_domains.iter())
-                        .cloned()
+                        .map(ToString::to_string)
+                        .chain(egress.allowed_domains.iter().cloned())
                         .collect()
                 }),
-            deny_out: (!egress.denied_cidrs.is_empty()).then(|| egress.denied_cidrs.clone()),
+            deny_out: (!egress.denied_cidrs.is_empty()).then(|| {
+                egress
+                    .denied_cidrs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            }),
             mask_request_host: None,
         }
     }
@@ -183,10 +419,9 @@ fn allow_internet_access_from_base_policy(policy: BaseSandboxNetworkPolicy) -> N
 
 impl From<SandboxMetadata> for models::SandboxDetail {
     fn from(m: SandboxMetadata) -> Self {
-        let network = m
-            .network_policy
-            .has_explicit_egress_rules()
-            .then(|| models::SandboxNetworkConfig::from(&m.network_policy));
+        let network = (!m.network_policy.allow_public_traffic
+            || m.network_policy.has_explicit_egress_rules())
+        .then(|| models::SandboxNetworkConfig::from(&m.network_policy));
         let allow_internet_access = Some(allow_internet_access_from_base_policy(
             m.network_policy.base_policy,
         ));
@@ -212,6 +447,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
                 auto_resume: m.auto_resume,
                 on_timeout: m.timeout_action.into(),
             }),
+            volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
         }
     }
 }
@@ -265,12 +501,18 @@ impl CreateRequestError {
 
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
+        let traffic_access_token = (!metadata.network_policy.allow_public_traffic)
+            .then(|| self.traffic_access_token(metadata.id));
         let envd_access_token = self
             .orchestrator
             .get_envd_access_token(&metadata)
             .map(|token| token.expose().to_owned());
         let mut sandbox = models::Sandbox::from(metadata);
         sandbox.envd_access_token = envd_access_token;
+        sandbox.traffic_access_token = Some(match traffic_access_token {
+            Some(token) => Nullable::Present(token),
+            None => Nullable::Null,
+        });
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()
@@ -520,12 +762,12 @@ fn network_policy_from_create(
     let allow_out = network.and_then(|network| network.allow_out.clone());
     let deny_out = network.and_then(|network| network.deny_out.clone());
     let egress = SandboxNetworkEgressPolicy::new(allow_out, deny_out)?;
-    let policy = SandboxNetworkPolicy::new(base_policy, egress);
-    if policy.has_domain_allow_rules() {
-        anyhow::bail!(
-            "domain entries in allowOut are not supported until TCP egress proxy is enabled"
-        );
-    }
+    let allow_public_traffic = network
+        .and_then(|network| network.allow_public_traffic)
+        .unwrap_or(true);
+    let policy = SandboxNetworkPolicy::new(allow_public_traffic, base_policy, egress);
+    validate_ipv4_cidrs(&policy)?;
+    validate_domain_allowlist(&policy)?;
     Ok(policy)
 }
 
@@ -533,15 +775,45 @@ fn network_policy_from_update(
     body: &models::SandboxNetworkUpdateConfig,
 ) -> anyhow::Result<SandboxNetworkPolicy> {
     let policy = SandboxNetworkEgressPolicy::new(body.allow_out.clone(), body.deny_out.clone())?;
-    if policy.has_domain_allow_rules() {
-        anyhow::bail!(
-            "domain entries in allowOut are not supported until TCP egress proxy is enabled"
-        );
-    }
-    Ok(SandboxNetworkPolicy::new(
+    let policy = SandboxNetworkPolicy::new(
+        true,
         base_policy_from_allow_internet_access(body.allow_internet_access),
         policy,
-    ))
+    );
+    validate_ipv4_cidrs(&policy)?;
+    validate_domain_allowlist(&policy)?;
+    Ok(policy)
+}
+
+fn validate_ipv4_cidrs(policy: &SandboxNetworkPolicy) -> anyhow::Result<()> {
+    if policy
+        .egress
+        .allowed_cidrs
+        .iter()
+        .chain(policy.egress.denied_cidrs.iter())
+        .any(|cidr| matches!(cidr, ipnetwork::IpNetwork::V6(_)))
+    {
+        anyhow::bail!("IPv6 CIDRs are not supported by the sandbox network API");
+    }
+    Ok(())
+}
+
+fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()> {
+    use crate::sandbox::ALL_INTERNET_TRAFFIC_CIDR;
+
+    // E2B's domain inspection applies to HTTP/HTTPS (TCP 80/443); other TCP
+    // ports remain CIDR-only. Do not reject a mixed domain/CIDR policy here:
+    // the runtime still honors its explicit CIDR grants on every port.
+    if policy.has_domain_allow_rules()
+        && !policy
+            .egress
+            .denied_cidrs
+            .iter()
+            .any(|cidr| cidr == &ALL_INTERNET_TRAFFIC_CIDR)
+    {
+        anyhow::bail!("allowOut contains domains but denyOut is missing {ALL_INTERNET_TRAFFIC_CIDR} (ALL_TRAFFIC)");
+    }
+    Ok(())
 }
 
 impl ApiImpl {
@@ -596,25 +868,18 @@ impl ApiImpl {
             .into_iter()
             .map(|resolved| resolved.drive)
             .collect();
-        let base = resolved_rootfs.base_context;
         Ok(CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
-                context: Box::new(
-                    CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                        .with_user(base.user)
-                        .with_exposed_ports(base.exposed_ports)
-                        .with_entrypoint(base.entrypoint)
-                        .with_cmd(base.cmd)
-                        .with_volumes(base.volumes)
-                        .with_labels(base.labels),
-                ),
+                context: Box::new(resolved_rootfs.base_context.into()),
                 resources: Some(resources),
                 extra_drives,
                 extra_boot_args: body.extra_boot_args.clone(),
                 image_configs: Box::new(image_configs),
             },
+            extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             timeout: duration_from_secs(body.timeout),
             timeout_action: create_timeout_action(body.auto_pause),
             auto_resume: create_auto_resume(body.auto_resume.as_ref()),
@@ -624,6 +889,7 @@ impl ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params,
             idempotency,
+            volume_mounts: HashMap::new(),
         })
     }
 
@@ -667,6 +933,8 @@ impl ApiImpl {
 
         Ok(CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+            extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             timeout: duration_from_secs(body.timeout),
             timeout_action: create_timeout_action(body.auto_pause),
             auto_resume: create_auto_resume(body.auto_resume.as_ref()),
@@ -676,6 +944,7 @@ impl ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params,
             idempotency,
+            volume_mounts: HashMap::new(),
         })
     }
 }
@@ -727,47 +996,83 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
-        let idempotency = match self
-            .prepare_create("/sandboxes-cold", body.idempotency_key.as_deref(), body)
-            .await
-        {
-            Ok(CreatePreflight::Start(idempotency)) => idempotency,
-            Ok(CreatePreflight::Replay(metadata)) => {
-                let sandbox_id = metadata.id.to_string();
-                return Ok(
-                    SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                );
-            }
-            Err(error) => return Ok(cold_create_error_response(error)),
-        };
-        let timer = SandboxStageTimer::new("create_cold");
-        let request = match self
-            .prepare_cold_create_request(body, idempotency, &timer)
-            .await
-        {
-            Ok(request) => request,
-            Err(error) => return Ok(cold_create_error_response(error)),
-        };
+        let api = self.clone();
+        let body = body.clone();
+        tokio::spawn(async move {
+            let _preparation = api
+                .lock_create_preparation(body.idempotency_key.as_deref())
+                .await;
+            api.sandboxes_cold_post_owned(&body).await
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "sandbox create supervisor failed");
+        })?
+    }
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
+    async fn sandboxes_metrics_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        query: &models::SandboxesMetricsGetQueryParams,
+    ) -> Result<SandboxesMetricsGetResponse, ()> {
+        use SandboxesMetricsGetResponse::*;
+        let ids = match parse_metrics_ids(&query.sandbox_ids) {
+            Ok(ids) => ids,
+            Err(message) => return Ok(Status400_BadRequest(ApiImpl::error(400, message))),
+        };
+        match self.orchestrator.latest_sandbox_metrics(&ids).await {
+            Ok(samples) => Ok(
+                Status200_SuccessfullyReturnedAllRunningSandboxesWithMetrics(
+                    models::SandboxesWithMetrics {
+                        sandboxes: samples
+                            .into_iter()
+                            .map(|(id, metric)| (id.to_string(), metric.into()))
+                            .collect(),
+                    },
+                ),
+            ),
+            Err(error) => Ok(Status500_ServerError(error.into())),
+        }
+    }
+
+    async fn sandboxes_sandbox_id_metrics_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::SandboxesSandboxIdMetricsGetPathParams,
+        query: &models::SandboxesSandboxIdMetricsGetQueryParams,
+    ) -> Result<SandboxesSandboxIdMetricsGetResponse, ()> {
+        use SandboxesSandboxIdMetricsGetResponse::*;
+        if !valid_metrics_interval(query.start, query.end) {
+            return Ok(Status400_BadRequest(ApiImpl::error(
+                400,
+                "start/end must be non-negative and start must not exceed end",
+            )));
+        }
+        let Ok(id) = SandboxId::parse_str(&path.sandbox_id) else {
+            return Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)));
+        };
+        match self
+            .orchestrator
+            .sandbox_metrics_history(
+                id,
+                query.start.map(|t| t as i64),
+                query.end.map(|t| t as i64),
+            )
             .await
         {
-            Ok(metadata) => {
-                let sandbox_id = metadata.id.to_string();
-                Ok(
-                    SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                )
-            }
-            Err(error) => Ok(cold_create_error_response(
-                CreateRequestError::from_cold_orchestrator(error),
+            Ok(samples) => Ok(Status200_SuccessfullyReturnedTheSandboxMetrics(
+                samples.into_iter().map(Into::into).collect(),
             )),
+            Err(OrchestratorError::SandboxNotFound(_)) => {
+                Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)))
+            }
+            Err(error) => Ok(Status500_ServerError(error.into())),
         }
     }
 
@@ -781,8 +1086,8 @@ impl Sandboxes<()> for ApiImpl {
     ) -> Result<SandboxesGetResponse, ()> {
         let filter = SandboxListFilter {
             states: Some(vec![SandboxState::Running]),
-            excluded_states: None,
             user_metadata: parse_metadata_filter(&query_params.metadata),
+            ..SandboxListFilter::matches_all()
         };
 
         let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
@@ -805,48 +1110,116 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
-        let idempotency = match self
-            .prepare_create("/sandboxes", body.idempotency_key.as_deref(), body)
-            .await
-        {
-            Ok(CreatePreflight::Start(idempotency)) => idempotency,
-            Ok(CreatePreflight::Replay(metadata)) => {
-                let sandbox_id = metadata.id.to_string();
-                return Ok(
-                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                );
-            }
-            Err(error) => return Ok(warm_create_error_response(error)),
-        };
-        let timer = SandboxStageTimer::new("create_warm");
-        let request = match self
-            .prepare_warm_create_request(body, idempotency, &timer)
-            .await
-        {
-            Ok(request) => request,
-            Err(error) => return Ok(warm_create_error_response(error)),
-        };
+        let api = self.clone();
+        let body = body.clone();
+        tokio::spawn(async move {
+            let _preparation = api
+                .lock_create_preparation(body.idempotency_key.as_deref())
+                .await;
+            api.sandboxes_post_owned(&body).await
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "sandbox create supervisor failed");
+        })?
+    }
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
-            Ok(metadata) => {
-                let sandbox_id = metadata.id.to_string();
-                Ok(
-                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
+    async fn v2_sandboxes_post(
+        &self,
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        body: &models::NewSandboxV2,
+    ) -> Result<V2SandboxesPostResponse, ()> {
+        let body = models::NewSandbox {
+            idempotency_key: None,
+            template_id: body.template_id.clone(),
+            timeout: Some(body.timeout.unwrap_or(300)),
+            auto_pause: body.auto_pause,
+            auto_resume: body.auto_resume.clone(),
+            secure: Some(true),
+            allow_internet_access: body.allow_internet_access,
+            network: body.network.clone(),
+            metadata: body.metadata.clone(),
+            env_vars: body.env_vars.clone(),
+            custom_extension_params: body.custom_extension_params.clone(),
+            mcp: body.mcp.clone(),
+            volume_mounts: body.volume_mounts.clone(),
+        };
+        Ok(
+            match self
+                .sandboxes_post(method, host, cookies, claims, &body)
+                .await?
+            {
+                SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                    body,
+                    x_agentenv_sandbox_id,
+                } => V2SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                    body,
+                    x_agentenv_sandbox_id,
+                },
+                SandboxesPostResponse::Status400_BadRequest(error) => {
+                    V2SandboxesPostResponse::Status400_BadRequest(error)
+                }
+                SandboxesPostResponse::Status401_AuthenticationError(error) => {
+                    V2SandboxesPostResponse::Status401_AuthenticationError(error)
+                }
+                SandboxesPostResponse::Status409_Conflict(error) => {
+                    V2SandboxesPostResponse::Status409_Conflict(error)
+                }
+                SandboxesPostResponse::Status500_ServerError(error) => {
+                    V2SandboxesPostResponse::Status500_ServerError(error)
+                }
+            },
+        )
+    }
+
+    async fn v2_sandboxes_sandbox_id_connect_post(
+        &self,
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::V2SandboxesSandboxIdConnectPostPathParams,
+        body: &Option<models::ConnectSandboxV2>,
+    ) -> Result<V2SandboxesSandboxIdConnectPostResponse, ()> {
+        use SandboxesSandboxIdConnectPostResponse as V1;
+        use V2SandboxesSandboxIdConnectPostResponse as V2;
+
+        let path_params = models::SandboxesSandboxIdConnectPostPathParams {
+            sandbox_id: path_params.sandbox_id.clone(),
+        };
+        let body = models::ConnectSandbox {
+            timeout: body.as_ref().and_then(|body| body.timeout).unwrap_or(300),
+        };
+        Ok(
+            match self
+                .sandboxes_sandbox_id_connect_post(
+                    method,
+                    host,
+                    cookies,
+                    claims,
+                    &path_params,
+                    &body,
                 )
-            }
-            Err(error) => Ok(warm_create_error_response(
-                CreateRequestError::from_orchestrator(error),
-            )),
-        }
+                .await?
+            {
+                V1::Status200_TheSandboxWasAlreadyRunning(body) => {
+                    V2::Status200_TheSandboxWasAlreadyRunning(body)
+                }
+                V1::Status201_TheSandboxWasResumedSuccessfully(body) => {
+                    V2::Status201_TheSandboxWasResumedSuccessfully(body)
+                }
+                V1::Status400_BadRequest(error) => V2::Status400_BadRequest(error),
+                V1::Status401_AuthenticationError(error) => {
+                    V2::Status401_AuthenticationError(error)
+                }
+                V1::Status404_NotFound(error) => V2::Status404_NotFound(error),
+                V1::Status409_Conflict(error) => V2::Status409_Conflict(error),
+                V1::Status500_ServerError(error) => V2::Status500_ServerError(error),
+            },
+        )
     }
 
     async fn sandboxes_sandbox_id_connect_post(
@@ -949,6 +1322,11 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
+            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
+                ));
+            }
             Err(err) => {
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
@@ -1000,7 +1378,75 @@ impl Sandboxes<()> for ApiImpl {
             ));
         };
 
+        let source_metadata = match self.orchestrator.get_sandbox(&sandbox_id).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                return Ok(SandboxesSandboxIdForkPostResponse::Status404_NotFound(
+                    sandbox_not_found(sandbox_id),
+                ));
+            }
+            Err(error) => {
+                return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
+                    error.into(),
+                ));
+            }
+        };
+
         let count = body.as_ref().and_then(|b| b.count).unwrap_or(1);
+        if !(1..=100).contains(&count) {
+            return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
+                Self::error(400, "count must be between 1 and 100"),
+            ));
+        }
+        if !source_metadata.volume_mounts.is_empty() {
+            if let Err(error) = self.orchestrator.snapshot_volume_mounts(sandbox_id).await {
+                return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
+                    error.into(),
+                ));
+            }
+            if let Err(error) = self
+                .volume_manager
+                .recover_backings(
+                    &sandbox_id.to_string(),
+                    &source_metadata
+                        .volume_mounts
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+                .await
+            {
+                return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
+                    Self::error(
+                        500,
+                        format!("failed to recover local volume backing before fork: {error}"),
+                    ),
+                ));
+            }
+        }
+        let (child_specs, child_volume_ids) = if source_metadata.volume_mounts.is_empty() {
+            (
+                (0..count)
+                    .map(|_| SandboxForkChildSpec {
+                        sandbox_id: SandboxId::new(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                HashMap::new(),
+            )
+        } else {
+            match prepare_volume_fork_specs(self, &source_metadata, count).await {
+                Ok(specs) => specs,
+                Err(error) => {
+                    return Ok(match error.code {
+                        404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
+                        409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
+                        500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
+                        _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
+                    });
+                }
+            }
+        };
         let new_timeout = body
             .as_ref()
             .and_then(|body| body.timeout)
@@ -1012,11 +1458,22 @@ impl Sandboxes<()> for ApiImpl {
             .time(
                 "fork",
                 self.orchestrator
-                    .fork_sandbox(sandbox_id, count, new_timeout),
+                    .fork_sandbox_with_specs(sandbox_id, child_specs, new_timeout),
             )
             .await
         {
             Ok(outcomes) => {
+                if !child_volume_ids.is_empty() {
+                    let successful_ids: HashSet<_> = outcomes
+                        .iter()
+                        .filter_map(|outcome| outcome.as_ref().ok().map(|metadata| metadata.id))
+                        .collect();
+                    let failed_children = child_volume_ids
+                        .into_iter()
+                        .filter(|(child_id, _)| !successful_ids.contains(child_id))
+                        .collect();
+                    cleanup_fork_volume_children(&self.volume_manager, &failed_children).await;
+                }
                 let results = outcomes
                     .into_iter()
                     .map(|outcome| match outcome {
@@ -1034,18 +1491,25 @@ impl Sandboxes<()> for ApiImpl {
                     SandboxesSandboxIdForkPostResponse::Status201_TheSandboxWasSnapshottedAndTheForksWereAttempted(results),
                 )
             }
-            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
-                SandboxesSandboxIdForkPostResponse::Status404_NotFound(sandbox_not_found(id)),
-            ),
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
+                Ok(SandboxesSandboxIdForkPostResponse::Status404_NotFound(
+                    sandbox_not_found(id),
+                ))
+            }
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok({
+                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
                 SandboxesSandboxIdForkPostResponse::Status409_Conflict(Self::error(
                     409,
                     format!("sandbox cannot be forked from {} state", state),
-                )),
-            ),
-            Err(err) => Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                err.into(),
-            )),
+                ))
+            }),
+            Err(err) => {
+                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
+                Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
+                    err.into(),
+                ))
+            }
         }
     }
 
@@ -1247,14 +1711,13 @@ impl Sandboxes<()> for ApiImpl {
                 SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
             ),
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ),
+                SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status409_Conflict(
-                    Self::error(409, format!("sandbox cannot be paused from {} state", state)),
-                ),
+                SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(
+                    409,
+                    format!("sandbox cannot be paused from {} state", state),
+                )),
             ),
             Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
                 err.into(),
@@ -1321,6 +1784,16 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        let volume_snapshots = match snapshot_sandbox_volumes(self, &capture.metadata).await {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                return Ok(match error.code {
+                    500 => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
+                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
+                });
+            }
+        };
+
         let published = match timer
             .time(
                 "publish",
@@ -1337,6 +1810,7 @@ impl Sandboxes<()> for ApiImpl {
                         runtime_versions: capture.metadata.runtime_versions.clone(),
                         virtualization_mode: capture.metadata.virtualization_mode,
                         image_configs: capture.metadata.image_configs.clone(),
+                        volume_snapshots,
                         custom_extension_params: capture.metadata.custom_extension_params.clone(),
                     },
                     capture.captured_snapshot,
@@ -1439,12 +1913,22 @@ impl Sandboxes<()> for ApiImpl {
                     sandbox_not_found(id),
                 ));
             }
+            Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status400_BadRequest(
+                    Self::error(400, format!("invalid timeout: {timeout}")),
+                ));
+            }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
                     Self::error(
                         409,
                         format!("sandbox cannot be resumed from {} state", state),
                     ),
+                ));
+            }
+            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
                 ));
             }
             Err(err) => {
@@ -1507,16 +1991,28 @@ impl Sandboxes<()> for ApiImpl {
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
             None
         };
+        let include_running = states
+            .as_ref()
+            .is_none_or(|states| states.contains(&SandboxState::Running));
+        let descending = !matches!(query_params.order, Some(models::OrderDirection::Asc));
 
         let filter = SandboxListFilter {
             states,
             excluded_states: None,
             user_metadata: parse_metadata_filter(&query_params.metadata),
+            started_after: query_params.started_after.map(SystemTime::from),
+            template: query_params.template.clone(),
         };
 
         let cursor = match query_params.next_token.as_deref() {
             Some(token) => match PaginationCursor::parse(token) {
-                Ok(cursor) => cursor,
+                Ok(cursor) if cursor.is_descending() == descending => cursor,
+                Ok(_) => {
+                    return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
+                        400,
+                        "next token was issued for a different sort order".to_string(),
+                    )));
+                }
                 Err(err) => {
                     return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -1524,7 +2020,10 @@ impl Sandboxes<()> for ApiImpl {
                     )));
                 }
             },
-            None => PaginationCursor::new(SystemTime::now(), SandboxId::max()),
+            None if descending => {
+                PaginationCursor::new_descending(SystemTime::now(), SandboxId::max())
+            }
+            None => PaginationCursor::new_ascending(SystemTime::UNIX_EPOCH, SandboxId::max()),
         };
 
         let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
@@ -1534,19 +2033,28 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        let x_total_running = include_running.then(|| {
+            list.iter()
+                .filter(|sandbox| sandbox.state == SandboxState::Running)
+                .count()
+                .try_into()
+                .unwrap_or(i32::MAX)
+        });
+
         let page = cursor.paginate(
             list,
             query_params.limit,
-            |a, b| PaginationCursor::compare_desc(a.created_at, &a.id, b.created_at, &b.id),
+            |a, b| PaginationCursor::compare(descending, a.created_at, &a.id, b.created_at, &b.id),
             |sandbox, cursor| {
-                PaginationCursor::compare_desc(
+                PaginationCursor::compare(
+                    descending,
                     sandbox.created_at,
                     &sandbox.id,
                     cursor.time(),
                     cursor.value(),
                 )
             },
-            |sandbox| PaginationCursor::new(sandbox.created_at, sandbox.id),
+            |sandbox| PaginationCursor::new(sandbox.created_at, sandbox.id, descending),
         );
 
         let out = page
@@ -1559,6 +2067,7 @@ impl Sandboxes<()> for ApiImpl {
             V2SandboxesGetResponse::Status200_SuccessfullyReturnedAllRunningSandboxes {
                 body: out,
                 x_next_token: page.next_token,
+                x_total_running,
             },
         )
     }
@@ -1567,6 +2076,32 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_mounts_from_model_maps_names_by_path() {
+        let mounts = vec![
+            models::SandboxVolumeMount::new("cache".to_string(), "/cache".to_string()),
+            models::SandboxVolumeMount::new("vol_123".to_string(), "/data".to_string()),
+        ];
+
+        let result = volume_mounts_from_model(Some(&mounts)).unwrap().unwrap();
+
+        assert_eq!(result.get("/cache").map(String::as_str), Some("cache"));
+        assert_eq!(result.get("/data").map(String::as_str), Some("vol_123"));
+    }
+
+    #[test]
+    fn volume_mounts_from_model_rejects_duplicate_paths() {
+        let mounts = vec![
+            models::SandboxVolumeMount::new("first".to_string(), "/data".to_string()),
+            models::SandboxVolumeMount::new("second".to_string(), "/data".to_string()),
+        ];
+
+        let error = volume_mounts_from_model(Some(&mounts)).unwrap_err();
+
+        assert_eq!(error.code, 400);
+        assert!(error.message.contains("duplicate volume mount path"));
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {
@@ -1689,8 +2224,28 @@ mod tests {
         let policy = network_policy_from_update(&body).unwrap();
 
         assert_eq!(policy.base_policy, BaseSandboxNetworkPolicy::Deny);
-        assert_eq!(policy.egress.allowed_cidrs, ["8.8.8.8/32"]);
-        assert_eq!(policy.egress.denied_cidrs, ["203.0.113.0/24"]);
+        assert_eq!(
+            policy.egress.allowed_cidrs,
+            vec!["8.8.8.8/32".parse().unwrap()]
+        );
+        assert_eq!(
+            policy.egress.denied_cidrs,
+            vec!["203.0.113.0/24".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn network_create_preserves_private_ingress() {
+        let mut network = models::SandboxNetworkConfig::new();
+        network.allow_public_traffic = Some(false);
+
+        let policy = network_policy_from_create(None, Some(&network)).unwrap();
+
+        assert!(!policy.allow_public_traffic);
+        assert_eq!(
+            models::SandboxNetworkConfig::from(&policy).allow_public_traffic,
+            Some(false)
+        );
     }
 
     #[test]
@@ -1699,5 +2254,393 @@ mod tests {
             .expect("empty update should be valid");
 
         assert_eq!(policy, SandboxNetworkPolicy::default());
+    }
+
+    #[test]
+    fn network_create_accepts_domain_allowlist_with_explicit_deny_all() {
+        let network = models::SandboxNetworkConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            deny_out: Some(vec!["0.0.0.0/0".to_string()]),
+            ..models::SandboxNetworkConfig::new()
+        };
+
+        let policy = network_policy_from_create(None, Some(&network)).unwrap();
+        assert_eq!(policy.egress.allowed_domains, ["example.com"]);
+        assert_eq!(
+            policy.egress.denied_cidrs,
+            vec!["0.0.0.0/0".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn network_create_rejects_ipv6_cidrs() {
+        let network = models::SandboxNetworkConfig {
+            allow_out: Some(vec!["2001:db8::/32".to_string()]),
+            ..models::SandboxNetworkConfig::new()
+        };
+
+        let error = network_policy_from_create(None, Some(&network)).unwrap_err();
+        assert!(error.to_string().contains("IPv6 CIDRs"));
+    }
+
+    #[test]
+    fn network_create_rejects_domain_allowlist_without_explicit_deny_all() {
+        let network = models::SandboxNetworkConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            ..models::SandboxNetworkConfig::new()
+        };
+
+        let error = network_policy_from_create(None, Some(&network)).unwrap_err();
+        assert!(error.to_string().contains("0.0.0.0/0"));
+    }
+
+    #[test]
+    fn network_update_accepts_domain_allowlist_with_explicit_deny_all() {
+        let body = models::SandboxNetworkUpdateConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            deny_out: Some(vec!["0.0.0.0/0".to_string()]),
+            allow_internet_access: None,
+        };
+        let policy = network_policy_from_update(&body).unwrap();
+        assert_eq!(policy.egress.allowed_domains, ["example.com"]);
+        assert_eq!(
+            policy.egress.denied_cidrs,
+            vec!["0.0.0.0/0".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn network_update_rejects_ipv6_cidrs() {
+        let body = models::SandboxNetworkUpdateConfig {
+            allow_out: Some(vec!["2001:db8::/32".to_string()]),
+            deny_out: None,
+            allow_internet_access: None,
+        };
+
+        let error = network_policy_from_update(&body).unwrap_err();
+        assert!(error.to_string().contains("IPv6 CIDRs"));
+    }
+
+    #[test]
+    fn network_update_rejects_domain_allowlist_without_explicit_deny_all() {
+        let body = models::SandboxNetworkUpdateConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            deny_out: None,
+            allow_internet_access: None,
+        };
+        let error = network_policy_from_update(&body).unwrap_err();
+        assert!(error.to_string().contains("0.0.0.0/0"));
+    }
+}
+
+impl From<crate::sandbox::SandboxMetric> for models::SandboxMetric {
+    fn from(sample: crate::sandbox::SandboxMetric) -> Self {
+        Self::new(
+            sample.timestamp,
+            sample.timestamp.timestamp(),
+            sample.cpu_count,
+            sample.cpu_used_pct,
+            sample.mem_used,
+            sample.mem_total,
+            sample.mem_cache,
+            sample.disk_used,
+            sample.disk_total,
+        )
+    }
+}
+
+fn valid_metrics_interval(start: Option<u64>, end: Option<u64>) -> bool {
+    start.is_none_or(|s| s <= i64::MAX as u64)
+        && end.is_none_or(|e| e <= i64::MAX as u64)
+        && !matches!((start, end), (Some(s), Some(e)) if s > e)
+}
+
+fn parse_metrics_ids(values: &[String]) -> Result<Vec<SandboxId>, &'static str> {
+    if values.len() != 1 {
+        return Err("sandbox_ids must be a single comma-separated list");
+    }
+    let ids: Vec<_> = values[0].split(',').collect();
+    if ids.len() > 100 {
+        return Err("sandbox_ids must contain at most 100 IDs");
+    }
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::new();
+    for id in ids {
+        let id =
+            SandboxId::parse_str(id).map_err(|_| "sandbox_ids must contain valid sandbox IDs")?;
+        if !seen.insert(id) {
+            return Err("sandbox_ids must contain distinct IDs");
+        }
+        parsed.push(id);
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod metrics_contract_tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_metrics_validates_csv_and_interval() {
+        let a = SandboxId::new();
+        let b = SandboxId::new();
+        assert_eq!(
+            parse_metrics_ids(&[format!("{a},{b}")]).unwrap(),
+            vec![a, b]
+        );
+        let alternate_a = a.to_string().replace('-', "");
+        for values in [
+            vec![],
+            vec!["".into()],
+            vec!["not-a-uuid".into()],
+            vec![format!("{a},not-a-uuid")],
+            vec![format!("{a},{a}")],
+            vec![format!("{a},{alternate_a}")],
+            vec![format!("{a},")],
+            vec![a.to_string(), b.to_string()],
+            vec![(0..101)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")],
+        ] {
+            assert!(parse_metrics_ids(&values).is_err());
+        }
+        assert!(valid_metrics_interval(Some(0), Some(i64::MAX as u64)));
+        assert!(!valid_metrics_interval(Some(u64::MAX), None));
+        assert!(!valid_metrics_interval(Some(2), Some(1)));
+    }
+}
+
+impl ApiImpl {
+    async fn sandboxes_cold_post_owned(
+        &self,
+        body: &models::NewColdSandbox,
+    ) -> Result<SandboxesColdPostResponse, ()> {
+        let idempotency = match self
+            .prepare_create("/sandboxes-cold", body.idempotency_key.as_deref(), body)
+            .await
+        {
+            Ok(CreatePreflight::Start(idempotency)) => idempotency,
+            Ok(CreatePreflight::Replay(metadata)) => {
+                let sandbox_id = metadata.id.to_string();
+                return Ok(
+                    SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                );
+            }
+            Err(error) => return Ok(cold_create_error_response(error)),
+        };
+        let timer = SandboxStageTimer::new("create_cold");
+        let mut request = match self
+            .prepare_cold_create_request(body, idempotency, &timer)
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return Ok(cold_create_error_response(error)),
+        };
+
+        let requested_volume_mounts = match volume_mounts_from_model(body.volume_mounts.as_deref())
+        {
+            Ok(mounts) => mounts,
+            Err(error) => {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(error));
+            }
+        };
+        let PreparedVolumeMounts {
+            owner: pending_volume_owner,
+            drives: volume_drives,
+            mounts: volume_mounts,
+            volume_ids: reserved_volume_ids,
+        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(error) if error.code >= 500 => {
+                return Ok(SandboxesColdPostResponse::Status500_ServerError(error));
+            }
+            Err(error) if error.code == 409 => {
+                return Ok(SandboxesColdPostResponse::Status409_Conflict(error));
+            }
+            Err(error) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(error)),
+        };
+
+        request.extra_drives = volume_drives;
+        request.volume_mounts = volume_mounts;
+
+        match timer
+            .time(
+                "create_sandbox",
+                self.orchestrator
+                    .create_sandbox_with_volume_reservation(request, pending_volume_owner.clone()),
+            )
+            .await
+        {
+            Ok(metadata) => {
+                // A replay may leave this request's unused preparation owner.
+                // The launched runtime already owns its volumes durably.
+                let _ = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    None,
+                    &reserved_volume_ids,
+                )
+                .await;
+                let sandbox_id = metadata.id.to_string();
+                Ok(
+                    SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                )
+            }
+            Err(error) => {
+                let _ = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    None,
+                    &reserved_volume_ids,
+                )
+                .await;
+                Ok(cold_create_error_response(
+                    CreateRequestError::from_cold_orchestrator(error),
+                ))
+            }
+        }
+    }
+    async fn sandboxes_post_owned(
+        &self,
+        body: &models::NewSandbox,
+    ) -> Result<SandboxesPostResponse, ()> {
+        let idempotency = match self
+            .prepare_create("/sandboxes", body.idempotency_key.as_deref(), body)
+            .await
+        {
+            Ok(CreatePreflight::Start(idempotency)) => idempotency,
+            Ok(CreatePreflight::Replay(metadata)) => {
+                let sandbox_id = metadata.id.to_string();
+                return Ok(
+                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                );
+            }
+            Err(error) => return Ok(warm_create_error_response(error)),
+        };
+        let timer = SandboxStageTimer::new("create_warm");
+        let mut request = match self
+            .prepare_warm_create_request(body, idempotency, &timer)
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return Ok(warm_create_error_response(error)),
+        };
+
+        let SandboxLaunchSource::Snapshot(snapshot) = &request.source else {
+            unreachable!()
+        };
+        let extra_drives_in_snapshot =
+            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
+        let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
+            body.volume_mounts.as_deref()
+        {
+            let mounts = match volume_mounts_from_model(Some(mounts)) {
+                Ok(mounts) => mounts,
+                Err(error) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+                }
+            };
+            (mounts, Vec::new())
+        } else {
+            match restore_snapshot_volume_mounts(self, &snapshot).await {
+                Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
+                Err(error) => {
+                    return Ok(match error.code {
+                        500 => SandboxesPostResponse::Status500_ServerError(error),
+                        _ => SandboxesPostResponse::Status400_BadRequest(error),
+                    });
+                }
+            }
+        };
+        let PreparedVolumeMounts {
+            owner: pending_volume_owner,
+            drives: volume_drives,
+            mounts: volume_mounts,
+            volume_ids: reserved_volume_ids,
+        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                return Ok(match error.code {
+                    500.. => SandboxesPostResponse::Status500_ServerError(error),
+                    409 => SandboxesPostResponse::Status409_Conflict(error),
+                    _ => SandboxesPostResponse::Status400_BadRequest(error),
+                });
+            }
+        };
+
+        request.extra_drives = volume_drives;
+        request.extra_drives_in_snapshot = extra_drives_in_snapshot;
+        request.volume_mounts = volume_mounts;
+
+        match timer
+            .time(
+                "create_sandbox",
+                self.orchestrator
+                    .create_sandbox_with_volume_reservation(request, pending_volume_owner.clone()),
+            )
+            .await
+        {
+            Ok(metadata) => {
+                // A replay may leave this request's unused preparation owner.
+                // The launched runtime already owns its volumes durably.
+                let _ = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    None,
+                    &reserved_volume_ids,
+                )
+                .await;
+                let sandbox_id = metadata.id.to_string();
+                Ok(
+                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                )
+            }
+            Err(error) => {
+                let _ = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    None,
+                    &reserved_volume_ids,
+                )
+                .await;
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                Ok(warm_create_error_response(
+                    CreateRequestError::from_orchestrator(error),
+                ))
+            }
+        }
+    }
+    async fn lock_create_preparation(
+        &self,
+        key: Option<&str>,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let key = key?;
+        let mutex = {
+            let mut locks = self.create_preparations.lock().await;
+            locks.retain(|_, mutex| mutex.strong_count() != 0);
+            match locks.get(key).and_then(std::sync::Weak::upgrade) {
+                Some(mutex) => mutex,
+                None => {
+                    let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(key.to_owned(), std::sync::Arc::downgrade(&mutex));
+                    mutex
+                }
+            }
+        };
+        Some(mutex.lock_owned().await)
     }
 }

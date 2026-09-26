@@ -18,7 +18,7 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
+    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{TemplateBuildError, TemplateBuildFailure, TemplatePipelineError};
@@ -173,7 +173,7 @@ fn build_record_envd_version(record: &SnapshotRecord) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
+pub(super) fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
     match &record.source {
         SnapshotSource::Template { build } => build.status,
         SnapshotSource::Sandbox { .. } => TemplateBuildStatus::Ready,
@@ -283,6 +283,60 @@ async fn mark_v2_build_error(
 impl Templates<()> for ApiImpl {
     type Claims = super::Claims;
 
+    async fn templates_template_id_builds_build_id_builder_put(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
+        body: &models::TemplateBuilderRequest,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, ()> {
+        use TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::*;
+        Ok(
+            match self
+                .start_image_build(&path.template_id, &path.build_id, body)
+                .await
+            {
+                Ok(body) => Status202_BuilderPreparationAccepted {
+                    x_agentenv_build_id: Some(path.build_id.clone()),
+                    body,
+                },
+                Err(err) => match err.code {
+                    400 => Status400_BadRequest(err),
+                    404 => Status404_NotFound(err),
+                    409 => Status409_Conflict(err),
+                    429 => Status429_ConcurrentBuildLimitReached(err),
+                    _ => Status500_ServerError(err),
+                },
+            },
+        )
+    }
+
+    async fn templates_template_id_builds_build_id_builder_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, ()> {
+        use TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse::*;
+        Ok(
+            match self
+                .cancel_image_build(&path.template_id, &path.build_id)
+                .await
+            {
+                Ok(()) => Status204_BuilderReleased,
+                Err(err) => match err.code {
+                    404 => Status404_NotFound(err),
+                    409 => Status409_Conflict(err),
+                    _ => Status500_ServerError(err),
+                },
+            },
+        )
+    }
+
     async fn templates_aliases_alias_get(
         &self,
         _method: &Method,
@@ -355,7 +409,13 @@ impl Templates<()> for ApiImpl {
     ) -> Result<V2TemplatesGetResponse, ()> {
         let cursor = match query_params.next_token.as_deref() {
             Some(token) => match PaginationCursor::<SnapshotId>::parse(token) {
-                Ok(cursor) => cursor,
+                Ok(cursor) if cursor.is_descending() => cursor,
+                Ok(_) => {
+                    return Ok(V2TemplatesGetResponse::Status400_BadRequest(Self::error(
+                        400,
+                        "next token was issued for a different sort order".to_string(),
+                    )));
+                }
                 Err(err) => {
                     return Ok(V2TemplatesGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -363,7 +423,7 @@ impl Templates<()> for ApiImpl {
                     )));
                 }
             },
-            None => PaginationCursor::new(SystemTime::now(), SnapshotId::max()),
+            None => PaginationCursor::new_descending(SystemTime::now(), SnapshotId::max()),
         };
 
         let records = match self
@@ -391,7 +451,7 @@ impl Templates<()> for ApiImpl {
                 )
             },
             |record| {
-                PaginationCursor::new(
+                PaginationCursor::new_descending(
                     SystemTime::from(datetime_from_unix_ms(record.created_at_unix_ms)),
                     record.id.clone(),
                 )
@@ -426,25 +486,32 @@ impl Templates<()> for ApiImpl {
             );
         }
 
-        match self
-            .snapshot_manager
-            .get(&path_params.template_id)
-            .await
-        {
+        match self.snapshot_manager.get(&path_params.template_id).await {
             Ok(Some(record)) => {
+                let mut info = models::TemplateBuildInfo::from(record);
+                if self.build_sessions.is_starting(&path_params.build_id) {
+                    info.status = models::TemplateBuildStatus::Waiting;
+                } else if info.status == models::TemplateBuildStatus::Ready
+                    && self.build_sessions.is_finishing(&path_params.build_id)
+                {
+                    // A sequential CLI build must observe the newly published cache seed.
+                    info.status = models::TemplateBuildStatus::Building;
+                }
                 Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status200_SuccessfullyReturnedTheTemplate(
-                    record.into(),
+                    info,
                 ))
             }
-            Ok(None) => Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status404_NotFound(
-                Self::error(
+            Ok(None) => Ok(
+                TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status404_NotFound(Self::error(
                     404,
                     format!("template {} not found", path_params.template_id),
+                )),
+            ),
+            Err(err) => Ok(
+                TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
                 ),
-            )),
-            Err(err) => Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status500_ServerError(
-                Self::snapshot_manager_error(&err),
-            )),
+            ),
         }
     }
 
@@ -456,7 +523,27 @@ impl Templates<()> for ApiImpl {
         _claims: &Self::Claims,
         path_params: &models::TemplatesTemplateIdDeletePathParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, ()> {
-        match self.snapshot_manager.delete(&path_params.template_id).await {
+        let record =
+            match self.snapshot_manager.get(&path_params.template_id).await {
+                Ok(Some(record)) if self.build_sessions.contains(&record.id.to_string()) => {
+                    return Ok(TemplatesTemplateIdDeleteResponse::Status409_Conflict(
+                        Self::error(
+                            409,
+                            "template build is active; cancel the builder or wait for it to finish",
+                        ),
+                    ));
+                }
+                Err(err) => {
+                    return Ok(TemplatesTemplateIdDeleteResponse::Status500_ServerError(
+                        Self::snapshot_manager_error(&err),
+                    ))
+                }
+                Ok(Some(record)) => record,
+                Ok(None) => return Ok(
+                    TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully,
+                ),
+            };
+        match self.snapshot_manager.delete(record.id.to_string()).await {
             Ok(_) => {
                 Ok(TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully)
             }
@@ -504,8 +591,8 @@ impl Templates<()> for ApiImpl {
         let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
 
         Ok(
-            TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds(
-                models::TemplateWithBuilds::new(
+            TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
+                body: models::TemplateWithBuilds::new(
                     record.id.to_string(),
                     true,
                     build_record_names(&record),
@@ -515,7 +602,8 @@ impl Templates<()> for ApiImpl {
                     0,
                     builds,
                 ),
-            ),
+                x_next_token: None,
+            },
         )
     }
 
@@ -686,21 +774,12 @@ impl Templates<()> for ApiImpl {
                     if let Some(config) = &resolved_rootfs.raw_config {
                         image_configs.add(None::<String>, "/", config.clone());
                     }
-                    let base = resolved_rootfs.base_context;
-                    let base_context =
-                        CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                            .with_user(base.user)
-                            .with_exposed_ports(base.exposed_ports)
-                            .with_entrypoint(base.entrypoint)
-                            .with_cmd(base.cmd)
-                            .with_volumes(base.volumes)
-                            .with_labels(base.labels);
                     let spec = spec
                         .with_resolved_overlaybd_image(
                             resolved_rootfs.overlaybd_config_path,
                             image_configs,
                         )
-                        .with_base_context(base_context);
+                        .with_base_context(resolved_rootfs.base_context.into());
                     match api
                         .template_builder
                         .build_and_publish_with_id(

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod build;
+pub mod codex;
 pub mod completion;
 pub mod connect;
 pub mod delete;
@@ -14,6 +15,7 @@ pub mod start;
 pub mod template;
 pub mod timeout;
 pub mod upload;
+pub mod volume;
 
 use crate::client::Client;
 use anyhow::Result;

@@ -533,7 +533,11 @@ impl RegistryFSImplV2 {
         url: &str,
         auth_header: &str,
     ) -> Result<ActualUrlResponse> {
-        let mut req = self.client.get(url).timeout(self.timeout);
+        let mut req = self
+            .client
+            .get(url)
+            .header(RANGE, "bytes=0-0")
+            .timeout(self.timeout);
         if !auth_header.is_empty() {
             req = req.header(AUTHORIZATION, auth_header);
         }
@@ -1890,7 +1894,6 @@ fn address_matches(addr: &str, seg: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::io::virtual_file::VirtualFile;
-    use crate::test_utils::test_io_ring;
     use axum::body::Body;
     use axum::extract::{Query, State};
     use axum::http::header::{
@@ -2635,11 +2638,8 @@ mod tests {
 
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("uploader.data");
-        let local = Arc::new(
-            LocalFile::open_rw(&path, true, test_io_ring())
-                .await
-                .expect("open local upload staging file"),
-        );
+        let local =
+            Arc::new(LocalFile::open_rw(&path, true).expect("open local upload staging file"));
         let mut uploader = RegistryUploader::new(
             local,
             RegistryUploaderOptions {

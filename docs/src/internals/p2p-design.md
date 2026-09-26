@@ -138,6 +138,8 @@ Snapshot publication advertises:
   - `firecracker-manifest.json` is serialized from the committed manifest and published as bytes.
 - Overlaybd layers referenced by the snapshot's rootfs, memory, and attached-drive image configs. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by `src/overlaybd/p2p/artifact.rs`, with keys like `overlaybd-layer/v1/sha256:<digest>` and `LayerMetadata` understood by the overlaybd HTTP facade.
 
+Digest-keyed layer publication is guarded against the committed record: a local layer is only advertised under `overlaybd-layer/v1/sha256:<digest>` when that digest is one the committed record references for the same subject (memory, rootfs, or the matching attached drive). When `[snapshot.publish_compression]` recontainerizes a raw local layer as ZFile during upload, the record names the compressed bytes, so the raw layer's digest key is skipped rather than advertised under a key no consumer will look up. ZFile layers also carry no LSMT uuid (`uuid = None` in the committed record), so uuid-keyed acceleration never applies to recontainerized layers.
+
 That split is important. Snapshot fixed artifacts are scoped to one snapshot ID and are only consumed by snapshot runtime resolvers. Overlaybd commit layers are content-addressed and may be consumed by any overlaybd runtime path, including foreground range reads through `/p2p-http/{origin}`. Do not add a second snapshot-specific key format for overlaybd layers; doing so publishes bytes that overlaybd cannot discover.
 
 OSS snapshot resolution consumes fixed artifacts through P2P first:
@@ -159,3 +161,6 @@ The P2P transport does not define what an artifact means. Each consuming module 
 - Deciding whether and when to publish local artifacts.
 
 This boundary keeps the transport reusable and avoids baking module-specific cache semantics into `src/p2p`.
+
+The image resolver uses the same boundary for standard OCI conversion artifacts. After a converted OverlayBD commit is durable in the node-local image cache, the image module publishes it under `oci-layer/v1/{context-hash}`. The hash is serialized from `LayerConversionKey`; descriptor metadata contains only the protocol version, output commit digest, and size. A consumer still resolves the source OCI manifest/config from the registry, then looks up each conversion context in P2P before falling back to local OCI download and conversion.
+Fetched bytes are verified as a sealed OverlayBD layer before being indexed locally. P2P publication and lookup failures are acceleration misses, while successful publications are recorded on the owning image-cache hard commit so GC can unpublish them before deleting the file.

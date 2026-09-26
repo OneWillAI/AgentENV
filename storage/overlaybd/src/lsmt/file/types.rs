@@ -74,12 +74,12 @@ fn premerged_index_cache_limit_bytes(cache_size_gb: u32) -> u64 {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ReadOnlyLayerMetadata {
-    pub(super) uuid: Uuid,
-    pub(super) file_size: u64,
-    pub(super) virtual_size: u64,
-    pub(super) index_offset: u64,
-    pub(super) index_size: u64,
+pub(crate) struct ReadOnlyLayerMetadata {
+    pub(crate) uuid: Uuid,
+    pub(crate) file_size: u64,
+    pub(crate) virtual_size: u64,
+    pub(crate) index_offset: u64,
+    pub(crate) index_size: u64,
     pub(super) header_version: u8,
     pub(super) header_sub_version: u8,
     pub(super) trailer_version: u8,
@@ -126,6 +126,29 @@ impl RwLayout {
             RwLayout::Sparse => LSMTFileType::SparseReadWrite,
             RwLayout::HybridLogStructured => LSMTFileType::HybridReadWrite,
         }
+    }
+
+    /// Reject a layout the current platform cannot support.
+    ///
+    /// `Sparse` pre-sizes the upper to the whole virtual disk and recovers "which
+    /// blocks were written" from the filesystem's extent map, so it only works
+    /// where unwritten regions are guaranteed to be reportable holes — see
+    /// [`crate::sys::sparse_extents_are_reliable`].
+    ///
+    /// Called from every entry point that creates *or* opens an upper, not just
+    /// from the recovery scan in `create_mappings_from_sparse`. Guarding only the
+    /// scan would let an unsupported platform create a sparse upper, write to it
+    /// successfully, and then fail to reopen it on the next restart — surfacing
+    /// the problem after the data is already there instead of before.
+    pub(super) fn ensure_supported(self) -> Result<Self> {
+        ensure!(
+            self != RwLayout::Sparse || crate::sys::sparse_extents_are_reliable(),
+            "sparse RW layout is not supported on this platform: it does not \
+             guarantee that unwritten regions are reported as holes, so the \
+             upper's extent map cannot be used to recover which blocks were \
+             written"
+        );
+        Ok(self)
     }
 }
 

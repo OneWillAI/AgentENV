@@ -1,9 +1,10 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::errors::RepositoryResult;
-use crate::sandbox::FirecrackerSnapshotManifest;
+use super::errors::{RepositoryError, RepositoryResult};
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::types::{
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
     TemplateBuildErrorReason, TemplateBuildStatus,
@@ -32,6 +33,20 @@ pub struct SnapshotListFilter {
     ///
     /// Sandbox records never match this field.
     pub template_statuses: Option<Vec<TemplateBuildStatus>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VolumeRecordPage {
+    pub records: Vec<crate::volume::VolumeRecord>,
+    /// The last returned volume ID. Supplying it to the next request resumes
+    /// after that record in the repository's stable shard-and-ID order.
+    pub next_volume_id: Option<String>,
+}
+
+fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
+    Err(RepositoryError::Unsupported {
+        feature: feature.to_owned(),
+    })
 }
 
 impl SnapshotListFilter {
@@ -135,10 +150,16 @@ pub trait SnapshotRepository: Send + Sync {
     /// On success, the returned [`SnapshotRecord`] must contain committed artifact state.
     /// On failure, callers may assume the backend attempted best-effort cleanup of partially published
     /// state, but durable shared artifacts may still be retained when doing so is safe and intentional.
+    ///
+    /// `recording`, when present, is the in-flight startup-manifest recording
+    /// for this snapshot; the backend awaits it after the layer uploads and
+    /// before building the manifest, so the recording VM overlaps the upload
+    /// phase instead of serializing ahead of it.
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord>;
 
     /// Loads one snapshot record by repository id or alias.
@@ -173,6 +194,107 @@ pub trait SnapshotRepository: Send + Sync {
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
+
+    /// Resolves a volume by ID first, then by its unique name.
+    async fn get_volume(
+        &self,
+        _reference: &str,
+    ) -> RepositoryResult<Option<crate::volume::VolumeRecord>> {
+        unsupported("volume catalog")
+    }
+
+    /// Lists one bounded page ordered by the repository's stable volume cursor.
+    async fn list_volumes_page(
+        &self,
+        _after_volume_id: Option<&str>,
+        _limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        unsupported("volume catalog")
+    }
+
+    /// Creates one durable volume record and atomically claims its unique name.
+    async fn create_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
+        unsupported("volume catalog")
+    }
+
+    /// Updates one existing durable volume record.
+    async fn put_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
+        unsupported("volume catalog")
+    }
+
+    /// Shared immutable cache seed for Dockerfile builds, independent of node and template.
+    async fn get_build_cache_head(&self) -> RepositoryResult<Option<String>> {
+        Ok(self.get_build_cache_state().await?.current)
+    }
+
+    async fn get_build_cache_state(&self) -> RepositoryResult<super::BuildCacheState> {
+        unsupported("template build cache")
+    }
+
+    /// Atomically publishes a fresh seed and records the previous seed for retirement.
+    async fn replace_build_cache_head(&self, _volume_id: &str) -> RepositoryResult<Option<String>> {
+        unsupported("template build cache")
+    }
+
+    /// Acknowledges retirement after the volume has been deleted.
+    async fn forget_retired_build_cache(&self, _volume_id: &str) -> RepositoryResult<()> {
+        unsupported("template build cache")
+    }
+
+    /// Publishes the current node-local OverlayBD backing and returns logical
+    /// layer references suitable for the shared volume catalog.
+    async fn publish_volume_backing(
+        &self,
+        _volume_id: &str,
+        _image_config_path: &Path,
+    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
+        unsupported("volume backing publication")
+    }
+
+    /// Materializes a node-local runtime image config from shared logical layers.
+    async fn materialize_volume_backing(
+        &self,
+        _volume_id: &str,
+        _layers: &[crate::snapshot::OverlaybdLayerRef],
+        _destination: &Path,
+    ) -> RepositoryResult<PathBuf> {
+        unsupported("volume backing materialization")
+    }
+
+    /// Removes one durable volume record. Missing records are considered success.
+    async fn delete_volume(&self, _volume_id: &str) -> RepositoryResult<()> {
+        unsupported("volume catalog")
+    }
+
+    /// Acquires an exclusive volume reservation atomically where the backend
+    /// supports it. `Ok(Some(owner))` reports an existing conflicting owner.
+    async fn reserve_volume(
+        &self,
+        _volume_id: &str,
+        _owner: &str,
+    ) -> RepositoryResult<Option<String>> {
+        unsupported("volume reservations")
+    }
+
+    /// Adds a shared lease for a read-only volume.
+    async fn reserve_read_only_volume(
+        &self,
+        _volume_id: &str,
+        _owner: &str,
+    ) -> RepositoryResult<()> {
+        unsupported("read-only volume reservations")
+    }
+
+    /// Conditionally releases or rebinds one known volume. Implementations
+    /// must change the record only when it is currently mounted by `from`.
+    async fn replace_volume_owner_for(
+        &self,
+        _volume_id: &str,
+        _from: &str,
+        _to: Option<&str>,
+    ) -> RepositoryResult<()> {
+        unsupported("volume reservations")
+    }
 }
 
 #[async_trait]

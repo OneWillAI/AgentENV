@@ -12,9 +12,15 @@ Set environment variables to point at your AgentENV server. See [Environment Var
 # Single-node example
 export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 ```
+
+AgentENV returns `trafficAccessToken` when `network.allowPublicTraffic` is false
+and (for secure sandboxes)
+`envdAccessToken` for envd control traffic. These credentials have different
+headers and trust boundaries: use `e2b-traffic-access-token` for private
+application routes and `X-Access-Token` only for envd. Public application
+routes require neither token.
 
 ### TypeScript SDK
 
@@ -58,6 +64,38 @@ await sandbox.kill();
 
 Replace `<template-id>` with a template that exists in your local template store. Use `e2b template list` or `GET /v2/templates` to see available templates.
 
+### Volume mounts
+
+The TypeScript SDK can create a volume and pass it directly when creating a
+sandbox:
+
+```typescript
+import { Sandbox, Volume } from "e2b";
+
+const volume = await Volume.create("workspace-volume", {
+  apiKey: process.env.E2B_API_KEY,
+});
+const sandbox = await Sandbox.create("<template-id>", {
+  apiKey: process.env.E2B_API_KEY,
+  volumeMounts: {
+    "/workspace": volume,
+  },
+});
+```
+
+For the Python SDK, create the volume with `aenv volume create` or
+`POST /volumes`, then pass its name when creating a sandbox:
+
+```python
+sandbox = Sandbox.create(
+    "<template-id>",
+    volume_mounts={"/workspace": "workspace-volume"},
+)
+```
+
+AgentENV supports the TypeScript SDK's volume create, list, and delete operations, and accessing the mounted filesystem through the sandbox.
+The E2B SDK's direct volume content API is not supported.
+
 ### Python SDK
 
 #### Setup
@@ -100,4 +138,4 @@ sandbox.kill()
 ## E2B CLI
 
 AgentENV is compatible with the E2B CLI, but we recommend using the
-[aenv CLI](../getting-started/aenv-cli.md) for AgentENV workflows.
+[aenv CLI](../getting-started/aenv-cli/index.md) for AgentENV workflows.

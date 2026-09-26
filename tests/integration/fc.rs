@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentenv::cfg::{ConfigManager, MemorySnapshotCompressionAlgorithm};
+use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
     BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, SandboxBackend,
     SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
@@ -10,9 +10,8 @@ use agentenv::sandbox::{
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::ImageConfig;
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
-use overlaybd::zfile::{is_zfile, zfile_open_ro, CompressOptions};
+use overlaybd::zfile::is_zfile;
 
 use crate::common;
 
@@ -95,16 +94,15 @@ async fn verify_disk_marker(sandbox: &mut FirecrackerSandbox) -> Result<()> {
     Ok(())
 }
 
-/// Assert that the newest local memory lower of `snapshot` matches the global
-/// `[memory_snapshot]` compression policy:
-/// - `compression_enabled = false` -> raw LSMT layer (no ZFile wrapper)
-/// - `compression_enabled = true` -> ZFile layer with the configured algorithm
-///   and 4096-byte compression blocks
+/// Assert that the newest local memory lower of `snapshot` is a raw LSMT
+/// layer (no ZFile wrapper). Capture-time compression was removed: local
+/// layers always stay raw, so local resume pays no decompression cost.
+/// Compression, when enabled via `[snapshot.publish_compression]`, happens
+/// once at publish time on the repository upload path.
 ///
 /// Image config lowers are ordered bottom-to-top (oldest base layer first), so
 /// the newest local lower is the last entry with a `file` path.
-async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig) -> Result<()> {
-    let memory_config = &ConfigManager::global().config().memory_snapshot;
+async fn assert_memory_layer_is_raw(snapshot: &FirecrackerSnapshotConfig) -> Result<()> {
     let image_config_path = &snapshot.mem_overlaybd_config.image_config_path;
     let image_config: ImageConfig = serde_json::from_slice(
         &fs::read(image_config_path)
@@ -128,48 +126,16 @@ async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig
     };
 
     let file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(&lower_path, shared_transient_io_ring())
-            .await
+        LocalFile::open_ro(&lower_path)
             .with_context(|| format!("open memory lower {}", lower_path.display()))?,
     );
-    let zfile_flag = is_zfile(file.clone())
+    let zfile_flag = is_zfile(file)
         .await
         .with_context(|| format!("probe zfile header of {}", lower_path.display()))?;
-    if !memory_config.compression_enabled {
-        assert_eq!(
-            zfile_flag,
-            0,
-            "compression disabled: memory lower {} should be a raw LSMT layer",
-            lower_path.display()
-        );
-        return Ok(());
-    }
-
-    let expected_algo = match memory_config.compression_algorithm {
-        MemorySnapshotCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
-        MemorySnapshotCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
-    };
     assert_eq!(
         zfile_flag,
-        1,
-        "compression {:?}: memory lower {} should be a ZFile layer",
-        memory_config.compression_algorithm,
-        lower_path.display()
-    );
-    let zfile = zfile_open_ro(file, false)
-        .await
-        .with_context(|| format!("open zfile memory lower {}", lower_path.display()))?;
-    assert_eq!(
-        zfile.options().algo,
-        expected_algo,
-        "memory lower {} should use the configured compression algorithm",
-        lower_path.display()
-    );
-    // The memory snapshot format contract pins 4 KiB compression blocks.
-    assert_eq!(
-        zfile.options().block_size,
-        4096,
-        "memory lower {} should use 4096-byte compression blocks",
+        0,
+        "memory lower {} should be a raw LSMT layer",
         lower_path.display()
     );
     Ok(())
@@ -199,10 +165,185 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     Ok(())
 }
 
+async fn serve_tools_rootfs(
+    rootfs: &Path,
+) -> Result<(String, tokio::task::JoinHandle<std::io::Result<()>>)> {
+    use axum::{extract::Path as RoutePath, routing::get, Router};
+    use bytes::Bytes;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    let mut archive = tar::Builder::new(Vec::new());
+    archive.follow_symlinks(false);
+    archive.append_dir_all(".", rootfs)?;
+    let layer = archive.into_inner()?;
+    let digest = |bytes: &[u8]| format!("sha256:{:x}", Sha256::digest(bytes));
+    let layer_digest = digest(&layer);
+    let config = serde_json::to_vec(&json!({
+        "architecture": if std::env::consts::ARCH == "x86_64" { "amd64" } else { "arm64" },
+        "os": "linux",
+        "config": {"Labels": {"io.agentenv.tools-drive.format": "oci-rootfs-v1"}},
+        "rootfs": {"type": "layers", "diff_ids": [layer_digest]}
+    }))?;
+    let config_digest = digest(&config);
+    let manifest_type = "application/vnd.oci.image.manifest.v1+json";
+    let manifest = Bytes::from(serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": manifest_type,
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer_digest, "size": layer.len()}]
+    }))?);
+    let manifest_digest = digest(&manifest);
+    let blobs = Arc::new(std::collections::HashMap::from([
+        (layer_digest, Bytes::from(layer)),
+        (config_digest, Bytes::from(config)),
+    ]));
+    let app = Router::new()
+        .route("/v2/", get(|| async { "{}" }))
+        .route(
+            "/v2/tools/manifests/{reference}",
+            get(move || {
+                let body = manifest.clone();
+                let digest = manifest_digest.clone();
+                async move {
+                    (
+                        [
+                            ("content-type", manifest_type.to_string()),
+                            ("docker-content-digest", digest),
+                        ],
+                        body,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v2/tools/blobs/{digest}",
+            get(move |RoutePath(digest): RoutePath<String>| {
+                let blobs = Arc::clone(&blobs);
+                async move {
+                    blobs
+                        .get(&digest)
+                        .cloned()
+                        .ok_or(axum::http::StatusCode::NOT_FOUND)
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let registry = listener.local_addr()?.to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    Ok((registry, server))
+}
+
+#[tokio::test]
+async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Result<()> {
+    use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
+
+    common::setup().await;
+    let global = ConfigManager::global_config();
+    let tools_dir = global.deps_path.join("tools");
+    fs::create_dir_all(&tools_dir)?;
+    let release = tempfile::Builder::new()
+        .prefix("0.0.0-oci-")
+        .tempdir_in(&tools_dir)?;
+    let version = release
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let rootfs = release.path().join("rootfs");
+    fs::create_dir(&rootfs)?;
+
+    // Reuse the provisioned guest binaries, regardless of the default tools format.
+    let mut seed = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    seed.start().await?;
+    let extracted = tokio::process::Command::new("debugfs")
+        .args(["-R", &format!("rdump / {}", rootfs.display())])
+        .arg(seed.work_rootfs_path().with_file_name("rootfs.ext4"))
+        .output()
+        .await;
+    seed.stop().await?;
+    let extracted = extracted?;
+    assert!(
+        extracted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    fs::write(
+        rootfs.join("agentenv/tools-drive-version"),
+        format!("{version}\n"),
+    )?;
+
+    let mut setup = global.clone();
+    setup.home_path = release.path().join("home");
+    setup.image.cache.root_dir = release.path().join("image-cache");
+    setup.deps_path = release.path().join("deps");
+    setup.ublk.overlaybd.global_config_path = release.path().join("config/overlaybd.json");
+    setup.memory_snapshot.overlaybd_global_config_path = release.path().join("config/memory.json");
+    setup.firecracker.binary_path = Some(global.resolved_firecracker_binary_path());
+    setup.kernel.image_path = Some(global.resolved_kernel_image_path());
+    setup.tools.drive_path = None;
+    setup.tools.version = Some(version.clone());
+    let regctl = setup.resolved_regctl_binary();
+    fs::create_dir_all(regctl.parent().unwrap())?;
+    symlink(
+        global.deps_path.join("overlaybd"),
+        setup.deps_path.join("overlaybd"),
+    )?;
+    let (registry, server) = serve_tools_rootfs(&rootfs).await?;
+    setup.tools.url = Some(format!("{registry}/tools:{{version}}"));
+    let prepared = async {
+        fs::write(
+            &regctl,
+            format!(
+                "#!/bin/sh\nexec {} --host reg={registry},tls=disabled \"$@\"\n",
+                shell_util::shell_quote(&global.resolved_regctl_binary().to_string_lossy())
+            ),
+        )?;
+        fs::set_permissions(&regctl, fs::Permissions::from_mode(0o755))?;
+        agentenv::setup::ensure_provisioning(&setup).await
+    }
+    .await;
+    server.abort();
+    prepared?;
+    for entry in fs::read_dir(setup.deps_path.join("tools").join(&version))? {
+        let entry = entry?;
+        fs::rename(entry.path(), release.path().join(entry.file_name()))?;
+    }
+
+    let mut config = common::default_sandbox_config()?;
+    config.common.tools_drive_version = version.clone();
+    let mut first = FirecrackerSandbox::new(config.clone())?;
+    let mut second = FirecrackerSandbox::new(config)?;
+    tokio::try_join!(first.start(), second.start())?;
+    let backing = |sandbox: &FirecrackerSandbox| {
+        fs::canonicalize(sandbox.work_rootfs_path().with_file_name("rootfs.ext4"))
+    };
+    let device = backing(&first)?;
+    assert!(fs::metadata(&device)?.file_type().is_block_device());
+    assert_eq!(device, backing(&second)?);
+    first.stop().await?;
+    let output = second
+        .run_command(
+            "/agentenv/bin/busybox",
+            &["cat", "/agentenv/tools-drive-version", "/sys/block/vda/ro"],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout.trim(), format!("{version}\n1"));
+    let paused = second.pause().await?;
+    assert_eq!(paused.common.tools_drive_version, version);
+    second.resume().await?;
+    assert_eq!(device, backing(&second)?);
+    second.stop().await?;
+    Ok(())
+}
+
 /// Shared body of the memory snapshot format test: pause a marked sandbox into
 /// a temp dir, assert the direct OverlayBD snapshot artifact layout, validate
-/// the newest memory lower against the configured compression policy, and
-/// verify that a resume round-trip preserves guest disk state.
+/// that the newest memory lower is a raw LSMT layer, and verify that a resume
+/// round-trip preserves guest disk state.
 async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
@@ -224,7 +365,7 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
         !snapshot_dir.path().join("mem.bin").exists(),
         "direct OverlayBD snapshot should not create mem.bin"
     );
-    assert_memory_layer_matches_config(&snapshot).await?;
+    assert_memory_layer_is_raw(&snapshot).await?;
 
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
     verify_disk_marker(&mut resumed).await?;
@@ -233,8 +374,7 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
 }
 
 /// Direct OverlayBD memory layers are built from Firecracker memory ranges
-/// without an intermediate raw memory file. This test is run by three
-/// independent processes (raw/lz4/zstd temp configs) to cover all modes.
+/// without an intermediate raw memory file, and are always written raw.
 #[tokio::test]
 async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
     common::setup().await;
@@ -245,6 +385,7 @@ async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
 async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
+    let tools_version = sandbox_config.common.tools_drive_version.clone();
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
@@ -255,6 +396,9 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     sandbox.stop().await?;
 
     let encoded = paused_state.encode()?;
+    assert_eq!(encoded["common"]["tools_drive_version"], tools_version);
+    assert!(encoded.get("tools").is_none());
+    assert!(!artifact_root.join("tools").exists());
     drop(paused_state);
 
     let decoded =
@@ -277,7 +421,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     write_disk_marker(&mut sandbox).await?;
     let first_snapshot = sandbox.pause().await?;
-    assert_memory_layer_matches_config(&first_snapshot).await?;
+    assert_memory_layer_is_raw(&first_snapshot).await?;
     sandbox.stop().await?;
     let first_snapshot_dir = fs::canonicalize(first_snapshot.vm_state_path.parent().unwrap())?;
     let first_persistent_generation = fs::canonicalize(
@@ -308,7 +452,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&first_snapshot).await?;
     verify_disk_marker(&mut resumed).await?;
     let second_snapshot = resumed.pause().await?;
-    assert_memory_layer_matches_config(&second_snapshot).await?;
+    assert_memory_layer_is_raw(&second_snapshot).await?;
     resumed.stop().await?;
     let second_snapshot_dir = fs::canonicalize(second_snapshot.vm_state_path.parent().unwrap())?;
     let second_mem_lowers = lower_file_paths_from_image_config(
@@ -497,6 +641,41 @@ async fn assert_tcp_connect(
     Ok(())
 }
 
+async fn assert_curl(
+    sandbox: &mut FirecrackerSandbox,
+    url: &str,
+    should_succeed: bool,
+) -> Result<()> {
+    let output = sandbox
+        .run_command(
+            "curl",
+            &[
+                "--noproxy",
+                "*",
+                "-4",
+                "-sS",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "10",
+                "-o",
+                "/dev/null",
+                "--",
+                url,
+            ],
+        )
+        .await?;
+    assert_eq!(
+        output.exit_code == 0,
+        should_succeed,
+        "curl expectation failed for {url}; exit={}, stdout={}, stderr={}",
+        output.exit_code,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}
+
 async fn test_network(sandbox: &mut FirecrackerSandbox, after_resume: bool) -> Result<()> {
     let checks = [("tcp_ip", "8.8.8.8/53"), ("tcp_dns", "www.baidu.com/443")];
 
@@ -537,6 +716,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
     common::setup().await;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy = Some(SandboxNetworkPolicy::new(
+        true,
         BaseSandboxNetworkPolicy::Deny,
         SandboxNetworkEgressPolicy::new(Some(vec!["8.8.8.8".to_string()]), None)?,
     ));
@@ -549,6 +729,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Deny,
             SandboxNetworkEgressPolicy::new(Some(vec!["1.1.1.1".to_string()]), None)?,
         )))
@@ -559,6 +740,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Allow,
             SandboxNetworkEgressPolicy::new(
                 Some(vec!["8.8.8.8".to_string()]),
@@ -578,11 +760,45 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Allow,
             SandboxNetworkEgressPolicy::new(Some(vec!["10.0.0.0/8".to_string()]), None)?,
         )))
         .await?;
     assert_tcp_connect(&mut sandbox, "10.255.255.254/80", false).await?;
+
+    sandbox
+        .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["www.baidu.com".to_string()]),
+                Some(vec!["0.0.0.0/0".to_string()]),
+            )?,
+        )))
+        .await?;
+
+    assert_curl(&mut sandbox, "http://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", false).await?;
+
+    sandbox
+        .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["www.qq.com".to_string()]),
+                Some(vec!["0.0.0.0/0".to_string()]),
+            )?,
+        )))
+        .await?;
+
+    assert_curl(&mut sandbox, "https://www.baidu.com/", false).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
+
+    sandbox.update_network_policy(None).await?;
+    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
 
     sandbox.stop().await?;
     Ok(())

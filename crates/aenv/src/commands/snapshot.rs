@@ -21,6 +21,7 @@ pub struct Args {
 enum Sub {
     /// Create a persistent snapshot from a running sandbox
     Create {
+        #[arg(add = crate::commands::completion::add_running_sandbox_candidates())]
         sandbox_id: String,
         /// Snapshot name or alias. If omitted, the server returns the generated snapshot ID.
         #[arg(long)]

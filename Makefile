@@ -7,6 +7,9 @@ CARGO ?= cargo
 DOCKER ?= docker
 DOCKER_COMPOSE ?= docker compose
 DEPLOY_COMPOSE_FILE ?= deploy/docker-compose.yml
+# Guests need upstream DNS, not the host's loopback resolver stub.
+HOST_RESOLV_CONF ?= $(firstword $(wildcard /run/systemd/resolve/resolv.conf /etc/resolv.conf))
+export HOST_RESOLV_CONF
 APT_MIRROR_BASE ?=
 KUBECTL ?= kubectl
 K8S_NAMESPACE ?= agentenv-system
@@ -55,7 +58,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	fmt clippy \
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
-	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
+	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all test-buildkit test-buildkit-users \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
@@ -116,6 +119,7 @@ test: test-agent test-envd test-ublk
 
 test-unit:
 	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
+	$(CARGO) test -p aenv --bin aenv
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
@@ -123,6 +127,7 @@ test-unit:
 	$(CARGO) build -p agentenv --bin aenv-paused-recovery
 	AENV_PAUSED_RECOVERY_BINARY="$(DEBUG_PROFILE_DIR)/aenv-paused-recovery" \
 		bash scripts/tests/verify-paused-recovery-boundary.sh
+	bash scripts/tests/verify-install-buildctl.sh
 
 test-integration: test-agent-integration test-envd test-ublk
 
@@ -202,6 +207,12 @@ custom-extension-client:
 test-e2e:
 	$(MAKE) install-ublk PROFILE=debug
 	bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
+
+test-buildkit: build-aenv
+	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" python3 scripts/buildkit/test.py
+
+test-buildkit-users: build-aenv
+	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" python3 scripts/buildkit/test.py BuildKitTests.test_numeric_users
 
 test-e2e-compose:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=compose bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh

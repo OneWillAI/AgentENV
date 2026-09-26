@@ -10,13 +10,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox::CustomExtensionParams;
 use crate::virtualization::VirtualizationMode;
+use crate::volume::VolumeMode;
 use shell_util::shell_quote;
 
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
 use super::value::{SnapshotAlias, SnapshotId};
 use super::version::SnapshotRuntimeVersions;
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotVolume {
+    pub mount_path: String,
+    #[serde(default)]
+    pub mode: VolumeMode,
+    pub size_mb: u64,
+    pub layers: Vec<OverlaybdLayerRef>,
+}
 
 #[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
@@ -29,6 +40,7 @@ pub struct SnapshotPublishMetadata {
     pub runtime_versions: SnapshotRuntimeVersions,
     pub virtualization_mode: VirtualizationMode,
     pub image_configs: ImageConfigs,
+    pub volume_snapshots: Vec<SnapshotVolume>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Template launches inherit it unless overridden at create time.
     pub custom_extension_params: Option<CustomExtensionParams>,
@@ -54,6 +66,7 @@ impl SnapshotPublishMetadata {
             },
             virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
             image_configs: ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
             custom_extension_params: None,
         }
     }
@@ -268,6 +281,18 @@ impl CommandContext {
     }
 }
 
+impl From<crate::image::ImageBaseContext> for CommandContext {
+    fn from(base: crate::image::ImageBaseContext) -> Self {
+        Self::from_env_and_workdir(base.env_vars, base.workdir)
+            .with_user(base.user)
+            .with_exposed_ports(base.exposed_ports)
+            .with_entrypoint(base.entrypoint)
+            .with_cmd(base.cmd)
+            .with_volumes(base.volumes)
+            .with_labels(base.labels)
+    }
+}
+
 fn normalize_workdir(workdir: String) -> String {
     if workdir.trim().is_empty() {
         "/".to_string()
@@ -281,6 +306,18 @@ pub struct StartupCommand {
     pub start_cmd: String,
     pub ready_cmd: String,
     pub context: CommandContext,
+    /// Absent for legacy templates, which use a Bash login shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+}
+
+impl StartupCommand {
+    pub(crate) fn shell_command(&self) -> (&str, &str) {
+        match self.shell.as_deref() {
+            Some(shell) => (shell, "-c"),
+            None => ("/bin/bash", "-lc"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -295,6 +332,10 @@ pub struct CommittedSnapshot {
     pub image_configs: ImageConfigs,
     pub rootfs_layers: Vec<OverlaybdLayerRef>,
     pub attached_drives: Vec<CommittedAttachedDrive>,
+    /// Logical volume snapshots captured with the sandbox, without local
+    /// snapshot artifact paths.
+    #[serde(default)]
+    pub volume_snapshots: Vec<SnapshotVolume>,
     /// Managed overlaybd layers for the memory snapshot image, ordered bottom-up.
     pub memory_layers: Vec<ManagedLayer>,
     #[serde(default)]
@@ -302,6 +343,11 @@ pub struct CommittedSnapshot {
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Optional startup memory pack descriptor. Present only when the pack
+    /// was recorded AND uploaded successfully; absent on older snapshots and
+    /// on POSIX-backend snapshots (pack acceleration is OSS-only for now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_startup: Option<crate::snapshot::MemoryStartupPackInfo>,
 }
 
 #[cfg(test)]
@@ -322,9 +368,11 @@ impl CommittedSnapshot {
             image_configs: ImageConfigs::new(),
             rootfs_layers: Vec::new(),
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            memory_startup: None,
         }
     }
 }
@@ -479,14 +527,14 @@ fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
 /// Runtime-ready snapshot with node-local artifact paths.
 pub struct RunnableSnapshot {
     record: SnapshotRecord,
-    manifest: FirecrackerSnapshotManifest,
+    manifest: SandboxSnapshotManifest,
     _lease: Arc<dyn RuntimeArtifactLease>,
 }
 
 impl RunnableSnapshot {
     pub(crate) fn new(
         record: SnapshotRecord,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
         lease: Arc<dyn RuntimeArtifactLease>,
     ) -> Self {
         Self {
@@ -518,7 +566,7 @@ impl RunnableSnapshot {
             .collect()
     }
 
-    pub fn manifest(&self) -> &FirecrackerSnapshotManifest {
+    pub fn manifest(&self) -> &SandboxSnapshotManifest {
         &self.manifest
     }
 
@@ -560,9 +608,19 @@ impl RunnableSnapshot {
 
         Self {
             record,
-            manifest: FirecrackerSnapshotManifest::for_test(0, &extra_drives),
+            manifest: SandboxSnapshotManifest::for_test(0, &extra_drives),
             _lease: default_runtime_artifact_lease(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_legacy_manifest(
+        record: SnapshotRecord,
+        attached_drives: Vec<ResolvedAttachedDrive>,
+    ) -> Self {
+        let mut snapshot = Self::from_test_manifest(record, attached_drives);
+        snapshot.manifest.volume_drive_slots = 0;
+        snapshot
     }
 }
 
@@ -577,9 +635,12 @@ impl fmt::Debug for RunnableSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use crate::volume::VolumeMode;
+
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        PersistedDiskImagePublication, SnapshotRecord, TemplateBuildErrorReason,
+        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotVolume,
+        TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -613,6 +674,59 @@ mod tests {
             .runtime_versions
             .tools_drive_version
             .is_empty());
+    }
+
+    #[test]
+    fn snapshot_volume_is_logical() {
+        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        record
+            .committed
+            .as_mut()
+            .unwrap()
+            .volume_snapshots
+            .push(SnapshotVolume {
+                mount_path: "/mnt/data".to_string(),
+                mode: VolumeMode::ReadOnly,
+                size_mb: 1024,
+                layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                    digest: "sha256:abc".to_string(),
+                    size: 123,
+                    uuid: None,
+                })],
+            });
+
+        let value = serde_json::to_value(&record).expect("serialize snapshot record");
+        assert_eq!(
+            value["committed"]["volume_snapshots"][0]["layers"][0]["Managed"]["digest"],
+            "sha256:abc"
+        );
+        assert_eq!(
+            value["committed"]["volume_snapshots"][0]["mode"],
+            "ReadOnly"
+        );
+        assert!(!value.to_string().contains("snapshot_dir"));
+        let decoded: SnapshotRecord =
+            serde_json::from_value(value.clone()).expect("deserialize record");
+        assert_eq!(
+            decoded.committed.as_ref().unwrap().volume_snapshots[0].mount_path,
+            "/mnt/data"
+        );
+        assert_eq!(
+            decoded.committed.unwrap().volume_snapshots[0].mode,
+            VolumeMode::ReadOnly
+        );
+
+        let mut legacy = value;
+        legacy["committed"]["volume_snapshots"][0]
+            .as_object_mut()
+            .expect("volume snapshot must be an object")
+            .remove("mode");
+        let decoded: SnapshotRecord =
+            serde_json::from_value(legacy).expect("deserialize legacy record");
+        assert_eq!(
+            decoded.committed.unwrap().volume_snapshots[0].mode,
+            VolumeMode::Exclusive
+        );
     }
 
     #[test]
@@ -715,6 +829,48 @@ mod tests {
     #[test]
     fn effective_start_cmd_absent_returns_none() {
         assert_eq!(CommandContext::default().effective_start_cmd(), None);
+    }
+
+    #[test]
+    fn startup_shell_is_backward_compatible() {
+        let legacy = serde_json::json!({"start_cmd": "true", "ready_cmd": "true", "context": CommandContext::default()});
+        let mut startup: super::StartupCommand = serde_json::from_value(legacy).unwrap();
+        assert_eq!(startup.shell_command(), ("/bin/bash", "-lc"));
+        assert!(serde_json::to_value(&startup)
+            .unwrap()
+            .get("shell")
+            .is_none());
+        startup.shell = Some("/bin/sh".to_owned());
+        let restored: super::StartupCommand =
+            serde_json::from_value(serde_json::to_value(&startup).unwrap()).unwrap();
+        assert_eq!(restored.shell_command(), ("/bin/sh", "-c"));
+    }
+
+    #[test]
+    fn legacy_snapshot_startup_roundtrips_without_format_changes() {
+        let mut legacy =
+            serde_json::to_value(SnapshotRecord::mock_ready(CommittedSnapshot::mock())).unwrap();
+        legacy["committed"]["startup"] = serde_json::json!({
+            "start_cmd": "[[ -n $HOME ]] && exec /app/server",
+            "ready_cmd": "test -f /app/ready",
+            "context": CommandContext::new(
+                HashMap::from([("HOME".into(), "/app".into())]),
+                "/app",
+            ),
+        });
+        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            record
+                .committed
+                .as_ref()
+                .unwrap()
+                .startup
+                .as_ref()
+                .unwrap()
+                .shell_command(),
+            ("/bin/bash", "-lc"),
+        );
+        assert_eq!(serde_json::to_value(record).unwrap(), legacy);
     }
 
     #[test]

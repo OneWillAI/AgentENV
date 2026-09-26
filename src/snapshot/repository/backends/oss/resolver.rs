@@ -197,13 +197,26 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let cache_lease: Arc<dyn RuntimeArtifactLease> =
             Arc::new(CacheArtifactLease { _handles: handles });
 
-        let runtime_manifest = hydrate_runtime_manifest(
+        let mut runtime_manifest = hydrate_runtime_manifest(
             committed_manifest,
             vm_state_path,
             mem_image_config_path,
             rootfs_image_config_path,
             &attached_drives,
         )?;
+
+        // Runtime-only startup pack reference: v2 packs only, and only when
+        // consumption is enabled on this node. Everything else resumes
+        // on-demand as before.
+        runtime_manifest.memory_startup_pack =
+            crate::snapshot::startup_pack::resolve_startup_pack_ref(
+                committed.memory_startup.as_ref(),
+                crate::cfg::ConfigManager::global_config()
+                    .snapshot
+                    .memory_startup_pack
+                    .consume_enabled,
+                || self.client.startup_pack_url(&id),
+            );
 
         let runnable = RunnableSnapshot::new((*snapshot).clone(), runtime_manifest, cache_lease);
         debug!(snapshot_id = %id, "resolved oss snapshot to local runnable paths");
@@ -383,7 +396,7 @@ impl OssRuntimeResolver {
         &self,
         layout: &OssSnapshotArtifactLayout<'_>,
         snapshot_id: &SnapshotId,
-    ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
+    ) -> RepositoryResult<crate::sandbox::SandboxSnapshotManifest> {
         let p2p_key =
             p2p::fixed_artifact_key(snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
         if let Some(transport) = self.p2p_transport.as_ref() {

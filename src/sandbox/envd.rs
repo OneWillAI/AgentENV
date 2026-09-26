@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, LazyLock,
+};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
@@ -15,7 +18,9 @@ use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
 use envd::reqwest::Client;
 
-const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+mod user;
+
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 // Bootstrap addresses can be reused across sandbox runtime generations. Do not
 // retain connections that may belong to the previous VM assigned the same IP.
@@ -31,9 +36,16 @@ pub(crate) struct EnvdInstance {
     config: Configuration,
     grpc_address: String,
     access_token: Option<EnvdAccessToken>,
+    live: Arc<AtomicBool>,
 }
 
 impl EnvdInstance {
+    pub(crate) async fn metrics(&self) -> Result<super::SandboxMetric> {
+        self.ensure_live()?;
+        let raw = default_api::metrics_get(&self.config).await?;
+        raw.try_into()
+    }
+
     pub(crate) fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
         let grpc_address = base_path.clone();
         Self {
@@ -53,12 +65,26 @@ impl EnvdInstance {
             },
             grpc_address,
             access_token,
+            live: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    fn ensure_live(&self) -> Result<()> {
+        if self.live.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(anyhow!("sandbox runtime is no longer active"))
+        }
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.live.store(false, Ordering::Release);
     }
 
     /// Create a new gRPC `ProcessClient` connected to the envd daemon.
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn process_client(&self) -> Result<ProcessClient> {
+        self.ensure_live()?;
         trace!(grpc_address = %self.grpc_address, "connecting envd process client");
         let client = ProcessClient::connect(
             &self.grpc_address,
@@ -73,6 +99,7 @@ impl EnvdInstance {
     /// Create a new gRPC `FilesystemClient` connected to the envd daemon.
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {
+        self.ensure_live()?;
         trace!(grpc_address = %self.grpc_address, "connecting envd filesystem client");
         let client = FilesystemClient::connect(
             &self.grpc_address,
@@ -153,6 +180,30 @@ impl EnvdInstance {
         default_workdir: Option<String>,
         default_user: Option<String>,
     ) -> Result<()> {
+        let default_user = match default_user {
+            Some(user) if user::needs_resolution(&user) => {
+                // Authenticate this runtime first, including after restore.
+                // Account setup runs before the sandbox becomes available.
+                self.post_init(None, Some("/".to_owned()), Some("root".to_owned()))
+                    .await?;
+                Some(
+                    tokio::time::timeout(Duration::from_secs(30), self.resolve_default_user(&user))
+                        .await
+                        .context("timed out resolving Dockerfile USER")??,
+                )
+            }
+            user => user,
+        };
+        self.post_init(env_vars, default_workdir, default_user)
+            .await
+    }
+
+    async fn post_init(
+        &self,
+        env_vars: Option<HashMap<String, String>>,
+        default_workdir: Option<String>,
+        default_user: Option<String>,
+    ) -> Result<()> {
         debug!(has_env_vars = env_vars.is_some(), "initializing envd");
         let now = chrono::Utc::now().fixed_offset();
         let init_post_request = InitPostRequest {
@@ -176,9 +227,9 @@ impl EnvdInstance {
 mod tests {
     use std::time::Instant;
 
-    use axum::extract::State;
+    use axum::extract::{Query, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::Value;
     use tokio::net::TcpListener;
@@ -193,6 +244,36 @@ mod tests {
     ) -> StatusCode {
         sender.send((headers, body)).await.unwrap();
         StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn sandbox_metrics_uses_guest_auth_and_rejects_invalidated_runtime() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("metrics-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let expected_token = token.clone();
+        let app = Router::new().route(
+            "/metrics",
+            get(move |headers: HeaderMap| async move {
+                assert_eq!(headers["x-access-token"], expected_token.expose());
+                Json(serde_json::json!({
+                    "ts": 1700000000, "cpu_count": 2, "cpu_used_pct": 25.0,
+                    "mem_used": 4000000000i64, "mem_total": 8000000000i64,
+                    "mem_cache": 3000000000i64, "disk_used": 9000000000i64,
+                    "disk_total": 20000000000i64
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token));
+        let sample = envd.metrics().await?;
+        assert_eq!(sample.mem_total, 8000000000);
+        assert_eq!(sample.disk_total, 20000000000);
+        envd.invalidate();
+        assert!(envd.metrics().await.is_err());
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]
@@ -213,6 +294,42 @@ mod tests {
         let (headers, body) = receiver.recv().await.expect("captured init request");
         assert_eq!(headers["x-access-token"], token.expose());
         assert_eq!(body["accessToken"], token.expose());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_resolves_numeric_default_user_and_preserves_image_environment() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (sender, mut receiver) = mpsc::channel(2);
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("numeric-user-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let file_token = token.clone();
+        let app = Router::new()
+            .route("/init", post(capture_init_request))
+            .route("/files", get(move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(headers["x-access-token"], file_token.expose());
+                assert_eq!(query["path"], "/etc/passwd");
+                assert_eq!(query["username"], "root");
+                b"root:x:0:0:r\xffot:/root:/bin/sh\nother:x:1000:1000:\xff:/home/other:/bin/sh\n".to_vec()
+            }))
+            .with_state(sender);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token.clone()));
+        envd.init(
+            Some(HashMap::from([("HOME".to_owned(), "/app".to_owned())])),
+            Some("/work".to_owned()),
+            Some("0".to_owned()),
+        )
+        .await?;
+        let (headers, bootstrap) = receiver.recv().await.unwrap();
+        assert_eq!(headers["x-access-token"], token.expose());
+        assert_eq!(bootstrap["accessToken"], token.expose());
+        let (_, body) = receiver.recv().await.unwrap();
+        assert_eq!(body["defaultUser"], "root");
+        assert_eq!(body["defaultWorkdir"], "/work");
+        assert_eq!(body["envVars"]["HOME"], "/app");
         server.abort();
         Ok(())
     }
@@ -240,5 +357,15 @@ mod tests {
         assert!(error.to_string().contains("timed out waiting for envd"));
         assert!(started.elapsed() < Duration::from_millis(500));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalidated_runtime_rejects_new_envd_clients() {
+        let envd = EnvdInstance::new("http://127.0.0.1:1".to_owned(), None);
+        let stale = envd.clone();
+        envd.invalidate();
+
+        assert!(stale.process_client().await.is_err());
+        assert!(stale.filesystem_client().await.is_err());
     }
 }

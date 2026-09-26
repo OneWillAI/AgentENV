@@ -9,13 +9,13 @@ mod config;
 mod connector;
 mod factory;
 mod instance;
-mod manifest;
 mod mmds;
 mod overlaybd_snapshot;
 mod pool;
 mod process_vm_reader;
 mod sandbox;
 mod socket;
+mod startup_pack;
 
 pub(crate) use cold_boot::recovery_checkpoint_references;
 pub use config::{
@@ -24,6 +24,6 @@ pub use config::{
 };
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
-pub use manifest::FirecrackerSnapshotManifest;
 pub use pool::FirecrackerPool;
-pub use sandbox::{FirecrackerCapturedSnapshot, FirecrackerPausedState, FirecrackerSandbox};
+pub use sandbox::{FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox};
+pub(crate) use startup_pack::record_startup_pack;

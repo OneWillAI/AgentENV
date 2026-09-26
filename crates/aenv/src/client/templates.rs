@@ -2,6 +2,23 @@ use super::{handle_status, Client};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Build-status values from the API's `TemplateBuildStatus` contract.
+///
+/// Kept next to the client so the completion providers and the build watcher
+/// agree on the strings. A status outside this list is unknown: the watcher
+/// keeps polling it rather than treating the build as finished, and completion
+/// eligibility follows the same rule.
+pub mod build_status {
+    /// The build succeeded; the template can be started.
+    pub const READY: &str = "ready";
+    /// The build failed; the template cannot be started.
+    pub const ERROR: &str = "error";
+    /// The build is queued but has not started running yet.
+    pub const WAITING: &str = "waiting";
+    /// The build is running.
+    pub const BUILDING: &str = "building";
+}
+
 #[derive(Debug, Serialize)]
 pub struct CreateTemplateV3 {
     pub name: String,

@@ -5,18 +5,21 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::task;
 
-use super::super::shared_runtime_cache_root;
+use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
+use crate::snapshot::repository::{
+    RepositoryError, RepositoryResult, SnapshotListFilter, VolumeRecordPage,
+};
 use crate::snapshot::types::{
     CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
+use crate::volume::VolumeRecord;
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -137,8 +140,10 @@ impl PosixFsSnapshotRepository {
             custom_extension_params: metadata.custom_extension_params.clone(),
             rootfs_layers: built.rootfs_layers,
             attached_drives: built.attached_drives,
+            volume_snapshots: metadata.volume_snapshots.clone(),
             memory_layers: built.memory_layers,
             disk_publications: Vec::new(),
+            memory_startup: None,
         }
     }
 
@@ -146,10 +151,19 @@ impl PosixFsSnapshotRepository {
         self.catalog_store.create(record)
     }
 
+    async fn run_catalog<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PosixFsCatalogStore) -> RepositoryResult<T> + Send + 'static,
+    {
+        let store = Arc::clone(&self.catalog_store);
+        run_repository_blocking(operation, move || work(&store)).await
+    }
+
     fn publish_sync(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
         let mut drive_ids = HashSet::new();
         for drive in &manifest.attached_drives {
@@ -241,7 +255,8 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
+        _recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
         let repository = self.clone();
         run_repository_blocking("publish snapshot", move || {
@@ -300,6 +315,143 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         })
         .await
     }
+
+    async fn get_build_cache_state(
+        &self,
+    ) -> RepositoryResult<crate::snapshot::repository::BuildCacheState> {
+        self.run_catalog("read build cache head", |store| {
+            store.get_build_cache_state()
+        })
+        .await
+    }
+
+    async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("replace build cache head", move |store| {
+            store.replace_build_cache_head(&volume_id)
+        })
+        .await
+    }
+
+    async fn forget_retired_build_cache(&self, volume_id: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("retire build cache seed", move |store| {
+            store.forget_retired_build_cache(&volume_id)
+        })
+        .await
+    }
+
+    async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        let reference = reference.to_owned();
+        self.run_catalog("get volume", move |store| store.get_volume(&reference))
+            .await
+    }
+
+    async fn list_volumes_page(
+        &self,
+        after_volume_id: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        let after_volume_id = after_volume_id.map(str::to_owned);
+        self.run_catalog("list volumes", move |store| {
+            store.list_volumes_page(after_volume_id.as_deref(), limit)
+        })
+        .await
+    }
+
+    async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        self.run_catalog("create volume", move |store| store.create_volume(&record))
+            .await
+    }
+
+    async fn put_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        let mut record = record;
+        record.backing_image_config = None;
+        self.run_catalog("put volume", move |store| store.put_volume(&record))
+            .await
+    }
+
+    async fn publish_volume_backing(
+        &self,
+        _volume_id: &str,
+        image_config_path: &std::path::Path,
+    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
+        let repository = self.clone();
+        let image_config_path = image_config_path.to_path_buf();
+        run_repository_blocking("publish volume backing", move || {
+            repository
+                .artifact_store
+                .publish_volume_backing(&image_config_path)
+        })
+        .await
+    }
+
+    async fn materialize_volume_backing(
+        &self,
+        _volume_id: &str,
+        layers: &[crate::snapshot::OverlaybdLayerRef],
+        destination: &std::path::Path,
+    ) -> RepositoryResult<std::path::PathBuf> {
+        materialize_volume_image_config(layers, destination, |layer| {
+            overlaybd::config::LayerConfig {
+                file: self
+                    .artifact_store
+                    .managed_layer_path(&layer.digest)
+                    .to_string_lossy()
+                    .into_owned(),
+                digest: layer.digest.clone(),
+                size: layer.size,
+                uuid: layer.uuid.clone().unwrap_or_default(),
+                ..Default::default()
+            }
+        })
+        .await
+    }
+
+    async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("delete volume", move |store| {
+            store.delete_volume(&volume_id)
+        })
+        .await
+    }
+
+    async fn reserve_volume(
+        &self,
+        volume_id: &str,
+        owner: &str,
+    ) -> RepositoryResult<Option<String>> {
+        let volume_id = volume_id.to_owned();
+        let owner = owner.to_owned();
+        self.run_catalog("reserve volume", move |store| {
+            store.reserve_volume(&volume_id, &owner)
+        })
+        .await
+    }
+
+    async fn reserve_read_only_volume(&self, volume_id: &str, owner: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        let owner = owner.to_owned();
+        self.run_catalog("reserve read-only volume", move |store| {
+            store.reserve_read_only_volume(&volume_id, &owner)
+        })
+        .await
+    }
+
+    async fn replace_volume_owner_for(
+        &self,
+        volume_id: &str,
+        from: &str,
+        to: Option<&str>,
+    ) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        let from = from.to_owned();
+        let to = to.map(str::to_owned);
+        self.run_catalog("replace volume owner", move |store| {
+            store.replace_volume_owner_for(&volume_id, &from, to.as_deref())
+        })
+        .await
+    }
 }
 
 async fn run_repository_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
@@ -327,7 +479,7 @@ mod tests {
     use super::super::runtime::PosixFsRuntimeResolver;
     use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsSnapshotRepository};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
-    use crate::sandbox::{ExtraDrive, FirecrackerSnapshotManifest};
+    use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::repository::{
@@ -403,7 +555,7 @@ mod tests {
         )
     }
 
-    fn seed_built_snapshot(root: &Path) -> FirecrackerSnapshotManifest {
+    fn seed_built_snapshot(root: &Path) -> SandboxSnapshotManifest {
         let local_root = root.join("local").join(uuid::Uuid::now_v7().to_string());
         let (_, _, manifest) =
             write_mock_built_artifacts(&local_root).expect("mock built artifacts should write");
@@ -420,7 +572,8 @@ mod tests {
             .join("snapshots")
             .join(snapshot_id.to_string());
         fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
-        let manifest = FirecrackerSnapshotManifest::new(
+        let manifest = SandboxSnapshotManifest::new(
+            crate::sandbox::FIRECRACKER_BACKEND,
             snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
             snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
             memory_virtual_size,
@@ -446,7 +599,7 @@ mod tests {
         let local_artifacts = seed_built_snapshot(tempdir.path());
         let metadata = sample_metadata(snapshot_id, Some("mvp"));
         let stored = repository
-            .publish(metadata, local_artifacts)
+            .publish(metadata, local_artifacts, None)
             .await
             .expect("publish should work");
 
@@ -484,7 +637,7 @@ mod tests {
         let local_artifacts = seed_built_snapshot(tempdir.path());
         let first_metadata = sample_metadata(first_id.clone(), Some("conflict"));
         repository
-            .publish(first_metadata, local_artifacts)
+            .publish(first_metadata, local_artifacts, None)
             .await
             .expect("first publish should work");
 
@@ -494,6 +647,7 @@ mod tests {
             .publish(
                 sample_metadata(second_id.clone(), Some("conflict")),
                 local_artifacts,
+                None,
             )
             .await
             .expect_err("second publish should fail");
@@ -517,7 +671,7 @@ mod tests {
         let metadata = sample_metadata(snapshot_id.clone(), Some("cleanup"));
 
         repository
-            .publish(metadata, local_artifacts)
+            .publish(metadata, local_artifacts, None)
             .await
             .expect("publish should work");
 
@@ -594,7 +748,7 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir");
         let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
-        let manifest = FirecrackerSnapshotManifest::for_test(
+        let manifest = SandboxSnapshotManifest::for_test(
             32768,
             &[
                 ExtraDrive::Overlaybd {
@@ -604,6 +758,8 @@ mod tests {
                     mount_path: ExtraDrive::default_mount_path("data"),
                     virtual_size: Some(32768),
                     sub_path: None,
+                    snapshot_output_dir: None,
+                    volume: false,
                 },
                 ExtraDrive::Overlaybd {
                     drive_id: "data".to_string(),
@@ -612,11 +768,17 @@ mod tests {
                     mount_path: ExtraDrive::default_mount_path("data"),
                     virtual_size: Some(32768),
                     sub_path: None,
+                    snapshot_output_dir: None,
+                    volume: false,
                 },
             ],
         );
         let err = repository
-            .publish(sample_metadata(snapshot_id, Some("dup-drive")), manifest)
+            .publish(
+                sample_metadata(snapshot_id, Some("dup-drive")),
+                manifest,
+                None,
+            )
             .await
             .expect_err("duplicate attached drive ids should be rejected");
 
@@ -648,9 +810,11 @@ mod tests {
                 uuid: None,
             })],
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            memory_startup: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));
 
@@ -705,9 +869,11 @@ mod tests {
                 uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
             })],
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            memory_startup: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));
 

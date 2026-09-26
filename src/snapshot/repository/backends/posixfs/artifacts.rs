@@ -9,7 +9,7 @@ use tempfile::NamedTempFile;
 use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::digest::{self, FileDigest};
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::{
     CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
     SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
@@ -25,8 +25,19 @@ impl PosixFsArtifactStore {
         Self { root }
     }
 
+    pub(crate) fn managed_layer_path(&self, digest: &str) -> PathBuf {
+        PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, digest)
+    }
+
     fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
+    }
+
+    pub(crate) fn publish_volume_backing(
+        &self,
+        image_config_path: &Path,
+    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+        self.derive_rootfs_layers(image_config_path, true)
     }
 
     /// Imports manager-owned local build artifacts into committed repository storage.
@@ -44,7 +55,7 @@ impl PosixFsArtifactStore {
     pub(crate) fn import_built_artifacts(
         &self,
         snapshot_id: &SnapshotId,
-        manifest: &FirecrackerSnapshotManifest,
+        manifest: &SandboxSnapshotManifest,
     ) -> RepositoryResult<CollectedBuiltArtifacts> {
         let committed_layout = self.committed_layout(snapshot_id);
 
@@ -65,7 +76,7 @@ impl PosixFsArtifactStore {
                 // The committed attached-drive manifest stores logical layers only.
                 // The build-time image config is used here as an input for deriving
                 // those layers, but is not copied into the committed repository.
-                let rootfs_layers = self.derive_rootfs_layers(&drive.image_config_path)?;
+                let rootfs_layers = self.derive_rootfs_layers(&drive.image_config_path, false)?;
                 Ok(CommittedAttachedDrive::Overlaybd {
                     drive_id: drive.drive_id.clone(),
                     layers: rootfs_layers,
@@ -83,7 +94,7 @@ impl PosixFsArtifactStore {
             })
             .collect::<RepositoryResult<Vec<_>>>()?;
 
-        let rootfs_layers = self.derive_rootfs_layers(&manifest.rootfs.image_config_path)?;
+        let rootfs_layers = self.derive_rootfs_layers(&manifest.rootfs.image_config_path, false)?;
 
         Ok(CollectedBuiltArtifacts {
             rootfs_layers,
@@ -95,7 +106,7 @@ impl PosixFsArtifactStore {
     fn persist_firecracker_manifest(
         &self,
         destination: PathBuf,
-        manifest: &crate::sandbox::FirecrackerSnapshotManifest,
+        manifest: &crate::sandbox::SandboxSnapshotManifest,
     ) -> RepositoryResult<()> {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -396,6 +407,7 @@ impl PosixFsArtifactStore {
     fn derive_rootfs_layers(
         &self,
         image_config_path: &Path,
+        allow_descriptorless: bool,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let image_config = load_overlaybd_image_config(image_config_path).map_err(|error| {
             RepositoryError::backend(
@@ -423,9 +435,11 @@ impl PosixFsArtifactStore {
                             )
                             .map(OverlaybdLayerRef::Managed);
                     }
-                    if crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
-                        layer_path,
-                    ) {
+                    if allow_descriptorless
+                        || crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
+                            layer_path,
+                        )
+                    {
                         return self
                             .import_descriptorless_rootfs_layer(layer_path)
                             .map(OverlaybdLayerRef::Managed);
@@ -710,7 +724,6 @@ mod tests {
 
     use overlaybd::backend::local::LocalFile;
     use overlaybd::index_file::{CommitArgs, LSMTFile};
-    use overlaybd::transient_io_ring::shared_transient_io_ring;
     use overlaybd::virtual_file::VirtualFile;
     use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
     use serde_json::json;
@@ -764,7 +777,9 @@ mod tests {
         )
         .expect("write image config");
 
-        let layers = store.derive_rootfs_layers(&image).expect("derive layers");
+        let layers = store
+            .derive_rootfs_layers(&image, false)
+            .expect("derive layers");
 
         assert_eq!(
             layers,
@@ -830,6 +845,8 @@ mod tests {
                 mount_path: crate::sandbox::ExtraDrive::default_mount_path("data"),
                 virtual_size: Some(4096),
                 sub_path: None,
+                snapshot_output_dir: None,
+                volume: false,
             }])
             .expect("attached drive manifest should include virtual size");
 
@@ -1004,19 +1021,14 @@ mod tests {
         );
     }
 
-    /// Write a real ZFile-compressed sealed LSMT layer, mirroring the memory
-    /// snapshot output when `[memory_snapshot].compression_enabled = true`.
+    /// Write a real ZFile-compressed sealed LSMT layer, mirroring a compressed
+    /// memory lower as found in repositories published while capture-time
+    /// compression existed (or produced by publish-time compression).
     async fn write_zfile_lsmt_layer(path: &std::path::Path) {
-        let io_ring = shared_transient_io_ring();
-        let data = Arc::new(
-            LocalFile::new(path.with_extension("data"), io_ring.clone())
-                .await
-                .expect("create layer data file"),
-        );
+        let data =
+            Arc::new(LocalFile::new(path.with_extension("data")).expect("create layer data file"));
         let index = Arc::new(
-            LocalFile::new(path.with_extension("index"), io_ring.clone())
-                .await
-                .expect("create layer index file"),
+            LocalFile::new(path.with_extension("index")).expect("create layer index file"),
         );
         let layer = LSMTFile::create(data, Some(index), 2 * 4096, false)
             .await
@@ -1029,11 +1041,7 @@ mod tests {
             .write_at(4096, &[0xA5; 4096])
             .await
             .expect("write layer page 1");
-        let output = Arc::new(
-            LocalFile::new(path, io_ring)
-                .await
-                .expect("create zfile layer output"),
-        );
+        let output = Arc::new(LocalFile::new(path).expect("create zfile layer output"));
         let compress_args = CompressArgs::new(CompressOptions::new(
             CompressOptions::LZ4,
             CompressOptions::DEFAULT_BLOCK_SIZE,
@@ -1101,11 +1109,7 @@ mod tests {
                 .len()
         );
         // The stored bytes still probe as a ZFile with the source algorithm.
-        let managed_file = Arc::new(
-            LocalFile::open_ro(&managed_path, shared_transient_io_ring())
-                .await
-                .expect("open managed layer"),
-        );
+        let managed_file = Arc::new(LocalFile::open_ro(&managed_path).expect("open managed layer"));
         assert_eq!(
             is_zfile(managed_file).await.expect("probe managed layer"),
             1

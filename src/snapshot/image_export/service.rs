@@ -75,6 +75,7 @@ impl SnapshotImageService {
                         config.backend.oss.as_ref().context(
                             "backend.oss config is required when repository_backend = oss",
                         )?;
+                    let publish_compression = &config.snapshot.publish_compression;
                     let policy = if config.snapshot.image_publish.enabled {
                         SnapshotImageStoragePolicy::SourceRegistry
                     } else {
@@ -87,10 +88,12 @@ impl SnapshotImageService {
                         config.region().to_string(),
                         config.prefix().to_string(),
                         config.credential_source(),
+                        config.addressing_style(),
                     )?);
                     let repository = Arc::new(oss::OssSnapshotRepository::new(
                         Arc::clone(&client),
                         config.snapshot_image_storage(),
+                        publish_compression,
                     ));
                     (repository, ManagedLayerLocator::Oss { client })
                 }

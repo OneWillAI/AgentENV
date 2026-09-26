@@ -6,6 +6,8 @@ pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
+pub mod manifest;
+mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
@@ -28,18 +30,25 @@ pub use backend::{
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use extra_drive::{
-    normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
-    ExtraDrive,
+    normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
+    validate_sub_path, ExtraDrive,
 };
+pub(crate) use firecracker::record_startup_pack;
 pub(crate) use firecracker::recovery_checkpoint_references;
 pub use firecracker::{
-    FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
+    FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
+    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
+pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
-pub use network::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
+pub use network::{
+    BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    ALL_INTERNET_TRAFFIC_CIDR,
+};
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
+pub(crate) use ublk::{compact_layers, OverlaybdCompactOutput};
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]
@@ -69,6 +78,11 @@ pub struct SandboxLaunchConfig {
     /// The sandbox layer does not interpret these; they are passed through
     /// as-is to the VM via the Firecracker MMDS interface.
     pub extra_mmds: serde_json::Map<String, serde_json::Value>,
+    /// Additional drives supplied for this launch, such as persistent volume mounts.
+    pub extra_drives: Vec<ExtraDrive>,
+    /// Whether `extra_drives` already occupy reserved slots in the source
+    /// Firecracker state and can be bound before snapshot load.
+    pub extra_drives_in_snapshot: bool,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Takes precedence over any value persisted in the source snapshot.
     pub custom_extension_params: Option<CustomExtensionParams>,
@@ -85,6 +99,8 @@ impl SandboxLaunchConfig {
             env_vars: None,
             network: None,
             extra_mmds: serde_json::Map::new(),
+            extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             custom_extension_params: None,
             envd_access_token: None,
         }

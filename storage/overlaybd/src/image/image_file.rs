@@ -5,7 +5,6 @@ use crate::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, Upper
 use crate::image::helper::prepare_runtime_upper;
 use crate::image::image_service::CacheDownloadRequest;
 use crate::image::image_service::ImageService;
-use crate::io::transient_io_ring::shared_transient_io_ring;
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
@@ -22,7 +21,6 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use storage_util::io_ring::IoRingHandle;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -99,6 +97,23 @@ impl fmt::Debug for ImageFileBase {
             Self::ReadWrite(_) => f.write_str("ImageFileBase::ReadWrite(..)"),
         }
     }
+}
+
+/// Refuse an upper that cannot be sealed, naming the `operation` the user asked for.
+///
+/// Which files have to be present is decided by the mode: a log-structured or hybrid
+/// upper keeps its mappings in a separate index, and sealing one without that index
+/// would produce a layer that owns nothing. Sparse carries its index inside the data
+/// file, so the data path is all it needs.
+fn ensure_sealable_upper(upper: &UpperConfig, operation: &str) -> Result<()> {
+    let needs_index = matches!(
+        upper.writable_mode(),
+        UpperMode::LogStructured | UpperMode::HybridLogStructured
+    );
+    if upper.data.is_empty() || (needs_index && upper.index.is_empty()) {
+        bail!("{operation} requires a writable upper layer");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -204,9 +219,8 @@ impl ImageFile {
             .base
             .writable()
             .context("snapshot requires a writable upper")?;
-        let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_rw(temporary.path(), false, shared_transient_io_ring()).await?,
-        );
+        let output_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_rw(temporary.path(), false)?);
         current
             .export_upper_as_sealed(CommitArgs::new(output_file))
             .await?;
@@ -219,6 +233,64 @@ impl ImageFile {
         Ok(None)
     }
 
+    /// Seal the writable upper and move the finished layer to `output_layer_path`.
+    ///
+    /// Named after [`LSMTFile::close_seal`] and terminal in the same way: **the image
+    /// must not be used after this returns.** Its upper is sealed, so every write
+    /// answers "File is sealed.", and the data file no longer exists at the path the
+    /// config still names. Nothing here tries to leave a recoverable state behind,
+    /// because there is no state worth recovering to — the caller asked for this
+    /// upper to become a layer.
+    ///
+    /// [`Self::create_snapshot_and_restack`] is the same seal followed by stacking a
+    /// fresh upper on the result, for a caller that has to keep serving.
+    ///
+    /// The move is a plain rename, so **an existing file at `output_layer_path` is
+    /// replaced**. Whoever chooses that path decides whether something being there
+    /// already means a previous attempt left a layer worth keeping.
+    pub async fn close_seal(&self, output_layer_path: &Path) -> Result<Option<LayerDescriptor>> {
+        // Exclusive rather than shared, unlike `export_upper_as_sealed`: this one
+        // modifies the upper it is reading, so no I/O may be in flight beside it.
+        let state = self.state.write().await;
+        ensure_sealable_upper(&state.config.upper, "close_seal")?;
+        let upper_data_path = Path::new(&state.config.upper.data);
+        let current = state
+            .base
+            .writable()
+            .context("close_seal requires a writable upper layer")?;
+
+        // Before the seal, so that an output path that cannot exist is refused while
+        // the upper is still intact.
+        if let Some(output_dir) = output_layer_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(output_dir)
+                .await
+                .with_context(|| {
+                    format!("create the layer's directory {}", output_dir.display())
+                })?;
+        }
+
+        // The seal writes the compact index and trailer through the upper's open
+        // handle — `LSMTFile::close_seal` takes no path — so the rename comes last,
+        // which is what leaves a failed seal's data file where it was.
+        let descriptor = current
+            .close_seal()
+            .await
+            .with_context(|| format!("seal the upper {}", upper_data_path.display()))?;
+        tokio::fs::rename(upper_data_path, output_layer_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "move the sealed layer from {} to {}",
+                    upper_data_path.display(),
+                    output_layer_path.display()
+                )
+            })?;
+        Ok(descriptor)
+    }
+
     pub async fn create_snapshot_and_restack(
         &self,
         output_layer_path: &Path,
@@ -228,14 +300,7 @@ impl ImageFile {
         let upper_data_path = PathBuf::from(&state.config.upper.data);
         let upper_index_path = (!state.config.upper.index.is_empty())
             .then(|| PathBuf::from(&state.config.upper.index));
-        if upper_data_path.as_os_str().is_empty()
-            || (matches!(
-                upper_mode,
-                UpperMode::LogStructured | UpperMode::HybridLogStructured
-            ) && upper_index_path.is_none())
-        {
-            bail!("create_snapshot_and_restack requires a writable upper layer");
-        }
+        ensure_sealable_upper(&state.config.upper, "create_snapshot_and_restack")?;
         let Some(output_dir) = output_layer_path.parent() else {
             bail!(
                 "snapshot output path has no parent directory: {}",
@@ -281,13 +346,10 @@ impl ImageFile {
             )
             .context("prepare fresh upper after restack")?;
 
-            let io_ring = shared_transient_io_ring();
             let new_upper_data: Arc<dyn VirtualFile> = Arc::new(
-                LocalFile::open_rw(&upper_data_path, false, io_ring.clone())
-                    .await
-                    .with_context(|| {
-                        format!("open fresh upper data {}", upper_data_path.display())
-                    })?,
+                LocalFile::open_rw(&upper_data_path, false).with_context(|| {
+                    format!("open fresh upper data {}", upper_data_path.display())
+                })?,
             );
             let new_upper_index = match upper_mode {
                 UpperMode::Sparse => None,
@@ -295,13 +357,11 @@ impl ImageFile {
                     let upper_index_path = upper_index_path
                         .as_ref()
                         .context("log-structured upper lost its index path during restack")?;
-                    Some(Arc::new(
-                        LocalFile::open_rw(upper_index_path, false, io_ring)
-                            .await
-                            .with_context(|| {
-                                format!("open fresh upper index {}", upper_index_path.display())
-                            })?,
-                    ) as Arc<dyn VirtualFile>)
+                    Some(
+                        Arc::new(LocalFile::open_rw(upper_index_path, false).with_context(
+                            || format!("open fresh upper index {}", upper_index_path.display()),
+                        )?) as Arc<dyn VirtualFile>,
+                    )
                 }
             };
             let new_upper = open_file_rw(new_upper_data, new_upper_index)
@@ -387,8 +447,7 @@ impl ImageFile {
             prefetcher.as_ref(),
         )
         .await?;
-        let upper_file =
-            Self::open_upper(&config.upper, image_service.io_ring(&config.upper.index)).await?;
+        let upper_file = Self::open_upper(&config.upper).await?;
         let replay_prefetch = prefetcher
             .as_ref()
             .map(|prefetcher| prefetcher.mode() == PrefetchMode::Replay)
@@ -563,7 +622,7 @@ impl ImageFile {
         Ok(opened)
     }
 
-    async fn open_upper(upper: &UpperConfig, io_ring: IoRingHandle) -> Result<Option<LSMTFile>> {
+    async fn open_upper(upper: &UpperConfig) -> Result<Option<LSMTFile>> {
         if upper.data.is_empty() {
             return Ok(None);
         }
@@ -573,18 +632,14 @@ impl ImageFile {
             ));
         }
 
-        let data_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::open_rw(&upper.data, false, io_ring.clone()).await?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper.data, false)?);
         let idx_file = match upper.writable_mode() {
             UpperMode::Sparse => None,
             UpperMode::LogStructured | UpperMode::HybridLogStructured => {
                 if upper.index.is_empty() {
                     bail!("log-structured upper requires upper.index");
                 }
-                Some(
-                    Arc::new(LocalFile::open_rw(&upper.index, false, io_ring).await?)
-                        as Arc<dyn VirtualFile>,
-                )
+                Some(Arc::new(LocalFile::open_rw(&upper.index, false)?) as Arc<dyn VirtualFile>)
             }
         };
         Ok(Some(open_file_rw(data_file, idx_file).await?))
@@ -618,12 +673,11 @@ impl ImageFile {
         let path_display = path.to_string_lossy().into_owned();
         let direct_io = image_service.io_engine() == IO_ENGINE_LIBAIO;
         let file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::builder(image_service.io_ring(path))
+            LocalFile::builder()
                 .write(false)
                 .create(false)
                 .direct_io(direct_io)
-                .open(path)
-                .await?,
+                .open(path)?,
         );
         let tar_file = new_tar_file_adaptor(file).await?;
         let switch = new_switch_file(tar_file, true, Some(path_display.as_str())).await?;
@@ -791,6 +845,7 @@ impl VirtualFile for ImageFile {
         Ok(written)
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -810,6 +865,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -830,6 +886,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -849,6 +906,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -949,9 +1007,9 @@ impl VirtualFile for ImageFile {
 mod tests {
     use super::*;
     use crate::config::DownloadConfig;
-    use crate::lsmt::file::{create_file_rw, LayerInfo, RwLayout};
+    use crate::layer::layer_metadata::read_overlaybd_layer_virtual_size;
+    use crate::lsmt::file::{create_file_rw, open_file_ro, LayerInfo, RwLayout};
     use crate::prefetch::new_prefetcher;
-    use crate::test_utils::test_io_ring;
     use axum::body::Body;
     use axum::extract::{Request, State};
     use axum::http::header::CONTENT_RANGE as CONTENT_RANGE_RAW;
@@ -968,9 +1026,8 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) -> Result<()> {
-        let ring = test_io_ring();
-        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path, ring.clone()).await?);
-        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path, ring).await?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path)?);
+        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path)?);
         let args = LayerInfo::new(data_file.clone(), Some(index_file), payload.len() as u64);
         let lsmt = create_file_rw(args).await?;
         lsmt.write_at(0, payload).await?;
@@ -1088,15 +1145,13 @@ mod tests {
         virtual_size: u64,
         mode: UpperMode,
     ) -> Result<()> {
-        let ring = test_io_ring();
-        let data_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(data_path, ring.clone()).await?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(data_path)?);
         let index_file = match mode {
             UpperMode::Sparse => None,
             UpperMode::LogStructured | UpperMode::HybridLogStructured => {
                 let index_path =
                     index_path.context("log-structured test upper requires an index path")?;
-                Some(Arc::new(LocalFile::new(index_path, ring).await?) as Arc<dyn VirtualFile>)
+                Some(Arc::new(LocalFile::new(index_path)?) as Arc<dyn VirtualFile>)
             }
         };
         let mut args = LayerInfo::new(data_file, index_file, virtual_size);
@@ -1235,11 +1290,11 @@ mod tests {
                 .expect("head response");
         }
         let Some((start, end)) = parse_request_range(&headers) else {
+            // The real UUID facade requires Range, including for URL probes.
             return Response::builder()
-                .status(HttpStatusCode::OK)
-                .header(reqwest::header::CONTENT_LENGTH, len.to_string())
-                .body(Body::from(state.blob.as_ref().clone()))
-                .expect("full response");
+                .status(HttpStatusCode::BAD_REQUEST)
+                .body(Body::from("missing Range header"))
+                .expect("missing range response");
         };
         let start = start.min(len.saturating_sub(1));
         let end = end.min(len.saturating_sub(1));
@@ -1414,6 +1469,10 @@ mod tests {
         assert!(!image.is_read_only().await);
     }
 
+    // Sparse LSMT files are rejected where the filesystem does not guarantee
+    // that unwritten regions read back as holes; see
+    // `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_image_file_stack_lower_and_existing_sparse_upper() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1473,6 +1532,10 @@ mod tests {
         assert!(!image.is_read_only().await);
     }
 
+    // Sparse LSMT files are rejected where the filesystem does not guarantee
+    // that unwritten regions read back as holes; see
+    // `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_image_file_sparse_discard_passthrough() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1653,11 +1716,8 @@ mod tests {
         assert_eq!(&got_full[..4096], first_overlay.as_slice());
         assert_eq!(&got_full[4096..8192], second_overlay.as_slice());
 
-        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&snapshot_path, service.io_ring(&snapshot_path))
-                .await
-                .expect("open snapshot file"),
-        );
+        let snapshot_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&snapshot_path).expect("open snapshot file"));
         let snapshot = LSMTReadOnlyFile::open(snapshot_file)
             .await
             .expect("open snapshot lower");
@@ -1665,6 +1725,10 @@ mod tests {
         assert_eq!(got_snapshot.as_ref(), first_overlay.as_slice());
     }
 
+    // Sparse LSMT files are rejected where the filesystem does not guarantee
+    // that unwritten regions read back as holes; see
+    // `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_create_snapshot_and_restack_keeps_sparse_image_writable() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1737,11 +1801,8 @@ mod tests {
             "restacked sparse upper should not materialize an index file",
         );
 
-        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&snapshot_path, service.io_ring(&snapshot_path))
-                .await
-                .expect("open snapshot file"),
-        );
+        let snapshot_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&snapshot_path).expect("open snapshot file"));
         let snapshot = LSMTReadOnlyFile::open(snapshot_file)
             .await
             .expect("open snapshot lower");
@@ -1834,11 +1895,8 @@ mod tests {
             "restacked hybrid upper should keep an index file",
         );
 
-        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&snapshot_path, service.io_ring(&snapshot_path))
-                .await
-                .expect("open snapshot file"),
-        );
+        let snapshot_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&snapshot_path).expect("open snapshot file"));
         let snapshot = LSMTReadOnlyFile::open(snapshot_file)
             .await
             .expect("open snapshot lower");
@@ -2069,6 +2127,134 @@ mod tests {
         assert!(
             write_err.to_string().contains("File is sealed"),
             "expected sealed write failure, got: {write_err:#}"
+        );
+    }
+
+    /// An image with a hybrid upper and nothing under it, so a layer sealed out of it
+    /// has to own everything that reads back.
+    async fn hybrid_image_without_lowers(tmp: &TempDir, virtual_size: u64) -> (ImageFile, PathBuf) {
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper_with_mode(
+            &upper_data,
+            Some(&upper_index),
+            virtual_size,
+            UpperMode::HybridLogStructured,
+        )
+        .await
+        .expect("build initialized hybrid upper");
+
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: Vec::new(),
+            upper: UpperConfig {
+                mode: Some(UpperMode::HybridLogStructured),
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let image = ImageFile::open(image_cfg, build_service(tmp).await, None)
+            .await
+            .expect("open image");
+        (image, upper_data)
+    }
+
+    /// The property that makes sealing affordable: the upper *becomes* the layer.
+    /// `close_seal` appends a compact index and a trailer to the data file that is
+    /// already on disk and renames it, so an upper the guest filled with 58 GiB costs
+    /// a rename rather than a 58 GiB copy — which is what `export_upper_as_sealed`
+    /// costs, since it compacts into a fresh file.
+    ///
+    /// This test arrived with the implementation, from the NBD server that used to
+    /// seal by reopening the files itself; it was the only thing pinning this.
+    #[tokio::test]
+    async fn test_close_seal_turns_the_upper_into_a_layer_without_copying() {
+        let tmp = TempDir::new().expect("tempdir");
+        let virtual_size = 1 << 20;
+        let (image, upper_data) = hybrid_image_without_lowers(&tmp, virtual_size).await;
+
+        let payload = vec![0xAB; 4096];
+        image.write_at(0, &payload).await.expect("write payload");
+        image.sync().await.expect("sync payload");
+
+        let before = std::fs::metadata(&upper_data)
+            .expect("stat the upper")
+            .len();
+        let output = tmp.path().join("layers/delta.commit");
+        image.close_seal(&output).await.expect("seal the upper");
+
+        // Moved rather than copied. The runtime path being empty afterwards is also
+        // what stops the next `prepare_runtime_upper` from truncating the layer.
+        assert!(
+            !upper_data.exists(),
+            "the upper was left at its runtime path"
+        );
+        let after = std::fs::metadata(&output).expect("stat the layer").len();
+        assert!(
+            after >= before && after < before + (1 << 20),
+            "sealing appended an index and a trailer, not a second copy: {before} -> {after}",
+        );
+
+        // Read the layer back through fresh handles, which is the first time anything
+        // reads the index and trailer that sealing wrote out of memory.
+        assert_eq!(
+            read_overlaybd_layer_virtual_size(&output).expect("read the trailer"),
+            virtual_size
+        );
+        let layer_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&output).expect("open the layer"));
+        let layer = open_file_ro(layer_file)
+            .await
+            .expect("open it as a sealed layer");
+        let mut read = vec![0u8; payload.len()];
+        layer
+            .read_at_into(0, &mut read)
+            .await
+            .expect("read it back");
+        assert_eq!(read, payload);
+
+        // A block the upper never owned still reads as zeros, so sealing did not
+        // invent mappings for the rest of the virtual size.
+        let mut hole = vec![0xFF; 4096];
+        layer
+            .read_at_into(8192, &mut hole)
+            .await
+            .expect("read a hole");
+        assert!(hole.iter().all(|byte| *byte == 0));
+    }
+
+    /// Sealing twice must be refused rather than append a second trailer. The refusal
+    /// comes from `LSMTFile::close_seal`'s own flag, so it does not depend on the data
+    /// file still being where the config says it is — after the first call it is not.
+    #[tokio::test]
+    async fn test_close_seal_twice_is_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (image, _upper_data) = hybrid_image_without_lowers(&tmp, 1 << 20).await;
+        image
+            .write_at(0, &[0xCD; 4096])
+            .await
+            .expect("write payload");
+
+        image
+            .close_seal(&tmp.path().join("first.commit"))
+            .await
+            .expect("seal the upper");
+        let error = image
+            .close_seal(&tmp.path().join("second.commit"))
+            .await
+            .expect_err("a sealed upper must not be sealed again");
+        // The whole chain rather than `to_string()`: the outermost context names the
+        // file, and the refusal itself comes from the layer underneath it.
+        assert!(
+            format!("{error:#}").contains("already been sealed"),
+            "{error:#}"
         );
     }
 

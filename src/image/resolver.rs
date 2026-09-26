@@ -92,6 +92,104 @@ impl ImageResolver {
         &self.default_image
     }
 
+    pub(crate) async fn resolve_buildkit(
+        &self,
+        content: &super::buildkit::BuildkitContent,
+        digest: &str,
+    ) -> Result<ResolvedBlockImage> {
+        anyhow::ensure!(
+            self.convert_standard_oci,
+            "standard OCI conversion is disabled"
+        );
+        let (fetched, metadata) =
+            oci_image::fetch_content_manifest(content, digest, &detect_arch()?).await?;
+        let source = self.store.open(&fetched.manifest_digest, None).await?;
+        if let CachedImageConfig::Found {
+            image_config_path, ..
+        } = source.cached_config().await?
+        {
+            return Ok(resolved_from_cached_config(
+                &fetched.manifest_digest,
+                image_config_path,
+                metadata,
+            ));
+        }
+        let mut conversion = source.begin_conversion().await?;
+        let image = oci_image::convert_content_image(
+            content,
+            &fetched,
+            oci_image::OverlaybdConversionEnv {
+                install_root: &self.overlaybd_install_root,
+                global_config: &self.overlaybd_convert_global_config,
+                converter_id: &self.overlaybd_oci_converter_id,
+                regctl_binary: &self.regctl_binary,
+            },
+            &mut *conversion,
+        )
+        .await?;
+        let path = source
+            .publish_config(
+                &overlaybd_image_config_json(&image),
+                metadata.clone(),
+                conversion,
+            )
+            .await?;
+        Ok(resolved_from_cached_config(
+            &fetched.manifest_digest,
+            path,
+            metadata,
+        ))
+    }
+
+    pub(crate) async fn resolve_tools(
+        mut self,
+        image_ref: &str,
+    ) -> ImageResult<Option<ResolvedBlockImage>> {
+        // System dependencies use their configured release source, independently
+        // of the admission policy and conversion settings for user images.
+        let arch = detect_arch()?;
+        let mut fetched =
+            oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch).await?;
+        if fetched.format() != ImageFormat::OverlaybdNative {
+            let metadata = oci_image::fetch_oci_image_config_metadata(
+                &self.regctl_binary,
+                &fetched.selected_image_ref,
+                fetched.config_digest(),
+            )
+            .await?;
+            match metadata
+                .base_context
+                .labels
+                .get("io.agentenv.tools-drive.format")
+                .map(String::as_str)
+            {
+                None => return Ok(None),
+                Some("oci-rootfs-v1") => {}
+                Some(format) => {
+                    return Err(ImageError::UnsupportedImage {
+                        reason: format!("unsupported tools image format '{format}'"),
+                    })
+                }
+            }
+            // v1 is part of the immutable tools release contract, independently
+            // of runtime upgrades and the conversion policy for user images.
+            const _: () = assert!(oci_image::LAYER_VIRTUAL_SIZE_GIB == 64);
+            let deps = self
+                .overlaybd_install_root
+                .parent()
+                .context("overlaybd dependency root")?;
+            self.overlaybd_install_root =
+                crate::setup::overlaybd::ensure_tools_converter_v1(deps).await?;
+            self.overlaybd_oci_converter_id = "tools-oci-rootfs-v1:overlaybd-v1.0.18-aenv.1".into();
+            self.convert_standard_oci = true;
+            self.try_referrers_overlaybd_prefixes.clear();
+            fetched.repository_scope = Some("tools-oci-rootfs-v1".into());
+        }
+        self.resolve_fetched_manifest(image_ref, &arch, fetched)
+            .await
+            .map(Some)
+    }
+
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
         if let Some(path) = image_ref.trim().strip_prefix("overlaybd-config:") {
             return resolve_overlaybd_config_ref(&self.disk_branch_root, path);
@@ -942,9 +1040,6 @@ mod tests {
         stderr: &str,
         exit_code: i32,
     ) -> std::path::PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let stdout_path = dir.join("stdout");
         let stderr_path = dir.join("stderr");
         std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
@@ -953,25 +1048,23 @@ mod tests {
         // The script locates its fixtures relative to `$0` rather than
         // embedding absolute paths, so a TMPDIR containing shell
         // metacharacters cannot break or inject into the generated script.
-        //
-        // Staged write + rename so the binary is never observed half-written or
-        // non-executable, matching how the real dependency installer stages
-        // downloads.
+        let script = format!(
+            "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
+        );
+
+        // Write in a child and wait for it to exit. Writing in this test process
+        // lets concurrent forks inherit the writable fd and cause ETXTBSY even
+        // after we close it and rename the file; CLOEXEC only closes it at exec.
         let binary = dir.join("regctl");
-        let staged = dir.join("regctl.staged");
-        {
-            let mut file = std::fs::File::create(&staged).expect("create fake regctl");
-            write!(
-                file,
-                "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
-            )
-            .expect("write fake regctl");
-            file.sync_all().expect("sync fake regctl");
-        }
-        let mut permissions = std::fs::metadata(&staged).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staged, permissions).expect("chmod fake regctl");
-        std::fs::rename(&staged, &binary).expect("publish fake regctl");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("install-fake-regctl")
+            .arg(&binary)
+            .arg(script)
+            .status()
+            .expect("install fake regctl");
+        assert!(status.success(), "install fake regctl: {status}");
         binary
     }
 

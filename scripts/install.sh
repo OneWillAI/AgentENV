@@ -3,6 +3,7 @@
 # The server is configured as a systemd service (or prints a manual start
 # command if systemd is unavailable).
 # Downloads: aenv (cli)   -> /usr/local/bin/aenv
+#            buildctl -> /usr/local/bin/aenv-buildctl
 #            server -> /usr/local/bin/server
 #            paused-state recovery utility -> /usr/local/sbin/aenv-paused-recovery (root-only)
 #            dependencies -> /var/lib/aenv/deps
@@ -90,19 +91,29 @@ command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
 command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
 command -v sha256sum >/dev/null 2>&1 || missing_packages+=(coreutils)
 command -v realpath >/dev/null 2>&1 || missing_packages+=(coreutils)
+command -v tar >/dev/null 2>&1 || missing_packages+=(tar)
+command -v gzip >/dev/null 2>&1 || missing_packages+=(gzip)
 
 if ((${#missing_packages[@]} > 0)); then
     if command -v apt-get >/dev/null 2>&1; then
         echo "Installing required commands: ${missing_packages[*]} ..."
         sudo apt-get update
         sudo apt-get install -y "${missing_packages[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo dnf install -y "${missing_packages[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo yum install -y "${missing_packages[@]}"
     else
-        echo "error: missing required commands and apt-get is unavailable: ${missing_packages[*]}" >&2
+        echo \
+            "error: missing required commands and no supported package manager is available: ${missing_packages[*]}" \
+            >&2
         exit 1
     fi
 fi
 
-for command in curl jq sha256sum realpath; do
+for command in curl jq sha256sum realpath tar gzip; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "error: required command is still unavailable after installation: ${command}" >&2
         exit 1
@@ -138,7 +149,8 @@ tmp_tarball="$(mktemp)"
 tmp_dir="$(mktemp -d)"
 current_env=""
 tmp_env=""
-trap 'rm -f "$release_metadata" "$tmp_cli" "$tmp_tarball" "$current_env" "$tmp_env"; rm -rf "$tmp_dir"' EXIT
+stage_dir=""
+trap 'rm -f "$release_metadata" "$tmp_cli" "$tmp_tarball" "$current_env" "$tmp_env"; rm -rf "$tmp_dir"; if [[ -n "$stage_dir" ]]; then sudo rm -rf "$stage_dir"; fi' EXIT
 
 api_headers=(
     -H "Accept: application/vnd.github+json"
@@ -189,9 +201,17 @@ sudo install -d -o root -g root -m 0755 "$RECOVERY_INSTALL_DIR"
 # ---------------------------------------------------------------------------
 # 1. Install the aenv CLI
 # ---------------------------------------------------------------------------
-echo "Downloading aenv CLI ..."
-download_release_asset "aenv-linux-${ARCH_TAG}" "$tmp_cli"
-sudo install -m 0755 "$tmp_cli" "${INSTALL_DIR}/aenv"
+echo "Downloading aenv CLI and buildctl ..."
+download_release_asset "aenv-linux-${ARCH_TAG}.tar.gz" "$tmp_cli"
+mkdir -p "$tmp_dir/cli"
+tar -xzf "$tmp_cli" -C "$tmp_dir/cli" aenv aenv-buildctl manifest.json
+test -s "$tmp_dir/cli/aenv"
+test -s "$tmp_dir/cli/aenv-buildctl"
+stage_dir="$(sudo mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
+sudo install -m 0755 "$tmp_dir/cli/aenv-buildctl" "$stage_dir/buildctl"
+sudo install -m 0755 "$tmp_dir/cli/aenv" "$stage_dir/aenv"
+sudo mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
+sudo mv "$stage_dir/aenv" "${INSTALL_DIR}/aenv"
 
 # ---------------------------------------------------------------------------
 # 2. Install the server
@@ -236,6 +256,11 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_dir/default.toml" "$CONFIG_PATH"
 fi
 
+# Raise the legacy ublk device limit before server setup loads the module.
+UBLK_MODPROBE_CONF="/etc/modprobe.d/aenv-ublk.conf"
+sudo install -d -m 0755 "$(dirname "$UBLK_MODPROBE_CONF")"
+printf '%s\n' 'options ublk_drv ublks_max=4096' | sudo tee "$UBLK_MODPROBE_CONF" > /dev/null
+
 if [[ "$SKIP_SETUP" == "1" ]]; then
     echo "Skipping setup (SKIP_SETUP=1)."
 else
@@ -265,6 +290,7 @@ sudo chmod 0640 "$CONFIG_PATH"
 if [[ -d /run/systemd/system ]]; then
     ENV_FILE_STATUS="exists"
     if [[ ! -f "$ENV_FILE" ]]; then
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 /dev/null "$ENV_FILE"
         sudo tee "$ENV_FILE" > /dev/null <<EOF
 API_ADDR="127.0.0.1:8000"
 AENV_CONFIG_PATH="${CONFIG_PATH}"
@@ -329,7 +355,7 @@ EOF
         if [[ "$found_virtualization" == "0" ]]; then
             printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
         fi
-        sudo install -m 0644 "$tmp_env" "$ENV_FILE"
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_env" "$ENV_FILE"
         rm -f "$current_env" "$tmp_env"
         ENV_FILE_STATUS="updated"
     fi
@@ -383,6 +409,7 @@ echo "  Server : ${INSTALL_DIR}/server"
 echo "  Recovery (root-only): ${RECOVERY_BINARY_PATH}"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
+echo "  API key: ${DATA_DIR}/secrets/api-key (auto-generated when no API key is configured)"
 echo "  Mode   : ${VIRTUALIZATION_MODE}"
 if [[ -d /run/systemd/system ]]; then
     if [[ "$ENV_FILE_STATUS" == "written" ]]; then

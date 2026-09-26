@@ -27,6 +27,19 @@ flowchart TD
     style node fill:transparent,stroke:gray
 ```
 
+## Key Components
+
+| Component | Location | Responsibility |
+|---|---|---|
+| **API Server** | `src/api/` | Exposes the E2B-compatible HTTP API and reverse proxy endpoints. |
+| **Orchestrator** | `src/orchestrator/` | Coordinates sandbox lifecycle transitions, persistence, and cleanup. |
+| **Firecracker Runtime** | `src/sandbox/firecracker/` | Creates and controls the microVM used by each sandbox. |
+| **Block Device Layer** | `storage/overlaybd/`, `storage/ublk/` | Provides layered root filesystems, attached drives, and snapshot-backed block devices. |
+| **envd Integration** | `thirdparty/envd/`, `src/sandbox/` | Handles in-guest command execution, file operations, process interaction, and health reporting. |
+| **Reverse Proxy** | `src/api/proxy.rs` | Routes HTTP, SSE, and WebSocket traffic to services inside sandboxes. |
+| **Snapshot Manager** | `src/snapshot/` | Commits, resolves, and deletes durable sandbox snapshots. |
+| **Template Builder** | `src/template/` | Builds user-facing templates and publishes their committed snapshots. |
+
 ## Storage 
 
 The storage subsystem turns layered image files into block devices mountable by VMs, and provides ublk-backed memory snapshot restore for snapshot resume. Four crates compose the active subsystem:
@@ -76,6 +89,7 @@ Async userspace block device server using Linux's ublk kernel driver. Exposes Ov
 Long-running daemon process (`uvm-ublk-daemon`) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.
 
 - Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
+- All remote image I/O (OSS/registry reads) is dispatched from the per-queue runtimes onto a dedicated per-`ImageService` remote-io runtime via `RuntimeDispatchFile` (`storage/overlaybd/src/io/dispatch_file.rs`), because opendal/reqwest pin pooled HTTP connection tasks to whatever runtime polls them and per-device runtimes are dropped on device teardown; the lazily-built remote runtime (file-cache workers, background-download scheduler) is likewise constructed and driven on that dedicated runtime so its internal `tokio::spawn` calls bind there. The runtime is created when the overlaybd global config sets `remoteIoWorkers` > 0 (agentenv-generated configs emit it from `ublk.overlaybd.remote_io_workers`, default 4); with it unset/zero, remote I/O runs on the runtime that constructed the `ImageService`.
 - `UblkDaemonClient` spawns and monitors the daemon process from the node runtime.
 - `UblkDeviceManager` (`src/sandbox/ublk/device.rs`) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.
 
@@ -123,16 +137,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 
 ### Sandbox Networking
 
-Sandbox networking is managed by a process-wide `NetworkManager` (`src/sandbox/network/manager.rs`) plus per-slot `Slot` objects (`src/sandbox/network/slot.rs`).
-
-- Each slot owns a stable index-derived address bundle from `[network.internal]` (defaulting to `10.11.0.0/16` and `10.12.0.0/16`) plus the fixed VM tap link `169.254.0.20/30`, together with the host veth name, namespace path, and iptables rules for one sandbox network namespace.
-- Network policy supports base allow/deny plus explicit egress rules. The `/sandboxes/{sandboxID}/network` endpoint replaces per-sandbox `allowOut` (CIDR/IP/domain patterns) and `denyOut` (CIDR/IP only) rules at runtime; allow rules always take precedence.
-- `allocate_any()` first tries a warm-slot pool and falls back to creating a new namespace/veth/tap/iptables setup on demand.
-- Warm-pool maintenance uses a single Condvar-driven background worker with low/high watermarks.
-- `release()` enqueues slots back to the warm pool; when maintenance is enabled, even releases above high watermark are first enqueued and then drained asynchronously by the worker.
-- `[pool]` provides shared watermarks and `[pool.network].maintenance_enabled` controls network worker behavior.
-- Because the manager is a process-wide singleton, orchestrator shutdown explicitly calls `NetworkManager::shutdown()` after deleting remaining sandboxes so cached slots are drained and no new allocations race with teardown.
-- Although calling `NetworkManager::shutdown()` on exit is recommended for clean teardown, the manager also has a `Drop` and `libc::atexit` handler to best-effort cleanup of any remaining namespaces and veth interfaces on unexpected shutdown and during testing.
+The network subsystem is managed by a process-wide `NetworkManager` and per-slot `Slot` objects. See [Sandbox Network Architecture](./networking.md) for the namespace topology, address plan, packet paths, firewall ordering, egress proxy, policy replacement, warm-pool behavior, and verification steps.
 
 Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, Firecracker process)` pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. `[pool.block]` controls the ublk daemon's overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.
 
@@ -220,10 +225,11 @@ Discovery modes:
 **Deployment**:
 
 ```bash
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)" # shared by local runtime and gateway processes
 # local dev (single node)
 make start-server && make -C services run-scheduler && make -C services run-gateway
 
-# docker compose (multi-node)
+# docker compose (multi-node; shared auth volume is provisioned automatically)
 make deploy-up     # gateway + scheduler + 2 backend nodes
 make deploy-down   # teardown
 

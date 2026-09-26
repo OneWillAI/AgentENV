@@ -54,6 +54,7 @@ impl fmt::Display for RecordingCall {
 
 #[derive(Clone, Default)]
 pub(crate) struct RecordingPersister {
+    artifact_root: Option<PathBuf>,
     pub(crate) calls: Arc<Mutex<Vec<RecordingCall>>>,
     loaded: Arc<Mutex<Vec<SandboxMetadata>>>,
     create_idempotency: Arc<Mutex<HashMap<String, CreateIdempotencyRecord>>>,
@@ -71,6 +72,13 @@ struct RecordingPersistBarrier {
 }
 
 impl RecordingPersister {
+    pub(crate) fn with_artifact_root(root: PathBuf) -> Self {
+        Self {
+            artifact_root: Some(root),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn block_next_collection(&self) -> (Arc<Semaphore>, Arc<Semaphore>) {
         let barrier = RecordingPersistBarrier {
             entered: Arc::new(Semaphore::new(0)),
@@ -212,7 +220,7 @@ impl SandboxPersister for RecordingPersister {
     ) -> PersistenceResult<Option<PathBuf>> {
         self.record(RecordingCall::AllocateArtifactRoot);
         self.maybe_fail(RecordingCall::AllocateArtifactRoot)?;
-        Ok(None)
+        Ok(self.artifact_root.clone())
     }
 
     async fn persist_paused(

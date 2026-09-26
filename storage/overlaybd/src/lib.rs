@@ -33,15 +33,16 @@ pub mod helper {
     pub use crate::image::helper::*;
 }
 mod metrics;
+pub mod pack_planner;
 pub mod prefetch;
+pub mod startup_manifest;
+pub mod startup_pack;
 pub mod snapshot {
     #[cfg(feature = "full")]
     pub use crate::image::snapshot::*;
 }
+mod sys;
 pub mod tools;
-pub mod transient_io_ring {
-    pub use crate::io::transient_io_ring::*;
-}
 pub mod vfile_io {
     pub use crate::io::vfile_io::*;
 }
@@ -51,9 +52,6 @@ pub mod virtual_file {
 pub mod zfile {
     pub use crate::compression::zfile::*;
 }
-
-#[cfg(test)]
-pub(crate) mod test_utils;
 
 #[cfg(feature = "full")]
 pub use image_file::{ImageFile, RestackSnapshotTerminalFailure};

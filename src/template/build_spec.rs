@@ -21,6 +21,12 @@ pub(crate) enum TemplateBuildRootfsBase {
 #[derive(Clone, Debug)]
 pub(crate) struct TemplateBuildStep {
     pub(crate) kind: TemplateBuildStepKind,
+    /// 1-based position of the client-visible step this came from. The e2b
+    /// front-end expands one request step (a multi-pair ENV/LABEL) into
+    /// several internal steps, so failed-step reporting must not count
+    /// internal positions. None: the step maps 1:1 to its position, which
+    /// holds for every other front-end.
+    pub(crate) source_step: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,12 +43,14 @@ pub(crate) enum TemplateBuildStepKind {
 impl TemplateBuildStep {
     pub(crate) fn run(cmd: impl Into<String>) -> Self {
         Self {
+            source_step: None,
             kind: TemplateBuildStepKind::Run { cmd: cmd.into() },
         }
     }
 
     pub(crate) fn env(key: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
+            source_step: None,
             kind: TemplateBuildStepKind::Env {
                 key: key.into(),
                 value: value.into(),
@@ -52,12 +60,14 @@ impl TemplateBuildStep {
 
     pub(crate) fn workdir(path: impl Into<PathBuf>) -> Self {
         Self {
+            source_step: None,
             kind: TemplateBuildStepKind::Workdir { path: path.into() },
         }
     }
 
     pub(crate) fn user(value: impl Into<String>) -> Self {
         Self {
+            source_step: None,
             kind: TemplateBuildStepKind::User {
                 value: value.into(),
             },
@@ -66,18 +76,21 @@ impl TemplateBuildStep {
 
     pub(crate) fn exposed_port(port: impl Into<String>) -> Self {
         Self {
+            source_step: None,
             kind: TemplateBuildStepKind::ExposedPort { port: port.into() },
         }
     }
 
     pub(crate) fn volume(path: impl Into<String>) -> Self {
         Self {
+            source_step: None,
             kind: TemplateBuildStepKind::Volume { path: path.into() },
         }
     }
 
     pub(crate) fn label(key: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
+            source_step: None,
             kind: TemplateBuildStepKind::Label {
                 key: key.into(),
                 value: value.into(),
@@ -95,6 +108,7 @@ pub struct TemplateBuildSpec {
     resources: Option<SandboxResources>,
     start_cmd: Option<String>,
     ready_cmd: Option<String>,
+    startup_shell: Option<String>,
     base_context: Option<CommandContext>,
 }
 
@@ -234,6 +248,19 @@ impl TemplateBuildSpec {
         self.rootfs_base.as_ref()
     }
 
+    pub(crate) fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Stamps the steps appended since `from` with the client step number
+    /// they came from — see `TemplateBuildStep::source_step`.
+    pub(crate) fn stamp_source_steps(mut self, from: usize, source_step: usize) -> Self {
+        for step in &mut self.steps[from..] {
+            step.source_step = Some(source_step);
+        }
+        self
+    }
+
     pub(crate) fn steps(&self) -> &[TemplateBuildStep] {
         &self.steps
     }
@@ -248,6 +275,15 @@ impl TemplateBuildSpec {
 
     pub(crate) fn ready_cmd_ref(&self) -> Option<&str> {
         self.ready_cmd.as_deref()
+    }
+
+    pub(crate) fn with_startup_shell(mut self, shell: &str) -> Self {
+        self.startup_shell = Some(shell.to_owned());
+        self
+    }
+
+    pub(crate) fn startup_shell(&self) -> Option<&str> {
+        self.startup_shell.as_deref()
     }
 
     pub(crate) fn with_base_context(mut self, context: CommandContext) -> Self {

@@ -4,8 +4,8 @@ mod readwrite;
 mod stack;
 mod types;
 
-pub(crate) use helper::initialize_file_rw_paths;
 pub use helper::{compact_to, create_mappings_from_sparse, validate_rw_header_pair_paths};
+pub(crate) use helper::{initialize_file_rw_paths, load_readonly_layers_metadata};
 pub use readonly::LSMTReadOnlyFile;
 pub use readwrite::LSMTFile;
 pub use stack::{
@@ -16,7 +16,7 @@ pub use types::{
     CommitArgs, DataStat, LSMTFileType, LayerDescriptor, LayerInfo, PremergedIndexCachePolicy,
     RwLayout, MAX_STACK_LAYERS,
 };
-pub(crate) use types::{PARALLEL_LOAD_INDEX, PREMERGED_INDEX_DIR};
+pub(crate) use types::{ReadOnlyLayerMetadata, PARALLEL_LOAD_INDEX, PREMERGED_INDEX_DIR};
 
 #[cfg(test)]
 mod tests;

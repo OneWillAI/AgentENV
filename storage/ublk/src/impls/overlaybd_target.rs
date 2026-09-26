@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use clap::Args;
 use overlaybd::image_file::ImageFile;
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use storage_util::io_ring::AsyncIoRing;
 
+use super::startup_pack_recorder::StartupPackRecorder;
 use crate::{IOBuffer, UVMUblkTarget, UblkDescOperation};
 
 const DEFAULT_PHYSICAL_BS_SHIFT: u8 = 12;
@@ -46,6 +47,7 @@ pub struct OverlaybdTargetConfig {
 
 pub struct OverlaybdTarget {
     state: ArcSwap<TargetState>,
+    recorder: ArcSwapOption<StartupPackRecorder>,
 }
 
 impl fmt::Debug for OverlaybdTarget {
@@ -120,7 +122,15 @@ impl OverlaybdTarget {
 
         Ok(Self {
             state: ArcSwap::new(Arc::new(state)),
+            recorder: ArcSwapOption::new(None),
         })
+    }
+
+    /// Attach (or detach with `None`) a startup-pack first-touch recorder.
+    /// Only the dedicated memory device of a pack-recording VM arms this;
+    /// rootfs and normal memory devices never do.
+    pub fn set_recorder(&self, recorder: Option<Arc<StartupPackRecorder>>) {
+        self.recorder.store(recorder);
     }
 
     /// Swap the target's backing image and capacity atomically.
@@ -154,6 +164,10 @@ impl OverlaybdTarget {
             discard_supported,
         };
 
+        // Per-image attachments must not survive a swap: a pooled device
+        // reused for another image would otherwise keep recording for the
+        // previous image.
+        self.recorder.store(None);
         self.state.store(Arc::new(new_state));
         Ok(())
     }
@@ -185,6 +199,14 @@ impl OverlaybdTarget {
         if len == 0 {
             return Ok(0);
         }
+        // Startup-pack recorder: observe at submission (≈ guest fault order);
+        // the guard settles in-flight and latency accounting on completion.
+        // The remote estimate only counts reads that touched new pages, so
+        // re-reads of already-recorded pages cannot trip the abort guard.
+        let _read_guard = self.recorder.load_full().map(|recorder| {
+            let touched_new = recorder.observe_submit(offset, len);
+            recorder.read_guard(len as u64, touched_new)
+        });
         match buf {
             IOBuffer::User(user_buf) => {
                 let dst = user_buf.subslice_mut(0, len);

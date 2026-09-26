@@ -1,35 +1,60 @@
+pub(crate) mod buildkit;
 pub mod files;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;
+pub mod volumes;
 
 use crate::auth::Credentials;
 use crate::grpc::Transport;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::time::Duration;
 use ureq::Agent;
 
 #[derive(Clone)]
 pub struct Client {
     agent: Agent,
+    async_agent: reqwest::Client,
     base: String,
     api_key: String,
 }
 
 impl Client {
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     pub fn from_env() -> Result<Self> {
         let creds = Credentials::load()?;
         Self::new(&creds.url, &creds.api_key)
     }
 
     pub fn new(url: &str, api_key: &str) -> Result<Self> {
+        Self::new_with_timeouts(
+            url,
+            api_key,
+            Duration::from_secs(5),
+            Duration::from_secs(120),
+        )
+    }
+
+    pub fn new_with_timeouts(
+        url: &str,
+        api_key: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         let base = url.trim_end_matches('/').to_string();
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(120))
+            .timeout_connect(connect_timeout)
+            .timeout(request_timeout)
             .build();
         Ok(Self {
             agent,
+            async_agent: reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
+                .build()?,
             base,
             api_key: api_key.to_string(),
         })
@@ -40,7 +65,7 @@ impl Client {
         sandbox_id: &str,
         envd_access_token: Option<&str>,
     ) -> Result<Transport> {
-        Transport::new(&self.base, &self.api_key, sandbox_id, envd_access_token)
+        Transport::new(&self.base, sandbox_id, envd_access_token)
     }
 
     fn url(&self, path: &str) -> String {
@@ -77,11 +102,28 @@ pub fn handle_status(resp: Result<ureq::Response, ureq::Error>) -> Result<ureq::
         Ok(r) => Ok(r),
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
-            let msg = parse_api_error(&body).unwrap_or_else(|| body.clone());
-            bail!("HTTP {}: {}", code, msg.trim())
+            Err(format_status_error(code, &body))
         }
         Err(ureq::Error::Transport(t)) => Err(anyhow!(t).context("transport error")),
     }
+}
+
+fn format_status_error(code: u16, body: &str) -> anyhow::Error {
+    let detail = parse_api_error(body)
+        .or_else(|| (!body.trim().is_empty()).then(|| body.trim().to_string()));
+
+    if code == 401 {
+        return match detail {
+            Some(detail) => anyhow!(
+                "authentication failed (HTTP 401 Unauthorized): {detail}; run `aenv auth` to update your API key"
+            ),
+            None => anyhow!(
+                "authentication failed (HTTP 401 Unauthorized); run `aenv auth` to update your API key"
+            ),
+        };
+    }
+
+    anyhow!("HTTP {}: {}", code, detail.unwrap_or_default())
 }
 
 fn parse_api_error(body: &str) -> Option<String> {
@@ -92,4 +134,16 @@ fn parse_api_error(body: &str) -> Option<String> {
     serde_json::from_str::<ApiError>(body)
         .ok()
         .and_then(|e| e.message)
+}
+#[cfg(test)]
+mod tests {
+    use super::format_status_error;
+
+    #[test]
+    fn unauthorized_error_explains_how_to_reauthenticate() {
+        assert_eq!(
+            format_status_error(401, "").to_string(),
+            "authentication failed (HTTP 401 Unauthorized); run `aenv auth` to update your API key"
+        );
+    }
 }

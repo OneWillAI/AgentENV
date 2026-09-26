@@ -13,8 +13,12 @@ use super::super::{
 };
 use super::cache_entry::{AcquireRefillResult, CacheEntry};
 use super::cache_pool::FileCacheBackend;
-use crate::io::vfile_io::{CtxRead, DirectRead, FileReader};
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+#[cfg(feature = "io-uring")]
+use crate::io::vfile_io::CtxRead;
+use crate::io::vfile_io::{DirectRead, FileReader};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 
 #[derive(Clone, Copy)]
 struct ReadCtx {
@@ -555,8 +559,10 @@ impl FileCacheBackend {
     ///
     /// Uses `read_at_into` to write source data straight into the page cache
     /// via the mmap'd buffer, then marks the block as cached in the bitmap.
-    /// This eliminates the intermediate `Bytes` allocation and the `pwrite`
-    /// syscall that the old path used.
+    /// For local sources this eliminates the intermediate `Bytes` allocation
+    /// and the `pwrite` syscall that the old path used; a
+    /// `RuntimeDispatchFile`-wrapped remote source falls back to `read_at` +
+    /// one block-sized copy, since the mmap buffer cannot cross runtimes.
     async fn do_refill_block_generic<R: FileReader>(
         &self,
         reader: &R,
@@ -584,6 +590,13 @@ impl FileCacheBackend {
             return Err(Errno::ENOSPC.into());
         }
 
+        // Reserve the block's disk range up front so writing the mmap below
+        // never allocates at page-fault time (SIGBUS when the disk is full).
+        // The guard punches the range back if the source read fails, is
+        // short, or the future is cancelled, so a failed refill leaves
+        // neither unaccounted disk blocks nor partially written pages.
+        let reservation = entry.reserve_range(offset, want as u64)?;
+
         // The caller holds the entry's refill barrier and passes the stable
         // entry reference. Never look up by cache_id here: that would allow a
         // stale task to populate a replacement entry after an ABA recycle.
@@ -604,6 +617,10 @@ impl FileCacheBackend {
                 "short refill read for cache_id={cache_id}, offset={offset}, got {n}, want {buf_len}"
             );
         }
+
+        // Commit before publishing: prevent RAII from punching holes in case
+        // of error (rollback).
+        reservation.commit();
 
         // Just update the bitmap — data is already in place via mmap.
         entry.mark_block_cached(block_id);
@@ -705,7 +722,6 @@ impl FileCacheBackend {
             entry.set_source_size(new_size)?;
         }
 
-        let mut bytes_added = 0u64;
         for block_id in start_block..=end_block {
             let block_start = block_id.saturating_mul(block_size);
             let in_write_start = offset.max(block_start);
@@ -763,16 +779,14 @@ impl FileCacheBackend {
             let was_cached = entry.index.read().contains(block_id as u32);
             entry.write_block(block_id, &block[..valid])?;
             if !was_cached {
-                bytes_added += valid as u64;
+                // Account immediately after each publication: an error on a
+                // later block (source read, reservation) must not leave the
+                // bytes already visible in the bitmap untracked.
+                self.add_current_bytes(valid as u64);
             }
         }
 
         entry.record_refill();
-
-        // Update global capacity and pressure state atomically as a pair.
-        if bytes_added > 0 {
-            self.add_current_bytes(bytes_added);
-        }
 
         // Trigger eviction check asynchronously.
         self.eviction_inner().await;
@@ -820,10 +834,10 @@ impl FileCacheBackend {
     // -------------------------------------------------------------------
     // Public-ish entry points called from CachedFile.
     //
-    // The non-`_with_ctx` variants drive the source through the global
-    // `IoRingHandle` workers (default `FileReader`) and yield `Send` futures,
-    // matching the historical behaviour for background callers (refill from
-    // tests, write_at_with_flags, prefetch, etc.).
+    // The non-`_with_ctx` variants use the source's ordinary `VirtualFile`
+    // methods (default `FileReader`) and yield `Send` futures. Local files use
+    // synchronous positional I/O on this fallback path; remote sources remain
+    // asynchronous.
     //
     // The `_with_ctx` variants accept an [`IoCtx`] and dispatch source IO
     // through it. The returned future is `!Send` because [`IoCtx`] borrows a
@@ -845,6 +859,7 @@ impl FileCacheBackend {
             .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn do_preadv2_with_ctx<'a>(
         &'a self,
         io_ctx: IoCtx<'a>,
@@ -870,6 +885,7 @@ impl FileCacheBackend {
             .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn do_preadv2_into_with_ctx<'a>(
         &'a self,
         io_ctx: IoCtx<'a>,
@@ -902,6 +918,7 @@ impl FileCacheBackend {
         .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn cache_refill_with_data_with_ctx<'a>(
         &'a self,
         io_ctx: IoCtx<'a>,
@@ -926,6 +943,16 @@ impl FileCacheBackend {
 // ---------------------------------------------------------------------------
 // CachedFile — per-open handle (unchanged public API)
 // ---------------------------------------------------------------------------
+
+/// What [`CachedFile::fadvise`] should do with a range.
+///
+/// Deliberately not a `libc` advice value: `POSIX_FADV_*` does not exist on
+/// Darwin, and the method only ever accepted one of them anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAdvice {
+    /// Pull the range into the local cache now.
+    WillNeed,
+}
 
 pub struct CachedFile {
     pub(crate) backend: FileCacheBackend,
@@ -1016,13 +1043,13 @@ impl CachedFile {
         Ok(self.missing_background_blocks(source_size)?.is_empty())
     }
 
-    /// Enumerate download chunks (`blocks_per_chunk` cache blocks each) that
-    /// still have at least one missing block, as `(start_block, len_blocks)`
+    /// Enumerate download chunks (`blocks_per_chunk` cache blocks each)
+    /// that have at least one block missing, as `(start_block, len_blocks)`
     /// pairs; the final chunk may be shorter. The download chunk is the
-    /// background fetch granularity (`download.blockSize`) expressed in cache
-    /// blocks — the cache itself keeps storing and exposing blocks in its own
-    /// smaller block size.
-    pub(crate) fn missing_background_chunks(
+    /// background fetch granularity (`download.blockSize`) expressed in
+    /// cache blocks — the cache itself keeps storing and exposing blocks in
+    /// its own smaller block size.
+    pub(crate) fn actionable_background_chunks(
         &self,
         source_size: u64,
         blocks_per_chunk: u32,
@@ -1038,8 +1065,9 @@ impl CachedFile {
         let mut start = 0u64;
         while start < block_count {
             let len = (block_count - start).min(blocks_per_chunk);
-            let has_missing = (start..start + len).any(|block_id| !index.contains(block_id as u32));
-            if has_missing {
+            let has_actionable =
+                (start..start + len).any(|block_id| !index.contains(block_id as u32));
+            if has_actionable {
                 chunks.push((start, u32::try_from(len)?));
             }
             start += len;
@@ -1152,6 +1180,13 @@ impl CachedFile {
             n as u64 == read_len,
             "short background chunk read at offset {offset}: got {n}, want {read_len}"
         );
+        // No rollback guard is needed: nothing past this point awaits or fails.
+        // Reserve the whole run before publishing any block: the mmap copies
+        // below must never allocate at page-fault time (SIGBUS when the disk
+        // is full), and a reservation failure returns before the first
+        // publication so the batched accounting below stays consistent.
+        entry.ensure_range_allocated(offset, read_len)?;
+
         let mut committed = 0u64;
         for (block_id, guard) in run {
             let want = source_size
@@ -1250,9 +1285,16 @@ impl CachedFile {
         self.try_refill_range(offset, count).await
     }
 
-    pub async fn fadvise(&self, offset: u64, len: u64, advice: i32) -> Result<()> {
-        if advice != libc::POSIX_FADV_WILLNEED {
-            bail!("advice {advice} is not supported");
+    /// Prefetch `[offset, offset + len)` into the local cache.
+    ///
+    /// Despite the name this never calls `posix_fadvise`; it refills cache
+    /// blocks from the source. It used to take a raw `libc` advice value and
+    /// reject anything but `POSIX_FADV_WILLNEED`, which both leaked a
+    /// Linux-only constant into the signature and misdescribed the behaviour.
+    /// [`CacheAdvice`] names the one thing that was ever accepted.
+    pub async fn fadvise(&self, offset: u64, len: u64, advice: CacheAdvice) -> Result<()> {
+        match advice {
+            CacheAdvice::WillNeed => {}
         }
 
         let page_size = 4096;
@@ -1388,6 +1430,7 @@ impl VirtualFile for CachedFile {
         self.write_at_with_flags(offset, data, 0).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1414,6 +1457,7 @@ impl VirtualFile for CachedFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1443,6 +1487,7 @@ impl VirtualFile for CachedFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

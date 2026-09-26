@@ -21,18 +21,37 @@ import (
 const maxCursorSandboxID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
 type listedSandbox struct {
-	TemplateID  string            `json:"templateID"`
-	Alias       *string           `json:"alias,omitempty"`
-	SandboxID   string            `json:"sandboxID"`
-	ClientID    string            `json:"clientID"`
-	StartedAt   time.Time         `json:"startedAt"`
-	EndAt       time.Time         `json:"endAt"`
-	CPUCount    uint32            `json:"cpuCount"`
-	MemoryMB    uint32            `json:"memoryMB"`
-	DiskSizeMB  uint32            `json:"diskSizeMB"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	State       string            `json:"state"`
-	EnvdVersion string            `json:"envdVersion"`
+	payload   json.RawMessage
+	sandboxID string
+	startedAt time.Time
+	state     string
+}
+
+type listedSandboxIndex struct {
+	SandboxID string    `json:"sandboxID"`
+	StartedAt time.Time `json:"startedAt"`
+	State     string    `json:"state"`
+}
+
+func (s *listedSandbox) UnmarshalJSON(data []byte) error {
+	var index listedSandboxIndex
+	if err := json.Unmarshal(data, &index); err != nil {
+		return err
+	}
+
+	// Keep the node response opaque so additive API fields survive aggregation.
+	s.payload = append(s.payload[:0], data...)
+	s.sandboxID = index.SandboxID
+	s.startedAt = index.StartedAt
+	s.state = index.State
+	return nil
+}
+
+func (s listedSandbox) MarshalJSON() ([]byte, error) {
+	if len(s.payload) == 0 {
+		return nil, errors.New("listed sandbox payload is empty")
+	}
+	return s.payload, nil
 }
 
 type clusterListResult struct {
@@ -70,6 +89,16 @@ func canonicalClusterListPath(path string) string {
 }
 
 func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routingCtx context.Context) {
+	descending := true
+	if canonicalClusterListPath(r.URL.Path) == "/v2/sandboxes" {
+		var err error
+		descending, err = parseClusterListOrder(r)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid order: %v", err), http.StatusBadRequest)
+			return
+		}
+	}
+
 	rpcStart := time.Now()
 	resp, err := s.scheduler.ListNodes(routingCtx, &schedulerv1.ListNodesRequest{})
 	recordGatewaySchedulerRPC("ListNodes", rpcStart, err)
@@ -78,7 +107,7 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 		return
 	}
 
-	items, err := s.fetchClusterList(routingCtx, r, resp.GetNodes())
+	items, err := s.fetchClusterList(routingCtx, r, resp.GetNodes(), descending)
 	if err != nil {
 		var statusErr *clusterListStatusError
 		if errors.As(err, &statusErr) && statusErr.statusCode >= 400 && statusErr.statusCode < 500 {
@@ -107,7 +136,7 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 		return
 	}
 
-	page, nextToken, err := paginateListedSandboxes(items, r.URL.Query().Get("nextToken"), limit)
+	page, nextToken, err := paginateListedSandboxes(items, r.URL.Query().Get("nextToken"), limit, descending)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("invalid next token: %v", err), http.StatusBadRequest)
 		return
@@ -115,10 +144,13 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 	if nextToken != "" {
 		w.Header().Set("x-next-token", nextToken)
 	}
+	if clusterListIncludesRunning(r) {
+		w.Header().Set("x-total-running", strconv.Itoa(runningSandboxCount(items)))
+	}
 	s.writeJSON(w, http.StatusOK, page)
 }
 
-func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, nodes []*schedulerv1.Node) ([]listedSandbox, error) {
+func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, nodes []*schedulerv1.Node, descending bool) ([]listedSandbox, error) {
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("no scheduler nodes available")
 	}
@@ -165,7 +197,7 @@ func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, n
 		return nil, firstErr
 	}
 
-	sortListedSandboxes(merged)
+	sortListedSandboxes(merged, descending)
 	return dedupListedSandboxes(merged), nil
 }
 
@@ -231,12 +263,44 @@ func parseClusterListLimit(r *http.Request) (*int, error) {
 	return &limit, nil
 }
 
-func sortListedSandboxes(items []listedSandbox) {
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].StartedAt.Equal(items[j].StartedAt) {
-			return items[i].SandboxID < items[j].SandboxID
+func parseClusterListOrder(r *http.Request) (bool, error) {
+	switch r.URL.Query().Get("order") {
+	case "", "desc":
+		return true, nil
+	case "asc":
+		return false, nil
+	default:
+		return false, fmt.Errorf("must be asc or desc")
+	}
+}
+
+func clusterListIncludesRunning(r *http.Request) bool {
+	states := strings.Split(r.URL.Query().Get("state"), ",")
+	return len(states) != 1 || states[0] != "paused"
+}
+
+func runningSandboxCount(items []listedSandbox) int {
+	count := 0
+	for _, item := range items {
+		if item.state == "running" {
+			count++
 		}
-		return items[i].StartedAt.After(items[j].StartedAt)
+	}
+	return count
+}
+
+func sortListedSandboxes(items []listedSandbox, descending bool) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].startedAt.Equal(items[j].startedAt) {
+			if descending {
+				return items[i].sandboxID < items[j].sandboxID
+			}
+			return items[i].sandboxID > items[j].sandboxID
+		}
+		if descending {
+			return items[i].startedAt.After(items[j].startedAt)
+		}
+		return items[i].startedAt.Before(items[j].startedAt)
 	})
 }
 
@@ -250,24 +314,30 @@ func dedupListedSandboxes(items []listedSandbox) []listedSandbox {
 	seen := make(map[string]struct{}, len(items))
 	deduped := make([]listedSandbox, 0, len(items))
 	for _, item := range items {
-		if _, ok := seen[item.SandboxID]; ok {
+		if _, ok := seen[item.sandboxID]; ok {
 			continue
 		}
-		seen[item.SandboxID] = struct{}{}
+		seen[item.sandboxID] = struct{}{}
 		deduped = append(deduped, item)
 	}
 	return deduped
 }
 
-func paginateListedSandboxes(items []listedSandbox, nextToken string, limit *int) ([]listedSandbox, string, error) {
-	cursorTime, cursorID, err := parseClusterListNextToken(nextToken)
+func paginateListedSandboxes(items []listedSandbox, nextToken string, limit *int, descending bool) ([]listedSandbox, string, error) {
+	cursorTime, cursorID, err := parseClusterListNextToken(nextToken, descending)
 	if err != nil {
 		return nil, "", err
 	}
 
 	page := make([]listedSandbox, 0, len(items))
 	for _, item := range items {
-		if item.StartedAt.Before(cursorTime) || (item.StartedAt.Equal(cursorTime) && item.SandboxID > cursorID) {
+		pastCursor := item.startedAt.Before(cursorTime)
+		pastID := item.sandboxID > cursorID
+		if !descending {
+			pastCursor = item.startedAt.After(cursorTime)
+			pastID = item.sandboxID < cursorID
+		}
+		if pastCursor || (item.startedAt.Equal(cursorTime) && pastID) {
 			page = append(page, item)
 		}
 	}
@@ -280,13 +350,16 @@ func paginateListedSandboxes(items []listedSandbox, nextToken string, limit *int
 		}
 	}
 
-	return page, nextClusterListToken(page, limit), nil
+	return page, nextClusterListToken(page, limit, descending), nil
 }
 
-func parseClusterListNextToken(token string) (time.Time, string, error) {
+func parseClusterListNextToken(token string, descending bool) (time.Time, string, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return time.Now(), maxCursorSandboxID, nil
+		if descending {
+			return time.Now(), maxCursorSandboxID, nil
+		}
+		return time.Unix(0, 0).UTC(), "00000000-0000-0000-0000-000000000000", nil
 	}
 
 	decoded, err := base64.URLEncoding.DecodeString(token)
@@ -294,9 +367,19 @@ func parseClusterListNextToken(token string) (time.Time, string, error) {
 		return time.Time{}, "", fmt.Errorf("error decoding cursor: %w", err)
 	}
 
-	parts := strings.SplitN(string(decoded), "__", 2)
-	if len(parts) != 2 {
+	parts := strings.Split(string(decoded), "__")
+	if len(parts) != 2 && len(parts) != 3 {
 		return time.Time{}, "", fmt.Errorf("invalid cursor format")
+	}
+	tokenDescending := true
+	if len(parts) == 3 {
+		if parts[2] != "asc" {
+			return time.Time{}, "", fmt.Errorf("invalid cursor direction: %s", parts[2])
+		}
+		tokenDescending = false
+	}
+	if tokenDescending != descending {
+		return time.Time{}, "", fmt.Errorf("cursor order does not match request")
 	}
 
 	cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
@@ -310,12 +393,15 @@ func parseClusterListNextToken(token string) (time.Time, string, error) {
 	return cursorTime.UTC(), parts[1], nil
 }
 
-func nextClusterListToken(items []listedSandbox, limit *int) string {
+func nextClusterListToken(items []listedSandbox, limit *int, descending bool) string {
 	if limit == nil || *limit <= 0 || len(items) != *limit {
 		return ""
 	}
 	last := items[len(items)-1]
-	raw := fmt.Sprintf("%s__%s", last.StartedAt.UTC().Format(time.RFC3339Nano), last.SandboxID)
+	raw := fmt.Sprintf("%s__%s", last.startedAt.UTC().Format(time.RFC3339Nano), last.sandboxID)
+	if !descending {
+		raw += "__asc"
+	}
 	return base64.URLEncoding.EncodeToString([]byte(raw))
 }
 

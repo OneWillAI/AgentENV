@@ -36,19 +36,21 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::{Builder, Uuid};
 
+use super::buildkit::{BuildkitContent, MAX_IMAGE_BYTES};
 use super::commit_index::sanitize_filename_component;
 use super::local_layer::LocalLayer;
 use super::{
     env_vars_from_entries, ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult,
 };
 use crate::digest;
+use crate::p2p::P2pArtifactKey;
 
 /// GOMAXPROCS ceiling applied to every spawned `regctl` process; see
 /// [`regctl_command`] for the rationale.
@@ -60,11 +62,14 @@ const MAX_INDEX_RESOLUTION_DEPTH: usize = 4;
 /// Virtual block-device size baked into every converted overlaybd layer. The
 /// VM sees this as the rootfs device capacity; actual storage is only what the
 /// layers contain. 64 GiB comfortably covers common base images.
-const LAYER_VIRTUAL_SIZE_GIB: u64 = 64;
+pub(super) const LAYER_VIRTUAL_SIZE_GIB: u64 = 64;
 const OCI_INDEX_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 ];
+
+const CONVERTED_LAYER_P2P_PROTOCOL: &str = "agentenv-oci-layer-v1";
+const CONVERTED_LAYER_P2P_KEY_PREFIX: &str = "oci-layer/v1";
 
 /// Outcome of resolving an OCI image reference for overlaybd consumption.
 ///
@@ -105,7 +110,8 @@ pub(crate) struct OverlaybdConversionEnv<'a> {
     pub(crate) regctl_binary: &'a Path,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct LayerConversionKey {
     pub(crate) source_layer_digest: String,
     pub(crate) converter_id: String,
@@ -113,6 +119,46 @@ pub(crate) struct LayerConversionKey {
     pub(crate) mkfs: bool,
     pub(crate) parent_commit_digest: Option<String>,
     pub(crate) expected_layer_uuid: Uuid,
+}
+
+impl LayerConversionKey {
+    /// Stable key for the conversion context, excluding the output digest so
+    /// peers can discover a converted layer before knowing its local filename.
+    pub(crate) fn p2p_key(&self) -> P2pArtifactKey {
+        let context = serde_json::to_vec(self)
+            .expect("layer conversion context serialization should not fail");
+        format!(
+            "{CONVERTED_LAYER_P2P_KEY_PREFIX}/{}",
+            digest::sha256_hex(&context)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConvertedLayerP2pMetadata {
+    pub(crate) protocol: String,
+    pub(crate) commit_digest: String,
+    pub(crate) size: u64,
+}
+
+impl ConvertedLayerP2pMetadata {
+    pub(crate) fn from_local_layer(layer: &LocalLayer) -> Self {
+        Self {
+            protocol: CONVERTED_LAYER_P2P_PROTOCOL.to_string(),
+            commit_digest: layer.digest.clone(),
+            size: layer.size,
+        }
+    }
+
+    pub(crate) fn parse(raw: &serde_json::Value) -> Result<Self> {
+        let metadata: ConvertedLayerP2pMetadata = serde_json::from_value(raw.clone())
+            .context("parse converted image layer P2P metadata")?;
+        if metadata.protocol != CONVERTED_LAYER_P2P_PROTOCOL {
+            bail!("unexpected converted image layer P2P metadata protocol");
+        }
+        Ok(metadata)
+    }
 }
 
 #[async_trait]
@@ -385,7 +431,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
     conversion: OverlaybdConversionEnv<'_>,
     sink: &mut dyn ImageConversion,
     converter: &OverlaybdLayerConverter,
-    producer: &mut RegctlImageCopyProducer,
+    producer: &mut dyn LayerBlobSource,
 ) -> Result<Vec<LocalLayer>> {
     let mut lower_paths: Vec<PathBuf> = Vec::with_capacity(manifest.layers.len());
     let mut lowers = Vec::with_capacity(manifest.layers.len());
@@ -451,6 +497,123 @@ struct RegctlImageCopyProducer {
     backoff: Duration,
 }
 
+#[async_trait]
+trait LayerBlobSource: Send {
+    async fn wait_layer_blob(
+        &mut self,
+        idx: usize,
+        layer: &OciLayerDescriptor,
+    ) -> ImageResult<PathBuf>;
+}
+
+struct ContentLayerSource<'a> {
+    content: &'a BuildkitContent,
+    work: &'a Path,
+}
+
+#[async_trait]
+impl LayerBlobSource for ContentLayerSource<'_> {
+    async fn wait_layer_blob(
+        &mut self,
+        idx: usize,
+        layer: &OciLayerDescriptor,
+    ) -> ImageResult<PathBuf> {
+        let path = self.work.join(format!("blob-{idx}"));
+        self.content
+            .download(&layer.digest, layer.size, &path)
+            .await?;
+        Ok(path)
+    }
+}
+
+pub(super) async fn fetch_content_manifest(
+    content: &BuildkitContent,
+    digest: &str,
+    arch: &str,
+) -> Result<(FetchedManifest, ImageResolutionMetadata)> {
+    let arch = host_arch_to_oci(arch)?;
+    let mut digest = digest.to_owned();
+    for _ in 0..MAX_INDEX_RESOLUTION_DEPTH {
+        let bytes = content.metadata(&digest).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("manifests").is_some() {
+            let index: OciIndex = serde_json::from_value(value)?;
+            digest = select_manifest_for_platform(&index.manifests, arch, "linux")?
+                .digest
+                .clone();
+            continue;
+        }
+        anyhow::ensure!(
+            value.get("schemaVersion").and_then(|v| v.as_u64()) == Some(2),
+            "expected OCI schema version 2"
+        );
+        let manifest: OciManifest = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            classify_manifest(&manifest)? == ImageFormat::StandardOci,
+            "builder must export standard OCI layers"
+        );
+        anyhow::ensure!(manifest.layers.len() <= 1024, "image exceeds 1024 layers");
+        let size = manifest
+            .layers
+            .iter()
+            .try_fold(0u64, |total, layer| total.checked_add(layer.size));
+        anyhow::ensure!(
+            size.is_some_and(|size| size <= MAX_IMAGE_BYTES),
+            "image exceeds 64 GiB of compressed layers"
+        );
+        for layer in &manifest.layers {
+            super::buildkit::validate_digest(&layer.digest)?;
+        }
+        let config = content.metadata(&manifest.config.digest).await?;
+        let config_value: serde_json::Value = serde_json::from_slice(&config)?;
+        anyhow::ensure!(
+            config_value["os"] == "linux" && config_value["architecture"] == arch,
+            "built image must target linux/{arch}"
+        );
+        let metadata = parse_oci_image_config(std::str::from_utf8(&config)?)?;
+        return Ok((
+            FetchedManifest {
+                manifest_digest: digest.clone(),
+                selected_image_ref: digest,
+                repository_scope: None,
+                format: ImageFormat::StandardOci,
+                manifest,
+            },
+            metadata,
+        ));
+    }
+    bail!("builder image index nesting exceeds {MAX_INDEX_RESOLUTION_DEPTH}")
+}
+
+pub(super) async fn convert_content_image(
+    content: &BuildkitContent,
+    fetched: &FetchedManifest,
+    conversion: OverlaybdConversionEnv<'_>,
+    sink: &mut dyn ImageConversion,
+) -> Result<ResolvedImage> {
+    let work = sink.create_temp_staging_dir()?;
+    let converter = OverlaybdLayerConverter {
+        tools: OverlaybdTools::from_overlaybd_install_root(conversion.install_root),
+        global_config_path: conversion.global_config.to_path_buf(),
+        virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
+    };
+    let mut producer = ContentLayerSource {
+        content,
+        work: work.path(),
+    };
+    let layers = convert_standard_oci_layers_pipeline_inner(
+        &fetched.manifest,
+        &fetched.manifest_digest,
+        work.path(),
+        conversion,
+        sink,
+        &converter,
+        &mut producer,
+    )
+    .await?;
+    Ok(ResolvedImage::Local(layers))
+}
+
 impl RegctlImageCopyProducer {
     async fn start(
         regctl_binary: &Path,
@@ -507,7 +670,10 @@ impl RegctlImageCopyProducer {
         self.attempts_started += 1;
         Ok(())
     }
+}
 
+#[async_trait]
+impl LayerBlobSource for RegctlImageCopyProducer {
     async fn wait_layer_blob(
         &mut self,
         idx: usize,
@@ -566,7 +732,9 @@ impl RegctlImageCopyProducer {
             tokio::time::sleep(OCI_LAYER_BLOB_POLL_INTERVAL).await;
         }
     }
+}
 
+impl RegctlImageCopyProducer {
     async fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
         if let Some(status) = self.exit_status {
             return Ok(Some(status));
@@ -1589,7 +1757,8 @@ mod tests {
     fn uuid_from_layer_digest_is_stable_and_digest_specific() {
         let digests = ["sha256:aaa", "sha256:aab", "sha256:aac", "sha256:aad"];
         let uuid = uuid_from_layer_digest(digests[0]);
-        assert_eq!(uuid, uuid_from_layer_digest(digests[0]));
+        // OCI tools v1 keeps this layer identity across runtime upgrades.
+        assert_eq!(uuid.to_string(), "6d4f1c33-bc1f-8f3d-89f7-46f7fecb5234");
         assert_ne!(
             uuid_from_layer_digest("sha256:aaa"),
             uuid_from_layer_digest("sha256:bbb")
@@ -1599,6 +1768,17 @@ mod tests {
             assert_eq!(uuid.get_variant(), Variant::RFC4122);
             assert_eq!(uuid.get_version(), Some(Version::Custom));
         }
+    }
+
+    #[test]
+    fn converted_layer_p2p_metadata_rejects_protocol_mismatch() {
+        let metadata = ConvertedLayerP2pMetadata {
+            protocol: "other-protocal".to_string(),
+            commit_digest: "sha256:aaa".to_string(),
+            size: 1234,
+        };
+        let serialized = serde_json::to_value(&metadata).expect("serialize metadata");
+        assert!(ConvertedLayerP2pMetadata::parse(&serialized).is_err());
     }
 
     #[test]

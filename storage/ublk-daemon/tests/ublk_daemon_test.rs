@@ -13,7 +13,9 @@ use overlaybd::config::UpperMode;
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 
-use uvm_ublk_daemon::protocol::{recv_message, send_message, DaemonRequest, DaemonResponse};
+use uvm_ublk_daemon::protocol::{
+    recv_message, send_message, DaemonRequest, DaemonResponse, PackRecordingState,
+};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
     UblkDaemonClient,
@@ -553,6 +555,7 @@ mod client_tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("snapshot failed"), "error: {msg}");
+        assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
     }
 
     #[tokio::test]
@@ -585,6 +588,7 @@ mod client_tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unexpected"), "error: {msg}");
+        assert!(err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
     }
 
     // ── shutdown ────────────────────────────────────────────────────────
@@ -724,6 +728,12 @@ mod client_tests {
                 DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
                 DaemonRequest::UpdateSize { .. } => DaemonResponse::SizeUpdated,
                 DaemonRequest::NotifySandboxReady { .. } => DaemonResponse::Ok,
+                DaemonRequest::StartPackRecording { .. } => DaemonResponse::Ok,
+                DaemonRequest::PackRecordingStatus { .. } => DaemonResponse::PackRecording {
+                    state: PackRecordingState::Recording,
+                },
+                DaemonRequest::AbortPackRecording { .. } => DaemonResponse::Ok,
+                DaemonRequest::PrefetchStartupPack { .. } => DaemonResponse::Ok,
             }
         }))
         .await;
@@ -1143,7 +1153,7 @@ mod server_tests {
             .acquire_overlaybd(
                 Path::new("/tmp/image.json"),
                 Path::new("/global.json"),
-                1024 * 1024 * 1024, // 1GB
+                Some(1024 * 1024 * 1024), // 1GB
                 uvm_ublk_daemon::AccessMode::Exclusive,
             )
             .await
@@ -1153,9 +1163,14 @@ mod server_tests {
     }
 
     #[tokio::test]
-    async fn acquire_overlaybd_shared_success() {
+    async fn acquire_overlaybd_shared_uses_image_capacity() {
         let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::AcquireOverlaybd { access_mode, .. } => {
+            DaemonRequest::AcquireOverlaybd {
+                access_mode,
+                virtual_size,
+                ..
+            } => {
+                assert_eq!(virtual_size, None);
                 assert_eq!(access_mode, uvm_ublk_daemon::AccessMode::Shared);
                 DaemonResponse::DeviceAcquired {
                     dev_id: 20,
@@ -1173,7 +1188,7 @@ mod server_tests {
             .acquire_overlaybd(
                 Path::new("/tmp/mem.json"),
                 Path::new("/global.json"),
-                128 * 1024 * 1024, // 128MB
+                None,
                 uvm_ublk_daemon::AccessMode::Shared,
             )
             .await
@@ -1237,7 +1252,7 @@ mod server_tests {
             .acquire_overlaybd(
                 Path::new("/tmp/image.json"),
                 Path::new("/global.json"),
-                1024 * 1024 * 1024,
+                Some(1024 * 1024 * 1024),
                 uvm_ublk_daemon::AccessMode::Exclusive,
             )
             .await;

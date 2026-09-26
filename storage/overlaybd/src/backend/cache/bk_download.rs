@@ -31,6 +31,10 @@ use tokio::task::JoinSet;
 
 use super::full_file_cache::cache_pool::FileCacheBackend;
 use super::full_file_cache::cache_store::CachedFile;
+use super::startup_pack_task::{
+    run_startup_pack_task, StartupPackPhase, StartupPackStatsSnapshot, StartupPackSubmission,
+    StartupPackTask,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -124,6 +128,22 @@ pub(crate) struct BkDownloadScheduler {
     tasks: DashMap<String, Arc<BkDownloadTask>>,
     ready: StdMutex<FairReadyQueue<Arc<BkDownloadTask>>>,
     ready_notify: tokio::sync::Notify,
+    /// Registered startup pack prefetches by task key (immutable pack
+    /// identity). Startup tasks are dispatched ahead of background tasks.
+    startup_tasks: DashMap<String, Arc<StartupPackTask>>,
+    startup_ready: StdMutex<VecDeque<Arc<StartupPackTask>>>,
+    /// Cap on concurrently running startup pack tasks, carved out of the
+    /// file-slot budget so background tasks keep guaranteed progress.
+    startup_slots: Arc<Semaphore>,
+    /// Startup packs queued for dispatch but not yet running (the signal
+    /// background tasks yield to at chunk boundaries). Counted rather than
+    /// derived from the queue: a task popped by the dispatcher but still
+    /// waiting for a file slot must keep backgrounds yielding.
+    startup_waiting: AtomicUsize,
+    /// Fired whenever any pending-import set changes (registered, frames
+    /// landed, task torn down). Background tasks that found only pending
+    /// holes park on this.
+    pending_notify: Arc<tokio::sync::Notify>,
     /// Set once submission closes; checked together with `tasks` insertion so
     /// a submit racing shutdown either registers before the drain or fails.
     closed: StdMutex<bool>,
@@ -167,6 +187,14 @@ impl BkDownloadScheduler {
             tasks: DashMap::new(),
             ready: StdMutex::new(FairReadyQueue::default()),
             ready_notify: tokio::sync::Notify::new(),
+            startup_tasks: DashMap::new(),
+            startup_ready: StdMutex::new(VecDeque::new()),
+            // At most a quarter of the file budget runs startup packs, so
+            // regular downloads keep at least three quarters (and always one
+            // slot when the budget is 1).
+            startup_slots: Arc::new(Semaphore::new((max_concurrent_files.max(1) / 4).max(1))),
+            startup_waiting: AtomicUsize::new(0),
+            pending_notify: Arc::new(tokio::sync::Notify::new()),
             closed: StdMutex::new(false),
             running: Arc::new(AtomicBool::new(true)),
             shutdown_notify: tokio::sync::Notify::new(),
@@ -278,6 +306,60 @@ impl BkDownloadScheduler {
         Ok(())
     }
 
+    /// Register one startup pack prefetch. Concurrent registrations of the
+    /// same immutable pack identity attach to the live task instead of
+    /// duplicating the download. The returned handle is a holder: the last
+    /// holder dropped on a non-terminal task cancels it.
+    pub(crate) fn submit_startup_pack(
+        self: &Arc<Self>,
+        submission: StartupPackSubmission,
+    ) -> std::result::Result<StartupPackHandle, BkDownloadSubmitError> {
+        let task_key = submission.task_key.clone();
+        let closed = self.closed.lock().unwrap();
+        if *closed {
+            return Err(BkDownloadSubmitError::Closed);
+        }
+        match self.startup_tasks.entry(task_key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                if !slot.get().is_terminal() {
+                    slot.get().retain();
+                } else {
+                    let task = StartupPackTask::new(submission);
+                    slot.insert(task.clone());
+                    self.startup_ready.lock().unwrap().push_back(task);
+                    self.startup_waiting.fetch_add(1, Ordering::AcqRel);
+                    self.ready_notify.notify_one();
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                let task = StartupPackTask::new(submission);
+                slot.insert(task.clone());
+                self.startup_ready.lock().unwrap().push_back(task);
+                self.startup_waiting.fetch_add(1, Ordering::AcqRel);
+                self.ready_notify.notify_one();
+            }
+        }
+        drop(closed);
+        Ok(StartupPackHandle {
+            scheduler: self.clone(),
+            task_key,
+        })
+    }
+
+    /// True when a startup pack is queued for dispatch. Running background
+    /// tasks check this at chunk boundaries and yield their file slot.
+    fn startup_waiting(&self) -> bool {
+        self.startup_waiting.load(Ordering::Acquire) > 0
+    }
+
+    pub(crate) fn running(&self) -> &Arc<AtomicBool> {
+        &self.running
+    }
+
+    pub(crate) fn block_slots(&self) -> &Arc<Semaphore> {
+        &self.block_slots
+    }
+
     /// Timer phase: wait for sandbox readiness and the configured delay
     /// without holding any execution resource, then move the task to the
     /// ready queue. On shutdown the task never became ready, so its
@@ -369,7 +451,9 @@ impl BkDownloadScheduler {
         self.running.store(false, Ordering::Release);
         self.file_slots.close();
         self.block_slots.close();
+        self.startup_slots.close();
         self.ready_notify.notify_waiters();
+        self.pending_notify.notify_waiters();
         self.shutdown_notify.notify_waiters();
     }
 
@@ -401,6 +485,98 @@ fn remove_task(tasks: &DashMap<String, Arc<BkDownloadTask>>, task: &Arc<BkDownlo
     tasks.remove_if(&task.cache_id, |_, existing| Arc::ptr_eq(existing, task));
 }
 
+/// One holder of a registered startup pack task. Concurrent resumes of the
+/// same snapshot share the task; the last holder dropped on a non-terminal
+/// task cancels and deregisters it.
+pub struct StartupPackHandle {
+    scheduler: Arc<BkDownloadScheduler>,
+    task_key: String,
+}
+
+impl StartupPackHandle {
+    fn task(&self) -> Option<Arc<StartupPackTask>> {
+        self.scheduler
+            .startup_tasks
+            .get(&self.task_key)
+            .map(|slot| slot.clone())
+    }
+
+    pub fn phase(&self) -> StartupPackPhase {
+        self.task()
+            .map(|task| task.phase())
+            .unwrap_or(StartupPackPhase::Failed)
+    }
+
+    pub fn stats(&self) -> Option<StartupPackStatsSnapshot> {
+        self.task().map(|task| task.stats.snapshot())
+    }
+
+    /// Wait for the task to reach a terminal phase. Test/A-B helper; resume
+    /// never blocks on it.
+    #[cfg(test)]
+    pub(crate) async fn wait_terminal(&self) -> StartupPackPhase {
+        let Some(task) = self.task() else {
+            return StartupPackPhase::Failed;
+        };
+        loop {
+            let phase = task.phase();
+            if task.is_terminal() {
+                return phase;
+            }
+            task.phase_notify.notified().await;
+        }
+    }
+}
+
+impl Clone for StartupPackHandle {
+    fn clone(&self) -> Self {
+        if let Some(task) = self.task() {
+            task.retain();
+        }
+        Self {
+            scheduler: self.scheduler.clone(),
+            task_key: self.task_key.clone(),
+        }
+    }
+}
+
+impl Drop for StartupPackHandle {
+    fn drop(&mut self) {
+        let Some(task) = self.task() else {
+            return;
+        };
+        if task.is_terminal() {
+            // Terminal tasks are never re-attached (a new submission for the
+            // same key spawns a fresh task), so deregister this one instead
+            // of letting it sit in the registry forever.
+            self.scheduler
+                .startup_tasks
+                .remove_if(&self.task_key, |_, existing| Arc::ptr_eq(existing, &task));
+            return;
+        }
+        if task.release() {
+            // Last holder: cancel a live task and always deregister.
+            if !task.is_terminal() {
+                task.cancel();
+                let mut ready = self.scheduler.startup_ready.lock().unwrap();
+                let before = ready.len();
+                ready.retain(|queued| !Arc::ptr_eq(queued, &task));
+                let removed = before - ready.len();
+                drop(ready);
+                if removed > 0 {
+                    self.scheduler
+                        .startup_waiting
+                        .fetch_sub(removed, Ordering::AcqRel);
+                }
+            }
+            self.scheduler
+                .startup_tasks
+                .remove_if(&self.task_key, |_, existing| Arc::ptr_eq(existing, &task));
+            self.scheduler.pending_notify.notify_waiters();
+        }
+    }
+}
+
 /// Log a skipped submission with only the fixed error category and the
 /// content-addressed cache id — never the source URL or credentials.
 fn warn_submit_skipped(cache_id: &str, error: &anyhow::Error) {
@@ -417,14 +593,38 @@ fn warn_submit_skipped(cache_id: &str, error: &anyhow::Error) {
 struct RunGuard {
     scheduler: Arc<BkDownloadScheduler>,
     task: Arc<BkDownloadTask>,
+    armed: bool,
+}
+
+impl RunGuard {
+    /// Keep the registration and the active count: used when the task is
+    /// requeued (pending-import wait or startup yield) instead of finished.
+    fn defuse(mut self) -> Arc<BkDownloadTask> {
+        self.armed = false;
+        self.task.clone()
+    }
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         remove_task(&self.scheduler.tasks, &self.task);
         self.scheduler.active.fetch_sub(1, Ordering::AcqRel);
         self.scheduler.idle_notify.notify_waiters();
     }
+}
+
+/// How a background task's run ended.
+enum RunOutcome {
+    /// Complete (or terminally failed): deregister.
+    Done,
+    /// Only pending-import holes remain: park until pending imports change,
+    /// then requeue. Registration is kept.
+    WaitPending,
+    /// A startup pack is queued: yield the file slot and requeue.
+    YieldStartup,
 }
 
 async fn dispatch_loop(scheduler: Arc<BkDownloadScheduler>) {
@@ -443,6 +643,50 @@ async fn dispatch_loop(scheduler: Arc<BkDownloadScheduler>) {
         if !scheduler.running.load(Ordering::Acquire) {
             break;
         }
+
+        // Startup packs dispatch ahead of background downloads.
+        let startup = scheduler.startup_ready.lock().unwrap().pop_front();
+        if let Some(task) = startup {
+            if task.fail_if_past_deadline() {
+                scheduler.startup_waiting.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            let startup_permit = tokio::select! {
+                permit = scheduler.startup_slots.clone().acquire_owned() => {
+                    match permit {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    }
+                }
+                _ = scheduler.shutdown_notify.notified() => break,
+            };
+            let file_permit = tokio::select! {
+                permit = scheduler.file_slots.clone().acquire_owned() => {
+                    match permit {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    }
+                }
+                _ = scheduler.shutdown_notify.notified() => break,
+            };
+            if !scheduler.running.load(Ordering::Acquire) {
+                break;
+            }
+            // The task is about to run: it no longer needs backgrounds to
+            // yield a slot.
+            scheduler.startup_waiting.fetch_sub(1, Ordering::AcqRel);
+            scheduler.active.fetch_add(1, Ordering::AcqRel);
+            let runner = scheduler.clone();
+            runs.spawn(async move {
+                let _startup_permit = startup_permit;
+                let _file_permit = file_permit;
+                run_startup_pack_task(&task, &runner).await;
+                runner.active.fetch_sub(1, Ordering::AcqRel);
+                runner.idle_notify.notify_waiters();
+            });
+            continue;
+        }
+
         let task = {
             let notified = scheduler.ready_notify.notified();
             tokio::pin!(notified);
@@ -475,10 +719,39 @@ async fn dispatch_loop(scheduler: Arc<BkDownloadScheduler>) {
         let guard = RunGuard {
             scheduler: scheduler.clone(),
             task,
+            armed: true,
         };
         runs.spawn(async move {
             let _permit = permit;
-            run_task(&guard.task, &guard.scheduler).await;
+            let outcome = run_task(&guard.task, &guard.scheduler).await;
+            match outcome {
+                RunOutcome::Done => {}
+                RunOutcome::WaitPending | RunOutcome::YieldStartup => {
+                    let scheduler = guard.scheduler.clone();
+                    let task = guard.defuse();
+                    scheduler.active.fetch_add(1, Ordering::AcqRel);
+                    tokio::spawn(async move {
+                        if matches!(outcome, RunOutcome::WaitPending) {
+                            tokio::select! {
+                                _ = scheduler.pending_notify.notified() => {}
+                                _ = tokio::time::sleep(PENDING_WAIT_FALLBACK) => {}
+                            }
+                        }
+                        if scheduler.running.load(Ordering::Acquire) {
+                            scheduler
+                                .ready
+                                .lock()
+                                .unwrap()
+                                .push(task.device_key.clone(), task);
+                            scheduler.ready_notify.notify_one();
+                        } else {
+                            remove_task(&scheduler.tasks, &task);
+                        }
+                        scheduler.active.fetch_sub(1, Ordering::AcqRel);
+                        scheduler.idle_notify.notify_waiters();
+                    });
+                }
+            }
         });
     }
     // Dropping the JoinSet aborts any live run futures; cancellation lands at
@@ -487,7 +760,11 @@ async fn dispatch_loop(scheduler: Arc<BkDownloadScheduler>) {
     scheduler.idle_notify.notify_waiters();
 }
 
-async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) {
+/// Fallback for the pending-import wait: without it a lost notification would
+/// park a background task forever. Long enough to never be busy polling.
+const PENDING_WAIT_FALLBACK: Duration = Duration::from_secs(5);
+
+async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) -> RunOutcome {
     let throttle = (task.config.max_mbps > 0).then(|| {
         Arc::new(Mutex::new(BkThrottle {
             started: tokio::time::Instant::now(),
@@ -498,7 +775,7 @@ async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) {
     let attempts = task.config.try_cnt as u32;
     for attempt in 0..attempts {
         if !scheduler.running.load(Ordering::Acquire) {
-            return;
+            return RunOutcome::Done;
         }
         // Re-resolve the cached file every attempt: the entry may have been
         // evicted while the task was pending, or after an ENOSPC failure.
@@ -525,29 +802,41 @@ async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) {
                     error_category = download_error_category(&error),
                     "background cache download could not open cached file"
                 );
-                return;
+                return RunOutcome::Done;
             }
         };
-        let chunks = match file.missing_background_chunks(task.source_size, task.blocks_per_chunk) {
-            Ok(chunks) => chunks,
-            Err(error) => {
-                tracing::warn!(
-                    error_category = download_error_category(&error),
-                    "invalid background cache block range"
-                );
-                return;
-            }
-        };
+        // Chunks whose only holes are pending-import blocks are deferred to
+        // the startup pack that owns them.
+        let chunks =
+            match file.actionable_background_chunks(task.source_size, task.blocks_per_chunk) {
+                Ok(chunks) => chunks,
+                Err(error) => {
+                    tracing::warn!(
+                        error_category = download_error_category(&error),
+                        "invalid background cache block range"
+                    );
+                    return RunOutcome::Done;
+                }
+            };
         if chunks.is_empty() {
-            return;
+            // Nothing actionable: either the bitmap is complete (task done)
+            // or every remaining hole is pending an in-flight startup pack —
+            // park until pending imports change. Completion is ALWAYS judged
+            // on the raw bitmap, never on the pending-filtered view.
+            return match file.background_is_complete(task.source_size) {
+                Ok(true) => RunOutcome::Done,
+                _ => RunOutcome::WaitPending,
+            };
         }
 
-        let first_error = download_chunks(task, &file, chunks, scheduler, throttle.as_ref()).await;
+        let outcome = download_chunks(task, &file, chunks, scheduler, throttle.as_ref()).await;
         if !scheduler.running.load(Ordering::Acquire) {
-            return;
+            return RunOutcome::Done;
         }
-        let Some(error) = first_error else {
-            return;
+        let error = match outcome {
+            ChunksOutcome::Done => return RunOutcome::Done,
+            ChunksOutcome::YieldStartup => return RunOutcome::YieldStartup,
+            ChunksOutcome::Failed(error) => error,
         };
         let error_category = download_error_category(&error);
         if attempt + 1 < attempts {
@@ -568,6 +857,18 @@ async fn run_task(task: &BkDownloadTask, scheduler: &BkDownloadScheduler) {
             );
         }
     }
+    RunOutcome::Done
+}
+
+/// How one pass over the missing chunks ended.
+enum ChunksOutcome {
+    /// Every chunk was fetched.
+    Done,
+    /// A startup pack is queued: yield at this chunk boundary so it can take
+    /// the file slot.
+    YieldStartup,
+    /// First chunk error (partial progress is kept).
+    Failed(anyhow::Error),
 }
 
 /// Download `chunks` of one layer with per-task concurrency, returning the
@@ -580,7 +881,7 @@ async fn download_chunks(
     chunks: Vec<(u64, u32)>,
     scheduler: &BkDownloadScheduler,
     throttle: Option<&Arc<Mutex<BkThrottle>>>,
-) -> Option<anyhow::Error> {
+) -> ChunksOutcome {
     let mut pending = chunks.into_iter();
     let mut in_flight = JoinSet::new();
     let mut first_error = None;
@@ -589,6 +890,11 @@ async fn download_chunks(
             && scheduler.running.load(Ordering::Acquire)
             && in_flight.len() < task.config.concurrency
         {
+            // A queued startup pack preempts background downloads at chunk
+            // boundaries so a long layer download cannot delay a resume.
+            if scheduler.startup_waiting() {
+                return ChunksOutcome::YieldStartup;
+            }
             let Some((start_block, len_blocks)) = pending.next() else {
                 break;
             };
@@ -626,7 +932,10 @@ async fn download_chunks(
             None => break,
         }
     }
-    first_error
+    match first_error {
+        Some(error) => ChunksOutcome::Failed(error),
+        None => ChunksOutcome::Done,
+    }
 }
 
 /// One chunk refill: gate admission, then a block slot, then the actual read

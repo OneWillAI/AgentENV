@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 uvm-ublk = { path = "../ublk" }
-overlaybd = { path = "../overlaybd" }
-storage-util = { path = "../util" }
+overlaybd = { path = "../overlaybd", features = ["io-uring"] }
+storage-util = { path = "../util", features = ["io-uring"] }
 warm-pool = { path = "../../crates/warm-pool" }
 agentenv-observability = { path = "../../crates/observability" }
 linux-cap = { path = "../../crates/linux-cap" }
@@ -24,7 +24,6 @@ tokio = { version = "1.44.2", features = ["full"] }
 tracing = "0.1.41"
 tracing-log = "0.2.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,5 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::CompleteEnv;
 
 mod auth;
 mod client;
@@ -20,11 +21,13 @@ struct Cli {
 enum Cmd {
     /// Save server URL and API key
     Auth,
+    /// Work on a project with native Codex in an AgentENV sandbox
+    Codex(commands::codex::Args),
     /// Build a template from a base image.
     /// Waits for the build to complete by default; exits non-zero on failure. Use -d to return immediately.
     Pull(commands::pull::Args),
     /// Build a template from a local Dockerfile
-    Build(commands::build::Args),
+    Build(Box<commands::build::Args>),
     /// Start a sandbox and attach an interactive shell
     Start(commands::start::Args),
     /// Run a command in a sandbox
@@ -57,14 +60,28 @@ enum Cmd {
     /// Template operations
     #[command(visible_alias = "templates")]
     Template(commands::template::Args),
+    /// Persistent volume operations
+    Volume(commands::volume::Args),
+}
+
+/// Chooses rustls's crypto provider for the process. reqwest and ureq enable
+/// different providers (aws-lc-rs and ring), so rustls cannot pick a default
+/// on its own, and a connection that relies on the default -- the `wss://`
+/// BuildKit tunnel of `aenv build` -- panics instead of connecting.
+fn install_crypto_provider() {
+    // Fails only when a provider is already installed, which serves as well.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 fn main() -> Result<()> {
+    install_crypto_provider();
+    CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth => commands::auth::run(),
+        Cmd::Codex(a) => commands::codex::run(a),
         Cmd::Pull(a) => commands::pull::run(a),
-        Cmd::Build(a) => commands::build::run(a),
+        Cmd::Build(a) => commands::build::run(*a),
         Cmd::Start(a) => commands::start::run(a),
         Cmd::Exec(a) => commands::exec::run(a),
         Cmd::Upload(a) => commands::upload::run(a),
@@ -78,5 +95,6 @@ fn main() -> Result<()> {
         Cmd::Timeout(a) => commands::timeout::run(a),
         Cmd::Snapshot(a) => commands::snapshot::run(a),
         Cmd::Template(a) => commands::template::run(a),
+        Cmd::Volume(a) => commands::volume::run(a),
     }
 }

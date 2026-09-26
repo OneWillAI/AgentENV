@@ -21,6 +21,8 @@ pub enum SandboxesColdPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -42,6 +44,20 @@ pub enum SandboxesGetResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxesMetricsGetResponse {
+    /// Successfully returned all running sandboxes with metrics
+    Status200_SuccessfullyReturnedAllRunningSandboxesWithMetrics(models::SandboxesWithMetrics),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesPostResponse {
     /// The sandbox was created successfully
     Status201_TheSandboxWasCreatedSuccessfully {
@@ -52,6 +68,8 @@ pub enum SandboxesPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -70,6 +88,8 @@ pub enum SandboxesSandboxIdConnectPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -159,6 +179,22 @@ pub enum SandboxesSandboxIdGetResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxesSandboxIdMetricsGetResponse {
+    /// Successfully returned the sandbox metrics
+    Status200_SuccessfullyReturnedTheSandboxMetrics(Vec<models::SandboxMetric>),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesSandboxIdNetworkPutResponse {
     /// Successfully updated the sandbox network configuration
     Status204_SuccessfullyUpdatedTheSandboxNetworkConfiguration,
@@ -214,6 +250,8 @@ pub enum SandboxesSandboxIdResumePostResponse {
     Status409_Conflict(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
+    /// Bad request
+    Status400_BadRequest(models::Error),
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Server error
@@ -258,11 +296,51 @@ pub enum V2SandboxesGetResponse {
     Status200_SuccessfullyReturnedAllRunningSandboxes {
         body: Vec<models::ListedSandbox>,
         x_next_token: Option<String>,
+        x_total_running: Option<i32>,
     },
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum V2SandboxesPostResponse {
+    /// The sandbox was created successfully
+    Status201_TheSandboxWasCreatedSuccessfully {
+        body: models::Sandbox,
+        x_agentenv_sandbox_id: Option<String>,
+    },
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum V2SandboxesSandboxIdConnectPostResponse {
+    /// The sandbox was already running
+    Status200_TheSandboxWasAlreadyRunning(models::Sandbox),
+    /// The sandbox was resumed successfully
+    Status201_TheSandboxWasResumedSuccessfully(models::Sandbox),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -298,6 +376,19 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         query_params: &models::SandboxesGetQueryParams,
     ) -> Result<SandboxesGetResponse, E>;
+
+    /// List sandbox metrics.
+    ///
+    /// SandboxesMetricsGet - GET /sandboxes/metrics
+    async fn sandboxes_metrics_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        query_params: &models::SandboxesMetricsGetQueryParams,
+    ) -> Result<SandboxesMetricsGetResponse, E>;
 
     /// Create sandbox.
     ///
@@ -388,6 +479,20 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::SandboxesSandboxIdGetPathParams,
     ) -> Result<SandboxesSandboxIdGetResponse, E>;
+
+    /// Sandbox metrics.
+    ///
+    /// SandboxesSandboxIdMetricsGet - GET /sandboxes/{sandboxID}/metrics
+    async fn sandboxes_sandbox_id_metrics_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdMetricsGetPathParams,
+        query_params: &models::SandboxesSandboxIdMetricsGetQueryParams,
+    ) -> Result<SandboxesSandboxIdMetricsGetResponse, E>;
 
     /// Update sandbox network.
     ///
@@ -484,4 +589,31 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         query_params: &models::V2SandboxesGetQueryParams,
     ) -> Result<V2SandboxesGetResponse, E>;
+
+    /// Create sandbox (v2).
+    ///
+    /// V2SandboxesPost - POST /v2/sandboxes
+    async fn v2_sandboxes_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        body: &models::NewSandboxV2,
+    ) -> Result<V2SandboxesPostResponse, E>;
+
+    /// Connect sandbox (v2).
+    ///
+    /// V2SandboxesSandboxIdConnectPost - POST /v2/sandboxes/{sandboxID}/connect
+    async fn v2_sandboxes_sandbox_id_connect_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::V2SandboxesSandboxIdConnectPostPathParams,
+        body: &Option<models::ConnectSandboxV2>,
+    ) -> Result<V2SandboxesSandboxIdConnectPostResponse, E>;
 }
