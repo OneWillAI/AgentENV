@@ -10,6 +10,8 @@ if [[ ! -f "$COMMON_SH" ]]; then
 fi
 # shellcheck source=/dev/null
 source "$COMMON_SH"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/lib/wait.sh"
 LOG_TAG=TEST
 
 require_cmd docker
@@ -67,23 +69,19 @@ log "Starting envd container..."
 
 # Wait for envd to start
 log "Waiting for envd to be ready on port ${READY_PORT}..."
-ready=0
-for ((i=1; i<=START_TIMEOUT_SECS; i++)); do
+envd_is_ready() {
     if ! "${DOCKER_CMD[@]}" ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-        warn "envd container exited early."
-        "${DOCKER_CMD[@]}" logs "$CONTAINER_NAME" || true
-        exit 1
+        return 2
     fi
 
     if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/${READY_PORT}" 2>/dev/null; then
-        ready=1
-        break
+        return 0
     fi
 
-    sleep 1
-done
+    return 1
+}
 
-if [[ "$ready" -ne 1 ]]; then
+if ! wait_until "${START_TIMEOUT_SECS}" envd_is_ready; then
     warn "Timeout waiting for envd to start."
     "${DOCKER_CMD[@]}" logs "$CONTAINER_NAME" || true
     exit 1

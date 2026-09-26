@@ -4049,3 +4049,80 @@ async fn test_direct_io_create_sparse() {
     assert_eq!(lsmt.size().await.unwrap(), vsize);
     assert_eq!(lsmt.file_type(), LSMTFileType::SparseReadWrite);
 }
+/// Sustained writes to one continuously open upper: this does not use snapshot
+/// rotation or pause/resume to obtain its space bound. Run explicitly on Linux.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "sustained filesystem allocation measurement; run on isolated builder state"]
+async fn hybrid_sustained_writes_record_allocated_bytes() {
+    use std::os::unix::fs::MetadataExt;
+    const WORKING_SET: usize = 16 * 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
+    const ROUNDS: usize = 256;
+    let temp = TempDir::new().unwrap();
+    let (data, index, upper) = create_hybrid_lsmt_env(&temp, (2 * WORKING_SET) as u64).await;
+    let data_path = temp.path().join("hybrid-data.lsmt");
+    let index_path = temp.path().join("hybrid-index.lsmt");
+    let allocated = |path: &std::path::Path| std::fs::metadata(path).unwrap().blocks() * 512;
+    let mut written = 0u64;
+    let mut baseline = 0;
+    for phase in ["overwrite", "discard-rewrite"] {
+        for round in 0..ROUNDS {
+            let payload = vec![(round % 251 + 1) as u8; CHUNK];
+            for offset in (0..WORKING_SET).step_by(CHUNK) {
+                if phase == "discard-rewrite" {
+                    upper
+                        .discard_range(offset as u64, CHUNK as u64)
+                        .await
+                        .unwrap();
+                    assert!(upper
+                        .read_at(offset as u64, CHUNK)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|b| *b == 0));
+                }
+                upper.write_at(offset as u64, &payload).await.unwrap();
+                written += CHUNK as u64;
+            }
+            if round == 0 || (round + 1) % 32 == 0 {
+                upper.sync().await.unwrap();
+                let bytes = allocated(&data_path);
+                if baseline == 0 {
+                    baseline = bytes;
+                }
+                println!("upper-growth phase={phase} round={} cumulative_written={written} data_allocated={bytes} index_allocated={} data_apparent={} index_apparent={} unique_written={WORKING_SET} checkpoint_bytes=0 rollback_bytes=0",
+                    round + 1, allocated(&index_path), data.size().await.unwrap(), index.size().await.unwrap());
+                assert!(
+                    bytes <= baseline + 1024 * 1024,
+                    "data allocation grew with cumulative overwrites"
+                );
+            }
+            assert_eq!(
+                upper.read_at(0, CHUNK).await.unwrap().as_ref(),
+                payload.as_slice()
+            );
+        }
+    }
+    upper.sync().await.unwrap();
+    drop(upper);
+    let reopened = LSMTFile::open(data, Some(index), None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .read_at((WORKING_SET - CHUNK) as u64, CHUNK)
+            .await
+            .unwrap()
+            .as_ref(),
+        &vec![((ROUNDS - 1) % 251 + 1) as u8; CHUNK]
+    );
+    // New unique writes are permitted to allocate, independently of reuse.
+    reopened
+        .write_at(WORKING_SET as u64, &vec![0x7b; CHUNK])
+        .await
+        .unwrap();
+    reopened.sync().await.unwrap();
+    println!("upper-growth phase=new-unique cumulative_written={} data_allocated={} index_allocated={} unique_written={} checkpoint_bytes=0 rollback_bytes=0", written+CHUNK as u64, allocated(&data_path), allocated(&index_path), WORKING_SET+CHUNK);
+    assert!(allocated(&data_path) <= baseline + CHUNK as u64 + 1024 * 1024);
+}
