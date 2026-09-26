@@ -122,9 +122,11 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
-        shutdown_outcome: tokio::sync::OnceCell::new(),
+        shutdown_complete: tokio::sync::Mutex::new(false),
+        lifecycle_gate: RwLock::new(()),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        create_idempotency: Mutex::new(HashMap::new()),
         volume_manager: None,
     })
 }
@@ -319,6 +321,11 @@ impl MetadataStore for ScriptedStore {
         &self,
         sandbox_id: &SandboxId,
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
+        if let StoreAction::Fail(error) =
+            ScriptedStoreControl::take_action(&self.control.remove_actions)
+        {
+            return Err(error);
+        }
         self.inner.remove(sandbox_id).await
     }
 
@@ -738,6 +745,8 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     let sandbox_id = SandboxId::new();
     let mut paused = paused_resume_metadata(sandbox_id);
     paused.auto_resume = true;
+    paused.create_idempotency_key = Some("restored-create-operation".to_string());
+    paused.create_request_fingerprint = Some("sha256:restored-request".to_string());
     let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
 
     let orchestrator = Orchestrator::new(
@@ -747,7 +756,14 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::LoadAll,
+            RecordingCall::LoadCreateIdempotency,
+            RecordingCall::PersistCreateIdempotency,
+        ]
+    );
     let restored = orchestrator
         .get_sandbox(&sandbox_id)
         .await?
@@ -758,6 +774,14 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
         orchestrator.proxy_lookup_for(&sandbox_id).await?,
         ProxyLookupResult::Paused { auto_resume: true }
     );
+    let replayed = orchestrator
+        .create_sandbox(idempotent_create_request(
+            "restored-create-operation",
+            "sha256:restored-request",
+        ))
+        .await?;
+    assert_eq!(replayed.id, sandbox_id);
+    assert_eq!(replayed.state, SandboxState::Paused);
     assert_metrics_values(&orchestrator, 0, 0, 0, 0, 0, 0).await;
     Ok(())
 }
@@ -2291,36 +2315,6 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "stop failed".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[]))
-        .await?;
-
-    orchestrator.pause_sandbox(created.id).await?;
-
-    let paused = orchestrator
-        .get_sandbox(&created.id)
-        .await?
-        .expect("sandbox should still exist after pause");
-    assert_eq!(paused.state, SandboxState::Paused);
-
-    // Resource metrics are derived from the current metadata state, so a
-    // sandbox that is logically Paused no longer counts toward allocated
-    // CPU/memory regardless of whether the backing VM `stop()` succeeded.
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    Ok(())
-}
 
 #[tokio::test]
 async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
@@ -2423,7 +2417,8 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
         persister.calls(),
         vec![
             RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused
+            RecordingCall::PersistPaused,
+            RecordingCall::MarkPausedRuntimeStopped,
         ]
     );
     let metadata = orchestrator
@@ -2578,6 +2573,7 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
+            RecordingCall::MarkPausedRuntimeStopped,
         ]
     );
 
@@ -2839,6 +2835,7 @@ async fn resume_sandbox_build_failure_does_not_subtract_metrics_that_were_never_
             id: paused_id,
             state: SandboxState::Paused,
             paused_state: Some(test_paused_state().clone()),
+            paused_runtime_stopped: true,
             ..Default::default()
         })
         .await?;
@@ -5079,6 +5076,7 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
         state: SandboxState::Paused,
         virtualization_mode: sandbox_mode,
         paused_state: None,
+        paused_runtime_stopped: true,
         ..Default::default()
     }]);
     let orchestrator = Orchestrator::new_inner(
@@ -5118,7 +5116,10 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
     assert_eq!(metadata.state, SandboxState::Paused);
     assert_eq!(metadata.virtualization_mode, sandbox_mode);
     assert!(metadata.paused_state.is_none());
-    assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::LoadAll, RecordingCall::LoadCreateIdempotency]
+    );
 }
 
 #[tokio::test]
@@ -6263,6 +6264,39 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
 }
 
 
+#[tokio::test]
+async fn normal_pause_collects_before_concurrent_resume_can_reopen_files() -> anyhow::Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let guest = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let (entered, release) = persister.block_next_collection();
+    let pausing = Arc::clone(&orchestrator);
+    let pause = tokio::spawn(async move { pausing.pause_sandbox(guest.id).await });
+    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+        .await??
+        .forget();
+    assert!(persister.loaded_sandboxes()[0].paused_runtime_stopped);
+    let resuming = Arc::clone(&orchestrator);
+    let mut resume = tokio::spawn(async move {
+        resuming
+            .resume_sandbox(guest.id, NewTimeout::Set(Duration::from_secs(60)))
+            .await
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut resume)
+        .await
+        .is_err());
+    release.add_permits(1);
+    pause.await??;
+    assert_eq!(resume.await??.state, SandboxState::Running);
+    Ok(())
+}
 
 fn sandbox_metric_sample(timestamp: i64) -> SandboxMetric {
     SandboxMetric {
