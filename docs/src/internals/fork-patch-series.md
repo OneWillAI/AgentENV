@@ -57,3 +57,14 @@ completed successfully, producing manifest SHA-256
 `5b1f6adfc6824e1e63b28ddb43c188c9dc69ac6d189c0a2e2dd2ba2659842cda`.
 It is reference evidence only and must not be staged for this restructuring.
 Dev and production deployment still require separate manifest-bound approval.
+
+## Replacement validation
+
+On `onewill-builder`, the replacement source at `059accb` passed workspace
+formatting, `cargo clippy --locked --workspace --all-targets --all-features --
+-D warnings`, and `cargo test --locked -p agentenv --lib` (972 passed, four
+capability tests ignored in the ordinary-user run). Checks ran as
+`onewill-builder` with isolated state and Rust 1.97.1. The four capability tests
+passed in the earlier isolated capability run on the identical production tree.
+This documentation update changes no build inputs or production code. Real VM
+migration and replacement-manifest staging acceptance remain separate gates.
