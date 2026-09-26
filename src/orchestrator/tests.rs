@@ -3000,7 +3000,7 @@ async fn capture_snapshot_terminal_stop_failure_retains_runtime_until_delete_ret
 }
 
 #[tokio::test]
-async fn capture_snapshot_without_runtime_handle_removes_sandbox_and_releases_metrics() -> Result<()>
+async fn capture_snapshot_without_runtime_handle_retains_state_until_handle_recovery() -> Result<()>
 {
     setup();
     let orchestrator = make_orchestrator().await;
@@ -3033,14 +3033,33 @@ async fn capture_snapshot_without_runtime_handle_removes_sandbox_and_releases_me
         .capture_snapshot(sandbox_id)
         .await
         .expect_err("capture_snapshot should fail when persisted running sandbox has no handle");
-    assert!(matches!(err, OrchestratorError::SandboxNotFound(_)));
-
-    assert!(
-        orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
-        "handle-less running sandbox should be removed from the store"
-    );
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxRecoveryRequired { .. }
+    ));
+    let retained = orchestrator.get_sandbox(&sandbox_id).await?.unwrap();
+    assert_eq!(retained.state, SandboxState::Running);
+    assert_eq!(retained.volume_mounts, created.volume_mounts);
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+    assert!(orchestrator.delete_sandbox(sandbox_id).await.is_err());
+    orchestrator
+        .sandboxes
+        .write()
+        .await
+        .insert(sandbox_id, removed.unwrap());
+    orchestrator.capture_snapshot(sandbox_id).await?;
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     Ok(())
 }
 
@@ -7250,7 +7269,25 @@ async fn create_transfers_volume_ownership_before_start_and_releases_only_stoppe
                     *observed.lock().unwrap(),
                     "uncertain runtime must keep volume reservation"
                 );
-                assert!(owner.is_some());
+                let retained_id = SandboxId::parse_str(owner.as_ref().unwrap())?;
+                assert!(orchestrator
+                    .sandboxes
+                    .read()
+                    .await
+                    .contains_key(&retained_id));
+                assert_eq!(
+                    orchestrator.get_sandbox(&retained_id).await?.unwrap().state,
+                    SandboxState::Killing
+                );
+                orchestrator.delete_sandbox(retained_id).await?;
+                assert!(!orchestrator
+                    .sandboxes
+                    .read()
+                    .await
+                    .contains_key(&retained_id));
+                let volume = volumes.get(volume_id).await?;
+                assert!(volume.reserved_by_sandbox_id.is_none());
+                assert_eq!(volume.status, VolumeStatus::Failed);
             } else {
                 assert!(
                     owner.is_none(),
@@ -7261,6 +7298,24 @@ async fn create_transfers_volume_ownership_before_start_and_releases_only_stoppe
             let created = result?;
             assert_eq!(owner.as_deref(), Some(created.id.to_string().as_str()));
             assert_eq!(owner, *observed.lock().unwrap());
+            let handle = orchestrator
+                .sandboxes
+                .write()
+                .await
+                .remove(&created.id)
+                .unwrap();
+            assert!(matches!(
+                orchestrator.capture_snapshot(created.id).await,
+                Err(OrchestratorError::SandboxRecoveryRequired { .. })
+            ));
+            let retained_volume = volumes.get(volume_id).await?;
+            assert_eq!(retained_volume.reserved_by_sandbox_id, owner);
+            assert_eq!(retained_volume.status, VolumeStatus::Ready);
+            orchestrator
+                .sandboxes
+                .write()
+                .await
+                .insert(created.id, handle);
         }
     }
     Ok(())
@@ -7309,5 +7364,113 @@ async fn fork_terminal_stop_failure_retains_source_until_delete_retry() -> Resul
     orchestrator.delete_sandbox(source.id).await?;
     assert!(orchestrator.get_sandbox(&source.id).await?.is_none());
     assert_metrics_values(&orchestrator, 1, 1, 0, 0, 0, 0).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_resume_retains_runtime_after_stop_failure_and_refuses_second_launch() -> Result<()>
+{
+    setup();
+    for operation in [MockOperation::StartNowait, MockOperation::WaitForReady] {
+        let behavior = Arc::new(MockBehavior::new());
+        let orchestrator =
+            make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone()))
+                .await;
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        orchestrator.pause_sandbox(created.id).await?;
+        behavior.push_action(
+            operation,
+            MockAction::Fail {
+                message: "failed restore".to_owned(),
+            },
+        );
+        behavior.push_action(
+            MockOperation::Stop,
+            MockAction::Fail {
+                message: "stop refused".to_owned(),
+            },
+        );
+        assert!(orchestrator
+            .resume_sandbox(created.id, NewTimeout::UseExisting)
+            .await
+            .is_err());
+        let retained = orchestrator.get_sandbox(&created.id).await?.unwrap();
+        assert_eq!(retained.state, SandboxState::Paused);
+        assert!(retained.paused_state.is_some());
+        assert!(!retained.paused_runtime_stopped);
+        let handle = orchestrator
+            .sandboxes
+            .read()
+            .await
+            .get(&created.id)
+            .cloned()
+            .expect("failed stop must retain owning backend");
+        assert!(orchestrator
+            .resume_sandbox(created.id, NewTimeout::UseExisting)
+            .await
+            .is_err());
+        assert!(Arc::ptr_eq(
+            &handle,
+            orchestrator
+                .sandboxes
+                .read()
+                .await
+                .get(&created.id)
+                .unwrap()
+        ));
+        let stop_calls = behavior.stop_calls();
+        orchestrator.delete_sandbox(created.id).await?;
+        assert_eq!(behavior.stop_calls(), stop_calls + 1);
+        assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_waiting_on_terminal_capture_can_retry_its_failed_stop() -> anyhow::Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Snapshot,
+        MockAction::FailTerminal {
+            message: "terminal capture".to_owned(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::FailAfter {
+            delay: Duration::from_millis(200),
+            message: "first stop refused".to_owned(),
+        },
+    );
+    let stopping = Arc::new(Notify::new());
+    let notify = stopping.clone();
+    behavior.set_on_operation(MockOperation::Stop, Arc::new(move || notify.notify_one()));
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let capturing = orchestrator.clone();
+    let capture = tokio::spawn(async move { capturing.capture_snapshot(created.id).await });
+    stopping.notified().await;
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Snapshotting
+    );
+    // Delete waits for capture while capture must publish a stop-retry phase.
+    // Holding the deletion mutex across that wait deadlocks until 60s timeout.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.delete_sandbox(created.id),
+    )
+    .await??;
+    assert!(tokio::time::timeout(Duration::from_secs(5), capture)
+        .await??
+        .is_err());
+    assert_eq!(behavior.stop_calls(), 2);
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
     Ok(())
 }

@@ -1701,27 +1701,51 @@ where
     async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("deleting sandbox");
         let deletion = self.deletion_progress(sandbox_id).await;
-        let mut progress = deletion.lock().await;
-        match *progress {
-            DeleteProgress::Done => return Ok(()),
-            DeleteProgress::Capture => {}
-            _ => {
-                return self
-                    .delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress)
-                    .await
+        loop {
+            let mut progress = deletion.lock().await;
+            match *progress {
+                DeleteProgress::Done => return Ok(()),
+                DeleteProgress::Capture => {}
+                _ => {
+                    return self
+                        .delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress)
+                        .await
+                }
+            }
+            if self.finish_retried_delete_if_needed(sandbox_id).await? {
+                *progress = DeleteProgress::Done;
+                return Ok(());
+            }
+            match self
+                .store
+                .update_state_if_state(
+                    &sandbox_id,
+                    SandboxState::Killing,
+                    &[SandboxState::Running, SandboxState::Paused],
+                )
+                .await
+            {
+                Ok(previous_state) => {
+                    return self
+                        .delete_sandbox_impl(sandbox_id, previous_state, &mut progress)
+                        .await
+                }
+                Err(StoreError::StateConflict { actual_state, .. }) => {
+                    // A failed capture/launch may need this same mutex to
+                    // publish its retained-stop phase. Never hold it while
+                    // waiting for that lifecycle operation to finish.
+                    drop(progress);
+                    match self
+                        .resolve_delete_state_conflict(sandbox_id, actual_state)
+                        .await?
+                    {
+                        DeleteTransition::Retry => continue,
+                        DeleteTransition::Complete => return Ok(()),
+                    }
+                }
+                Err(error) => return Err(OrchestratorError::from(error)),
             }
         }
-
-        if self.finish_retried_delete_if_needed(sandbox_id).await? {
-            *progress = DeleteProgress::Done;
-            return Ok(());
-        }
-        let previous_state = match self.transition_delete_to_killing(sandbox_id).await? {
-            Some(state) => state,
-            None => return Ok(()),
-        };
-        self.delete_sandbox_impl(sandbox_id, previous_state, &mut progress)
-            .await
     }
 
     async fn finish_retried_delete_if_needed(&self, sandbox_id: SandboxId) -> Result<bool> {
@@ -1739,35 +1763,6 @@ where
                     .await;
                 info!("sandbox delete cleanup completed");
                 Ok(true)
-            }
-        }
-    }
-
-    async fn transition_delete_to_killing(
-        &self,
-        sandbox_id: SandboxId,
-    ) -> Result<Option<SandboxState>> {
-        loop {
-            match self
-                .store
-                .update_state_if_state(
-                    &sandbox_id,
-                    SandboxState::Killing,
-                    &[SandboxState::Running, SandboxState::Paused],
-                )
-                .await
-            {
-                Ok(previous_state) => return Ok(Some(previous_state)),
-                Err(StoreError::StateConflict { actual_state, .. }) => {
-                    match self
-                        .resolve_delete_state_conflict(sandbox_id, actual_state)
-                        .await?
-                    {
-                        DeleteTransition::Retry => continue,
-                        DeleteTransition::Complete => return Ok(None),
-                    }
-                }
-                Err(error) => return Err(OrchestratorError::from(error)),
             }
         }
     }
@@ -1971,6 +1966,8 @@ where
         self.finish_sandbox_delete(sandbox_id, entry.as_ref())
             .await?;
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+            .await;
+        self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
             .await;
         self.deletions.lock().await.remove(&sandbox_id);
         Ok(())
@@ -2890,13 +2887,18 @@ where
         if let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() {
             return Ok(handle);
         }
-        warn!("sandbox handle not found while snapshotting, removing from store");
-        self.detach_sandbox_handle_and_route(&sandbox_id).await;
-        if let Some(metadata) = self.store.get(&sandbox_id).await? {
-            self.finalize_terminal_volumes(&metadata).await;
-        }
-        self.store.remove(&sandbox_id).await?;
-        Err(OrchestratorError::SandboxNotFound(sandbox_id))
+        // Losing an in-memory handle does not prove that its VM or storage
+        // stopped. Preserve metadata, routes, volume ownership and image refs;
+        // restore the prior state so recovery can reattach the owning handle.
+        warn!(%sandbox_id, "snapshot requires recovery of the missing runtime handle");
+        self.store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Running,
+                &[SandboxState::Snapshotting],
+            )
+            .await?;
+        Err(OrchestratorError::SandboxRecoveryRequired { sandbox_id })
     }
 
     /// Terminal capture errors permit cleanup only after a positive stop result.
@@ -2910,11 +2912,12 @@ where
     ) -> Result<()> {
         if let Err(error) = handle.lock().await.stop().await {
             warn!(%error, %sandbox_id, "terminal capture cleanup awaits a successful runtime stop");
+            let progress = self.deletion_progress(sandbox_id).await;
+            let mut progress = progress.lock().await;
             self.store
                 .update_state_if_state(&sandbox_id, SandboxState::Killing, &[expected_state])
                 .await?;
-            let progress = self.deletion_progress(sandbox_id).await;
-            *progress.lock().await = DeleteProgress::Stop {
+            *progress = DeleteProgress::Stop {
                 capture_failed: true,
             };
             return Ok(());
@@ -3654,11 +3657,7 @@ where
         }
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
-            let runtime_absence_proven = Self::stop_unregistered_sandbox(
-                sandbox.as_mut(),
-                "failed to stop sandbox after start failure",
-            )
-            .await;
+            let runtime_absence_proven = self.stop_unregistered_sandbox(plan, sandbox).await;
             self.rollback_failed_launch_metadata(plan, transitional_state, runtime_absence_proven)
                 .await;
             return Err(OrchestratorError::SandboxOperationFailed {
@@ -3670,8 +3669,7 @@ where
         debug!("sandbox start requested");
         if self.is_shutting_down() {
             info!("orchestrator started shutting down just after starting the sandbox");
-            let runtime_absence_proven =
-                Self::stop_unregistered_sandbox(sandbox.as_mut(), "failed to stop sandbox").await;
+            let runtime_absence_proven = self.stop_unregistered_sandbox(plan, sandbox).await;
             self.rollback_failed_launch_metadata(plan, transitional_state, runtime_absence_proven)
                 .await;
             return Err(OrchestratorError::ShuttingDown);
@@ -3680,13 +3678,21 @@ where
     }
 
     async fn stop_unregistered_sandbox(
-        sandbox: &mut dyn SandboxBackend,
-        failure_message: &'static str,
+        &self,
+        plan: &LaunchPlan,
+        mut sandbox: Box<dyn SandboxBackend>,
     ) -> bool {
         match sandbox.stop().await {
             Ok(()) => true,
             Err(error) => {
-                warn!(error = %format_args!("{error:#}"), "{failure_message}");
+                warn!(%error, "retaining failed launch runtime after uncertain stop");
+                // Dropping the backend can kill its VM and storage. Publish
+                // ownership before rollback so a failed launch remains alive
+                // and a normal delete can retry graceful stop.
+                self.sandboxes
+                    .write()
+                    .await
+                    .insert(plan.sandbox_id(), Arc::new(Mutex::new(sandbox)));
                 false
             }
         }
@@ -3858,6 +3864,23 @@ where
         handle: SandboxHandle,
         stage: FailedLaunchStage,
     ) {
+        // Keep the registered owning handle until stop succeeds. In particular,
+        // a failed readiness check is not permission to drop a running backend.
+        let stop_result = handle.lock().await.stop().await;
+        if let Err(error) = stop_result {
+            warn!(%error, "failed launch cleanup awaits a successful runtime stop");
+            let is_current = self
+                .sandboxes
+                .read()
+                .await
+                .get(&plan.sandbox_id())
+                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            if is_current {
+                self.rollback_failed_launch_metadata(plan, plan.transitional_state(), false)
+                    .await;
+            }
+            return;
+        }
         let should_rollback_shared_state = self
             .detach_launch_runtime_if_current(
                 &plan.sandbox_id(),
@@ -3866,24 +3889,11 @@ where
                 stage,
             )
             .await;
-
-        // Stop the sandbox.
-        let stop_result = {
-            let mut sandbox = handle.lock().await;
-            sandbox.stop().await
-        };
-        let runtime_absence_proven = stop_result.is_ok();
-        if let Err(err) = stop_result {
-            warn!(error = %format_args!("{err:#}"), "failed to stop sandbox while rolling back launch");
-        }
-
-        if !should_rollback_shared_state {
-            return;
-        }
-
-        if let Some(expected_state) = stage.rollback_expected_state(plan) {
-            self.rollback_failed_launch_metadata(plan, expected_state, runtime_absence_proven)
-                .await;
+        if should_rollback_shared_state {
+            if let Some(expected_state) = stage.rollback_expected_state(plan) {
+                self.rollback_failed_launch_metadata(plan, expected_state, true)
+                    .await;
+            }
         }
     }
 
@@ -3893,12 +3903,42 @@ where
         expected_state: SandboxState,
         runtime_absence_proven: bool,
     ) {
-        self.release_image_refs(RuntimeImageOwner::StartingSandbox(plan.sandbox_id()))
-            .await;
+        if runtime_absence_proven {
+            self.release_image_refs(RuntimeImageOwner::StartingSandbox(plan.sandbox_id()))
+                .await;
+        }
         match plan {
-            LaunchPlan::Create(_) => {
+            LaunchPlan::Create(create) => {
                 if !runtime_absence_proven {
-                    warn!(sandbox_id = %plan.sandbox_id(), "retaining create volume ownership after uncertain stop");
+                    warn!(sandbox_id = %plan.sandbox_id(), "retaining create runtime and volume ownership after uncertain stop");
+                    // A failure before register_launch has no metadata yet.
+                    // Keep a discoverable record and resume deletion at stop,
+                    // without publishing an incompletely started volume.
+                    let progress = self.deletion_progress(create.sandbox_id).await;
+                    let mut progress = progress.lock().await;
+                    let retained = match self.store.get(&create.sandbox_id).await {
+                        Ok(Some(_)) => self
+                            .store
+                            .update_state_if_state(
+                                &create.sandbox_id,
+                                SandboxState::Killing,
+                                &[expected_state],
+                            )
+                            .await
+                            .map(|_| ()),
+                        Ok(None) => {
+                            let mut metadata = create.metadata.clone();
+                            metadata.state = SandboxState::Killing;
+                            self.store.add(metadata).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = retained {
+                        warn!(%error, "failed to record retained launch; runtime and references remain owned");
+                    }
+                    *progress = DeleteProgress::Stop {
+                        capture_failed: true,
+                    };
                     return;
                 }
                 if let (Some(manager), Some(metadata)) =
