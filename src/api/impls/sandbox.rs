@@ -822,9 +822,40 @@ impl ApiImpl {
         body: &models::NewColdSandbox,
         idempotency: Option<CreateSandboxIdempotency>,
         timer: &SandboxStageTimer,
-    ) -> Result<CreateSandboxRequest, CreateRequestError> {
+    ) -> Result<
+        (
+            CreateSandboxRequest,
+            Option<crate::snapshot::RunnableSnapshot>,
+        ),
+        CreateRequestError,
+    > {
         let image_resolver = self.image_resolver();
-        let resolved_rootfs = timer
+        // Retain the materialization lease until the new sandbox owns its image
+        // references. A saved snapshot may be deleted after creation completes.
+        let source_snapshot = if let Some(id) = body.image.strip_prefix("snapshot://") {
+            Some(
+                self.snapshot_manager
+                    .load_runnable(id)
+                    .await
+                    .map_err(|error| {
+                        CreateRequestError::ServerError(Self::snapshot_manager_error(&error))
+                    })?
+                    .ok_or_else(|| {
+                        CreateRequestError::BadRequest(Self::error(404, "Snapshot not found"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let resolved_rootfs = if let Some(snapshot) = &source_snapshot {
+            ResolvedBlockImage {
+                image_ref: body.image.clone(),
+                overlaybd_config_path: snapshot.manifest().rootfs.image_config_path.clone(),
+                base_context: Default::default(),
+                raw_config: None,
+            }
+        } else {
+            timer
             .time("resolve_rootfs", image_resolver.resolve(&body.image))
             .await
             .map_err(|error| {
@@ -837,7 +868,8 @@ impl ApiImpl {
                         format!("resolve sandbox rootfs image '{}': {error:#}", body.image),
                     ))
                 }
-            })?;
+            })?
+        };
         let resources = cold_start_resources(body).map_err(CreateRequestError::BadRequest)?;
         let resolved_attached = timer
             .time(
@@ -868,29 +900,32 @@ impl ApiImpl {
             .into_iter()
             .map(|resolved| resolved.drive)
             .collect();
-        Ok(CreateSandboxRequest {
-            source: SandboxLaunchSource::Image {
-                image_ref: resolved_rootfs.image_ref,
-                overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
-                context: Box::new(resolved_rootfs.base_context.into()),
-                resources: Some(resources),
-                extra_drives,
-                extra_boot_args: body.extra_boot_args.clone(),
-                image_configs: Box::new(image_configs),
+        Ok((
+            CreateSandboxRequest {
+                source: SandboxLaunchSource::Image {
+                    image_ref: resolved_rootfs.image_ref,
+                    overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
+                    context: Box::new(resolved_rootfs.base_context.into()),
+                    resources: Some(resources),
+                    extra_drives,
+                    extra_boot_args: body.extra_boot_args.clone(),
+                    image_configs: Box::new(image_configs),
+                },
+                extra_drives: Vec::new(),
+                extra_drives_in_snapshot: false,
+                timeout: duration_from_secs(body.timeout),
+                timeout_action: create_timeout_action(body.auto_pause),
+                auto_resume: create_auto_resume(body.auto_resume.as_ref()),
+                user_metadata: body.metadata.clone(),
+                env_vars: nonempty_env_vars(body.env_vars.clone()),
+                network_policy,
+                secure: body.secure == Some(true),
+                custom_extension_params,
+                idempotency,
+                volume_mounts: HashMap::new(),
             },
-            extra_drives: Vec::new(),
-            extra_drives_in_snapshot: false,
-            timeout: duration_from_secs(body.timeout),
-            timeout_action: create_timeout_action(body.auto_pause),
-            auto_resume: create_auto_resume(body.auto_resume.as_ref()),
-            user_metadata: body.metadata.clone(),
-            env_vars: nonempty_env_vars(body.env_vars.clone()),
-            network_policy,
-            secure: body.secure == Some(true),
-            custom_extension_params,
-            idempotency,
-            volume_mounts: HashMap::new(),
-        })
+            source_snapshot,
+        ))
     }
 
     async fn prepare_warm_create_request(
@@ -2434,7 +2469,7 @@ impl ApiImpl {
             Err(error) => return Ok(cold_create_error_response(error)),
         };
         let timer = SandboxStageTimer::new("create_cold");
-        let mut request = match self
+        let (mut request, _source_snapshot) = match self
             .prepare_cold_create_request(body, idempotency, &timer)
             .await
         {

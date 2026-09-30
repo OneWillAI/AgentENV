@@ -2735,7 +2735,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MemoryMb> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct NewColdSandbox {
-    /// Explicit external OCI image reference to use as the sandbox rootfs. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
+    /// Explicit external OCI image reference, or snapshot://<id> to cold boot from a saved snapshot's rootfs with independently chosen resources. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
     #[serde(rename = "image")]
     #[validate(custom(function = "check_xss_string"))]
     pub image: String,

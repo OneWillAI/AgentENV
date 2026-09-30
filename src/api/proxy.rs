@@ -90,6 +90,9 @@ const E2B_SANDBOX_ID_HEADER: &str = "e2b-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 /// E2B-compatible alias for the target port header.
 const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
+// A control plane that performs its own capacity admission can disable proxy
+// wake-up, preventing a pause race from bypassing that admission.
+const AUTO_RESUME_HEADER: &str = "x-agentenv-auto-resume";
 #[cfg(test)]
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
@@ -727,6 +730,16 @@ async fn resolve_proxy_request(
                 return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
             }
             Ok(ProxyLookupResult::Paused { auto_resume: true }) => {
+                if parts
+                    .headers
+                    .get(AUTO_RESUME_HEADER)
+                    .is_some_and(|value| value == "false")
+                {
+                    return Err(ProxyRequestError::SandboxUnavailable(
+                        sandbox_id,
+                        SandboxState::Paused,
+                    ));
+                }
                 if auto_resume_attempted {
                     return Err(ProxyRequestError::AutoResumeFailed(sandbox_id));
                 }
@@ -988,6 +1001,7 @@ fn sanitize_request_headers(headers: &mut HeaderMap) {
     headers.remove(E2B_SANDBOX_ID_HEADER);
     headers.remove(TARGET_PORT_HEADER);
     headers.remove(E2B_TARGET_PORT_HEADER);
+    headers.remove(AUTO_RESUME_HEADER);
     headers.remove(TRAFFIC_ACCESS_TOKEN_HEADER);
     headers.remove(header::HOST);
     remove_hop_by_hop_headers(headers);
@@ -2318,6 +2332,30 @@ mod tests {
             body,
             Bytes::from_static(b"sandbox is not proxyable in its current state")
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_caller_can_disable_wake_for_capacity_admission() {
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox_with_state_and_auto_resume(
+            &sandbox_id,
+            crate::orchestrator::SandboxState::Paused,
+            true,
+        )
+        .await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/proxy/jobs")
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, "3000")
+                    .header(AUTO_RESUME_HEADER, "false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
     }
 
     #[tokio::test]

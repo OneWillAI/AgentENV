@@ -725,7 +725,8 @@ components:
         image:
           type: string
           description: >
-            Explicit external OCI image reference to use as the sandbox rootfs.
+            Explicit external OCI image reference, or snapshot://<id> to cold boot
+            from a saved snapshot's rootfs with independently chosen resources.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
         idempotencyKey:
