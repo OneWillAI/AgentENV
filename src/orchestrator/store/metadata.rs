@@ -129,6 +129,8 @@ impl SandboxMetadata {
     }
 
     fn _set_timeout(&mut self, timeout: Option<Duration>, from: SystemTime) {
+        // An explicit zero TTL disables expiration; omitted API TTLs still use their default.
+        let timeout = timeout.filter(|ttl| !ttl.is_zero());
         self.timeout = timeout;
         self.expires_at = timeout.and_then(|ttl| from.checked_add(ttl));
     }
@@ -143,7 +145,8 @@ impl SandboxMetadata {
             NewTimeout::Set(timeout) => Some(timeout),
             NewTimeout::EnsureMinimum(minimum) => match self.timeout {
                 Some(existing) => Some(existing.max(minimum)),
-                None => Some(minimum),
+                // Automatic wake/keep-alive must not reintroduce a deadline.
+                None => None,
             },
             NewTimeout::None => None,
         };

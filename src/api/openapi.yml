@@ -187,10 +187,11 @@ components:
 
     SandboxState:
       type: string
-      description: State of the sandbox
+      description: State of the sandbox; pausing includes an in-progress checkpoint.
       enum:
         - running
         - paused
+        - pausing
 
     OrderDirection:
       type: string
@@ -637,7 +638,7 @@ components:
           format: int32
           minimum: 0
           default: 15
-          description: Time to live for the sandbox in seconds.
+          description: Time to live for the sandbox in seconds; zero disables expiration.
         autoPause:
           type: boolean
           default: true
@@ -680,9 +681,9 @@ components:
         timeout:
           type: integer
           format: int32
-          minimum: 1
+          minimum: 0
           default: 300
-          description: Time to live for the sandbox in seconds.
+          description: Time to live for the sandbox in seconds; zero disables expiration.
         autoPause:
           type: boolean
           default: true
@@ -716,7 +717,7 @@ components:
           format: int32
           minimum: 0
           default: 15
-          description: Time to live for the sandbox in seconds.
+          description: Time to live for the sandbox in seconds; zero disables expiration.
 
     NewColdSandbox:
       required:
@@ -744,7 +745,7 @@ components:
           format: int32
           minimum: 0
           default: 15
-          description: Time to live for the sandbox in seconds.
+          description: Time to live for the sandbox in seconds; zero disables expiration.
         autoPause:
           type: boolean
           default: true
@@ -795,7 +796,7 @@ components:
         - timeout
       properties:
         timeout:
-          description: Timeout in seconds from the current time after which the sandbox should expire
+          description: Timeout in seconds from the current time; zero disables expiration.
           type: integer
           format: int32
           minimum: 0
@@ -804,10 +805,10 @@ components:
       type: object
       properties:
         timeout:
-          description: Timeout in seconds from the current time after which the sandbox should expire
+          description: Timeout in seconds from the current time; zero disables expiration.
           type: integer
           format: int32
-          minimum: 1
+          minimum: 0
           default: 300
 
     SandboxTimeoutRequest:
@@ -816,7 +817,7 @@ components:
         - timeout
       properties:
         timeout:
-          description: Timeout in seconds from the current time after which the sandbox should expire
+          description: Timeout in seconds from the current time; zero disables expiration.
           type: integer
           format: int32
           minimum: 0
@@ -846,7 +847,7 @@ components:
           minimum: 0
           description: >-
             Time to live for the new forked sandboxes in seconds. When omitted,
-            each fork inherits the source sandbox timeout.
+            each fork inherits the source sandbox timeout. Zero disables expiration.
         count:
           type: integer
           format: int32

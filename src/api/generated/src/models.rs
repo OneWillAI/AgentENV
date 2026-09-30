@@ -1098,7 +1098,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<BuildStatusR
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ConnectSandbox {
-    /// Timeout in seconds from the current time after which the sandbox should expire
+    /// Timeout in seconds from the current time; zero disables expiration.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
     pub timeout: u32,
@@ -1232,9 +1232,9 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ConnectSandb
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ConnectSandboxV2 {
-    /// Timeout in seconds from the current time after which the sandbox should expire
+    /// Timeout in seconds from the current time; zero disables expiration.
     #[serde(rename = "timeout")]
-    #[validate(range(min = 1u32))]
+    #[validate(range(min = 0u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
 }
@@ -2746,7 +2746,7 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 
-    /// Time to live for the sandbox in seconds.
+    /// Time to live for the sandbox in seconds; zero disables expiration.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3142,7 +3142,7 @@ pub struct NewSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 
-    /// Time to live for the sandbox in seconds.
+    /// Time to live for the sandbox in seconds; zero disables expiration.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3474,9 +3474,9 @@ pub struct NewSandboxV2 {
     #[validate(custom(function = "check_xss_string"))]
     pub template_id: String,
 
-    /// Time to live for the sandbox in seconds.
+    /// Time to live for the sandbox in seconds; zero disables expiration.
     #[serde(rename = "timeout")]
-    #[validate(range(min = 1u32))]
+    #[validate(range(min = 0u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
 
@@ -5070,7 +5070,7 @@ impl std::str::FromStr for OrderDirection {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ResumedSandbox {
-    /// Time to live for the sandbox in seconds.
+    /// Time to live for the sandbox in seconds; zero disables expiration.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7549,6 +7549,8 @@ pub enum SandboxState {
     Running,
     #[serde(rename = "paused")]
     Paused,
+    #[serde(rename = "pausing")]
+    Pausing,
 }
 
 impl validator::Validate for SandboxState {
@@ -7562,6 +7564,7 @@ impl std::fmt::Display for SandboxState {
         match *self {
             SandboxState::Running => write!(f, "running"),
             SandboxState::Paused => write!(f, "paused"),
+            SandboxState::Pausing => write!(f, "pausing"),
         }
     }
 }
@@ -7573,6 +7576,7 @@ impl std::str::FromStr for SandboxState {
         match s {
             "running" => std::result::Result::Ok(SandboxState::Running),
             "paused" => std::result::Result::Ok(SandboxState::Paused),
+            "pausing" => std::result::Result::Ok(SandboxState::Pausing),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
         }
     }
@@ -7581,7 +7585,7 @@ impl std::str::FromStr for SandboxState {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxTimeoutRequest {
-    /// Timeout in seconds from the current time after which the sandbox should expire
+    /// Timeout in seconds from the current time; zero disables expiration.
     #[serde(rename = "timeout")]
     #[validate(range(min = 0u32))]
     pub timeout: u32,

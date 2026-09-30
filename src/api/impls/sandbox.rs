@@ -84,10 +84,9 @@ impl From<OrchestratorError> for models::Error {
 impl From<SandboxState> for models::SandboxState {
     fn from(state: SandboxState) -> Self {
         match state {
-            SandboxState::Pausing
-            | SandboxState::Paused
-            | SandboxState::Snapshotting
-            | SandboxState::Forking => Self::Paused,
+            // Checkpointing is a temporary lifecycle operation, not a failed VM.
+            SandboxState::Pausing | SandboxState::Snapshotting => Self::Pausing,
+            SandboxState::Paused | SandboxState::Forking => Self::Paused,
             _ => Self::Running,
         }
     }
@@ -1327,7 +1326,12 @@ impl Sandboxes<()> for ApiImpl {
                     sandbox_not_found(sandbox_id),
                 ));
             }
-            SandboxState::Pausing | SandboxState::Paused => {}
+            SandboxState::Pausing => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status409_Conflict(
+                    Self::error(409, "SANDBOX_PAUSING".to_string()),
+                ));
+            }
+            SandboxState::Paused => {}
         }
 
         // try to resume the sandbox
@@ -2020,9 +2024,10 @@ impl Sandboxes<()> for ApiImpl {
             Some(vec![match query_params.state[0] {
                 models::SandboxState::Running => SandboxState::Running,
                 models::SandboxState::Paused => SandboxState::Paused,
+                models::SandboxState::Pausing => SandboxState::Pausing,
             }])
         } else {
-            // Only two states are supported. If multiple states are provided,
+            // If multiple states are provided,
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
             None
         };

@@ -1630,12 +1630,21 @@ where
             });
         }
 
+        if valid_timeout.is_zero() && metadata.timeout.is_none() {
+            return Ok(Some(metadata));
+        }
+
         let mut timeout_updated = false;
         let update_result = self
             .store
             .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                // Zero explicitly clears expiration. A normal keep-alive cannot
+                // shorten an unlimited lifetime back to a finite deadline.
+                if !allow_shorter && metadata.timeout.is_none() && !valid_timeout.is_zero() {
+                    return;
+                }
                 let new_expire_time = SystemTime::now().checked_add(valid_timeout);
-                if !allow_shorter {
+                if !allow_shorter && !valid_timeout.is_zero() {
                     if let Some(current_expire) = metadata.expires_at {
                         if let Some(new_expire) = new_expire_time {
                             if new_expire <= current_expire {

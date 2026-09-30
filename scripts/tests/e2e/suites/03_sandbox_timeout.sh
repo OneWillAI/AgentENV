@@ -23,6 +23,28 @@ assert_status "$HTTP_STATUS" "204" "POST /timeout returns 204"
 api_post "/sandboxes/${sandbox_id}/refreshes" '{"duration":300}'
 assert_status "$HTTP_STATUS" "204" "POST /refreshes returns 204"
 
+# Zero is an explicit no-expiration policy, including on an existing VM.
+api_post "/sandboxes/${sandbox_id}/timeout" '{"timeout":5}'
+api_post "/sandboxes/${sandbox_id}/timeout" '{"timeout":0}'
+assert_status "$HTTP_STATUS" "204" "clear an existing expiration"
+api_post "/sandboxes/${sandbox_id}/refreshes" '{"duration":1}'
+sleep 7
+api_get "/sandboxes/${sandbox_id}"
+assert_json_field "$HTTP_BODY" '.state' "running" "refresh does not expire an unlimited sandbox"
+assert_json_field "$HTTP_BODY" '(.endAt | split("-")[0] | tonumber) > 2060' "true" "no-expiration endAt representation"
+api_post "/sandboxes/${sandbox_id}/pause" '{}'
+assert_status "$HTTP_STATUS" "204" "manual pause still works without expiration"
+api_post "/sandboxes/${sandbox_id}/connect" '{"timeout":0}'
+assert_status "$HTTP_STATUS" "201" "resume without expiration"
+api_get "/sandboxes/${sandbox_id}"
+assert_json_field "$HTTP_BODY" '(.endAt | split("-")[0] | tonumber) > 2060' "true" "resume preserves unlimited lifetime"
+unlimited_id=$(create_sandbox "$AENV_TEMPLATE_ID" 0); _sync_http
+assert_status "$HTTP_STATUS" "201" "create without expiration"
+track_sandbox "$unlimited_id"
+api_get "/sandboxes/${unlimited_id}"
+assert_json_field "$HTTP_BODY" '(.endAt | split("-")[0] | tonumber) > 2060' "true" "create accepts zero TTL"
+delete_sandbox "$unlimited_id"
+
 # -- Verify auto-pause --
 # Use a 5-second timeout. The sandbox takes ~1s to boot, so it should be
 # auto-paused around 5s after creation. We poll for up to 20s.
