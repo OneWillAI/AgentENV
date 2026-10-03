@@ -1,6 +1,6 @@
 //! Conservative peak allocation preflight. Checks are repeated immediately
-//! before capture under a process-wide serialization lock. They are not a disk
-//! reservation: ENOSPC during writing must still be handled without VM teardown.
+//! before capture under process-wide admission. In-flight estimates are reserved
+//! against one another; ENOSPC from other writers still requires safe VM recovery.
 use anyhow::{bail, Context, Result};
 use nix::sys::statvfs::statvfs;
 use std::{
@@ -9,7 +9,48 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub static CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub const MAX_CONCURRENT_CAPTURES: usize = 2;
+static CAPTURE_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_CAPTURES);
+static CAPTURE_REQUIREMENTS: std::sync::Mutex<BTreeMap<uuid::Uuid, CheckpointCapacity>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+pub struct CaptureGuard {
+    id: uuid::Uuid,
+    _slot: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE_REQUIREMENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// Recompute after admission: the still-running guest may have written while
+/// waiting. Serialize only this accounting step, not the capture itself.
+pub async fn acquire(
+    capacity: impl FnOnce() -> Result<Option<CheckpointCapacity>>,
+) -> Result<CaptureGuard> {
+    let slot = CAPTURE_SLOTS
+        .acquire()
+        .await
+        .context("capture admission closed")?;
+    let mut active = CAPTURE_REQUIREMENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let requirement = capacity()?;
+    let mut combined: Vec<_> = active.values().cloned().collect();
+    combined.extend(requirement.iter().cloned());
+    check(&combined)?;
+    let id = uuid::Uuid::now_v7();
+    if let Some(requirement) = requirement {
+        active.insert(id, requirement);
+    }
+    Ok(CaptureGuard { id, _slot: slot })
+}
 
 #[derive(Clone, Debug)]
 pub struct CheckpointCapacity {
@@ -123,4 +164,30 @@ pub fn check(requirements: &[CheckpointCapacity]) -> Result<()> {
             "checkpoint capacity preflight passed; recheck required at capture");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_captures_cannot_spend_the_same_free_capacity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stats = statvfs(temp.path())?;
+        let available = stats.blocks_available() * stats.fragment_size();
+        let headroom = (stats.blocks() * stats.fragment_size() / 20).max(1 << 30);
+        let usable = available
+            .checked_sub(headroom)
+            .context("test filesystem needs capture headroom")?;
+        let requirement = CheckpointCapacity {
+            path: temp.path().to_path_buf(),
+            bytes: usable * 2 / 3,
+            inodes: 1,
+        };
+        let first = acquire(|| Ok(Some(requirement.clone()))).await?;
+        assert!(acquire(|| Ok(Some(requirement.clone()))).await.is_err());
+        drop(first);
+        let _next = acquire(|| Ok(Some(requirement))).await?;
+        Ok(())
+    }
 }

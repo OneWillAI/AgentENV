@@ -5800,6 +5800,57 @@ async fn shutdown_reports_unproven_stop_after_pause() -> Result<()> {
 }
 
 #[tokio::test]
+async fn shutdown_checkpoints_guests_concurrently_without_exceeding_the_bound() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let pause_active = Arc::clone(&active);
+    let pause_peak = Arc::clone(&peak);
+    behavior.set_on_operation(
+        MockOperation::Pause,
+        Arc::new(move || {
+            let count = pause_active.fetch_add(1, Ordering::SeqCst) + 1;
+            pause_peak.fetch_max(count, Ordering::SeqCst);
+        }),
+    );
+    let stop_active = Arc::clone(&active);
+    behavior.set_on_operation(
+        MockOperation::Stop,
+        Arc::new(move || {
+            stop_active.fetch_sub(1, Ordering::SeqCst);
+        }),
+    );
+    for _ in 0..5 {
+        behavior.push_action(
+            MockOperation::Pause,
+            MockAction::SucceedAfter(Duration::from_millis(50)),
+        );
+    }
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    for _ in 0..5 {
+        orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+    }
+    orchestrator.shutdown().await?;
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(behavior.stop_calls(), 5);
+    assert!(orchestrator
+        .list_sandboxes()
+        .await?
+        .iter()
+        .all(|guest| guest.state == SandboxState::Paused
+            && guest.paused_runtime_stopped
+            && !guest.resume_recovery_pending));
+    Ok(())
+}
+
+#[tokio::test]
 async fn shutdown_retries_pause_failures_and_preserves_sandbox_on_success() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());

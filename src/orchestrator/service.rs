@@ -4,10 +4,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
@@ -2309,6 +2309,7 @@ where
             )
             .await?;
 
+        let publication_started = Instant::now();
         let persisted_metadata = {
             let mut metadata = self
                 .store
@@ -2344,6 +2345,10 @@ where
         }
         let resources = persisted_metadata.resources;
         self.store.update(persisted_metadata).await?;
+        info!(%sandbox_id, phase = "durable_publication",
+            elapsed_ms = publication_started.elapsed().as_millis() as u64,
+            "checkpoint phase completed");
+        let stop_started = Instant::now();
         if let Err(error) = self
             .stop_and_ack_paused_runtime(sandbox_id, &handle, Some(&paused_state))
             .await
@@ -2354,6 +2359,9 @@ where
                 .insert(sandbox_id, Arc::clone(&handle));
             return Err(error);
         }
+        info!(%sandbox_id, phase = "runtime_stop",
+            elapsed_ms = stop_started.elapsed().as_millis() as u64,
+            "checkpoint phase completed");
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
 
@@ -4249,43 +4257,31 @@ where
                 "preserving sandboxes during shutdown"
             );
 
-            for metadata in sandboxes {
-                let sandbox_id = metadata.id;
-                match metadata.state {
-                    SandboxState::Paused => {
-                        unreachable!("paused sandboxes should have been filtered out")
-                    }
-                    SandboxState::Running => {
-                        let result = if metadata.template_builder {
-                            self.delete_sandbox_inner(sandbox_id).await
-                        } else {
-                            self.pause_sandbox_inner(sandbox_id).await
-                        };
-                        if let Err(err) = result {
-                            last_failures.push(format!("{sandbox_id}: {err}"));
-                        }
-                    }
-                    SandboxState::Creating
-                    | SandboxState::Snapshotting
-                    | SandboxState::Forking
-                    | SandboxState::Pausing
-                    | SandboxState::Resuming
-                    | SandboxState::Killing => {
-                        match self.wait_for_transition(sandbox_id, metadata.state).await {
-                            Ok(_) | Err(OrchestratorError::SandboxNotFound(_)) => {}
-                            Err(err) => {
-                                warn!(
-                                    sandbox_id = %sandbox_id,
-                                    error = ?err,
-                                    pass,
-                                    "failed to wait for sandbox transition during orchestrator shutdown"
-                                );
-                                last_failures.push(format!("{sandbox_id}: {err}"));
+            // Drain every admitted operation even when another guest fails.
+            // Preservation errors must never cancel a sibling's checkpoint.
+            last_failures = futures::stream::iter(sandboxes)
+                .map(|metadata| async move {
+                    let sandbox_id = metadata.id;
+                    let result = match metadata.state {
+                        SandboxState::Paused => unreachable!("paused guests were filtered out"),
+                        SandboxState::Running => {
+                            if metadata.template_builder {
+                                self.delete_sandbox_inner(sandbox_id).await
+                            } else {
+                                self.pause_sandbox_inner(sandbox_id).await
                             }
                         }
-                    }
-                }
-            }
+                        state => match self.wait_for_transition(sandbox_id, state).await {
+                            Ok(_) | Err(OrchestratorError::SandboxNotFound(_)) => Ok(()),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    result.err().map(|error| format!("{sandbox_id}: {error}"))
+                })
+                .buffer_unordered(crate::sandbox::checkpoint_capacity::MAX_CONCURRENT_CAPTURES)
+                .filter_map(|failure| async move { failure })
+                .collect()
+                .await;
 
             if last_failures.is_empty() {
                 continue;

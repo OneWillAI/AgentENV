@@ -21,7 +21,7 @@ use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
 use overlaybd::index_file::compact_to;
 use overlaybd::virtual_file::VirtualFile;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
@@ -390,9 +390,12 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         live_runtime_image_config_path
     } else {
         let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
+        let started = std::time::Instant::now();
         UblkDeviceManager::global()
             .export_snapshot_device(ublk_device, &snapshot_layer_path, kind)
             .await?;
+        info!(output_dir = %output_dir.display(), phase = "disk_capture", kind,
+            elapsed_ms = started.elapsed().as_millis() as u64, "checkpoint phase completed");
         let mut config = overlaybd::config::load_image_config(live_runtime_image_config_path)?;
         config.lowers.push(local_layer_config(&snapshot_layer_path));
         write_bytes_atomically(

@@ -8,7 +8,7 @@ use overlaybd::index_file::{merge_files_ro, CommitArgs};
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::info;
 use uuid::Uuid;
 
 use super::device::UblkDevice;
@@ -107,6 +107,7 @@ pub(crate) async fn compact_layers(
         return Ok(None);
     }
 
+    let started = std::time::Instant::now();
     let mut src_files: Vec<Arc<dyn VirtualFile>> = Vec::with_capacity(layers.len());
     for layer in layers {
         let path = Path::new(&layer.file);
@@ -150,10 +151,10 @@ pub(crate) async fn compact_layers(
     }
     build_result?;
 
-    debug!(
-        output = %output_path.display(),
-        input_layers = layers.len(),
-        "compacted overlaybd layers"
+    info!(
+        output = %output_path.display(), input_layers = layers.len(),
+        phase = "layer_merge", elapsed_ms = started.elapsed().as_millis() as u64,
+        "checkpoint phase completed"
     );
     Ok(Some(output_path.to_path_buf()))
 }

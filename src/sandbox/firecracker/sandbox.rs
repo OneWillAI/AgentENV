@@ -1310,13 +1310,17 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
-        let _capture = crate::sandbox::checkpoint_capacity::CAPTURE_LOCK
-            .lock()
-            .await;
-        if let Some(mut capacity) = self.checkpoint_capacity()? {
-            capacity.path = snapshot_dir.to_path_buf();
-            crate::sandbox::checkpoint_capacity::check(&[capacity])?;
-        }
+        let admission_started = Instant::now();
+        let _capture = crate::sandbox::checkpoint_capacity::acquire(|| {
+            Ok(self.checkpoint_capacity()?.map(|mut capacity| {
+                capacity.path = snapshot_dir.to_path_buf();
+                capacity
+            }))
+        })
+        .await?;
+        info!(sandbox_id = %self.id, snapshot_dir = %snapshot_dir.display(),
+            phase = "admission", elapsed_ms = admission_started.elapsed().as_millis() as u64,
+            "checkpoint phase completed");
         if self.has_writable_persistent_volumes() {
             let envd = self
                 .envd_instance
@@ -1330,7 +1334,11 @@ impl FirecrackerSandbox {
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
 
+        let snapshot_started = Instant::now();
         let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
+        info!(sandbox_id = %self.id, snapshot_dir = %snapshot_dir.display(),
+            phase = "snapshot_total", elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+            success = snapshot_result.is_ok(), "checkpoint phase completed");
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
@@ -1350,12 +1358,16 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
+        let memory_started = Instant::now();
         // Local layers are always captured raw; when enabled, compression
         // happens once at publish time under `[snapshot.publish_compression]`.
         let (mem_layer_path, mem_virtual_size) = self
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, OverlaybdCompactOutput::Raw)
             .await?;
 
+        info!(sandbox_id = %self.id, snapshot_dir = %snapshot_dir.display(),
+            phase = "memory_capture", elapsed_ms = memory_started.elapsed().as_millis() as u64,
+            "checkpoint phase completed");
         // Build the memory image config: collect parent layers, make runtime
         // lowers local to this snapshot dir, and compact only if the layer
         // count exceeds the configured maximum.
@@ -1739,13 +1751,17 @@ impl FirecrackerSandbox {
         config.vcpu_count = resources.cpu_count;
         config.mem_size_mib = resources.memory_mib;
         config.validate()?;
-        let _capture = crate::sandbox::checkpoint_capacity::CAPTURE_LOCK
-            .lock()
-            .await;
-        if let Some(mut capacity) = self.checkpoint_capacity()? {
-            capacity.path = output_dir.to_path_buf();
-            crate::sandbox::checkpoint_capacity::check(&[capacity])?;
-        }
+        let admission_started = Instant::now();
+        let _capture = crate::sandbox::checkpoint_capacity::acquire(|| {
+            Ok(self.checkpoint_capacity()?.map(|mut capacity| {
+                capacity.path = output_dir.to_path_buf();
+                capacity
+            }))
+        })
+        .await?;
+        info!(sandbox_id = %self.id, snapshot_dir = %output_dir.display(),
+            phase = "admission", elapsed_ms = admission_started.elapsed().as_millis() as u64,
+            "checkpoint phase completed");
         tokio::fs::create_dir_all(output_dir).await?;
         let token = Uuid::new_v4().to_string();
         // Record ownership before the RPC: a lost reply may still have frozen
