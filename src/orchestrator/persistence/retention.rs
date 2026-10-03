@@ -1,5 +1,5 @@
 //! Collection excludes lifecycle changes and protects live guest references.
-//! It runs after ordinary pauses as well as shutdown preparation. Retain current + one rollback generation,
+//! It runs after ordinary pauses as well as shutdown preparation. Retain the current/latest generation,
 //! every uncertain/incomplete generation, and their transitive path references.
 use super::codecs::{decode_record, PAUSED_MANIFEST_FILE};
 use super::paused_transactions::PersistedPausedCommitState;
@@ -100,9 +100,9 @@ pub(super) fn plan(
             generations.insert(root, inventory);
         }
         successful.sort();
-        // Always keep the latest successful rollback copy in addition to the
-        // authoritative pointer, even if the index is older than directory age.
-        for (_, root) in successful.into_iter().rev().take(2) {
+        // Resume drops the index, so keep the latest successful checkpoint
+        // for explicit recovery. Older copies need an actual reference.
+        for (_, root) in successful.into_iter().rev().take(1) {
             retained.insert(root);
         }
     }
@@ -308,19 +308,35 @@ mod tests {
                 std::slice::from_ref(&current),
                 &[live.join("data.commit")],
             )?;
-            assert!(plan.retained_generations <= 3);
+            assert_eq!(plan.retained_generations, 2);
             assert!(live.join("live-only.commit").exists());
-            assert!(previous.join("data.commit").exists());
+            if previous != live {
+                assert!(!previous.exists());
+            }
             assert!(current.join("data.commit").exists());
             previous = current;
         }
-        // Once that guest releases the reference, normal collection returns to two.
+        // Once that guest releases the reference, normal collection returns to one.
         assert_eq!(
             collect(temp.path(), &[previous.clone()], &[])?.retained_generations,
-            2
+            1
         );
         assert!(!live.exists());
         assert_eq!(fs::read(previous.join("data.commit"))?, vec![1u8; 4096]);
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_guest_keeps_latest_checkpoint_without_a_paused_index() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let guest = SandboxId::new();
+        let old = generation(temp.path(), guest, 1);
+        let latest = generation(temp.path(), guest, 2);
+        let plan = collect(temp.path(), &[], &[])?;
+        assert_eq!(plan.retained_generations, 1);
+        assert!(!old.exists());
+        assert!(latest.join("vm_state.bin").exists());
+        assert_eq!(fs::read(latest.join("data.commit"))?, vec![1u8; 4096]);
         Ok(())
     }
 
@@ -329,7 +345,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let guest = SandboxId::new();
         let old = generation(temp.path(), guest, 1);
-        let _rollback = generation(temp.path(), guest, 2);
+        let rollback = generation(temp.path(), guest, 2);
         let current = generation(temp.path(), guest, 3);
         let other = generation(temp.path(), SandboxId::new(), 1);
         fs::write(
@@ -340,7 +356,8 @@ mod tests {
         )?;
         fs::write(current.join("unused.commit"), b"compaction input")?;
         let plan = collect(temp.path(), &[current.clone(), other.clone()], &[])?;
-        assert_eq!(plan.retained_generations, 4);
+        assert_eq!(plan.retained_generations, 3);
+        assert!(!rollback.exists());
         assert!(old.join("data.commit").exists());
         assert!(!current.join("unused.commit").exists());
         // Drop the cross-guest reference, preserving a hardlink to its payload.
@@ -383,10 +400,11 @@ mod tests {
             &[cache.join("evicted")],
         )?;
         assert!(!old.exists());
-        assert!(rollback.exists());
+        assert!(!rollback.exists());
+        let older = generation(&artifacts, guest, 2);
         fs::remove_file(current.join("data.commit"))?;
         assert!(collect(&artifacts, std::slice::from_ref(&current), &[]).is_err());
-        assert!(rollback.exists());
+        assert!(older.exists());
         fs::write(current.join("data.commit"), b"restored")?;
         // A dangling alias cannot hide an unresolved reference into the store.
         std::os::unix::fs::symlink(current.join("missing"), cache.join("evicted"))?;

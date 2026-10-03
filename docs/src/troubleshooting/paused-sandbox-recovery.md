@@ -16,13 +16,15 @@ reports that checkpoint as requiring explicit recovery, including its capture
 timestamp and the possible loss interval; a host reboot is not proof that those
 writes were preserved. Legacy checkpoints have an unknown timestamp.
 
-A later pause retains the prior generation for rollback. Collection runs after
+A later successful pause makes an unreferenced prior generation eligible for
+cleanup. Collection runs after
 successful ordinary/idle pauses and during shutdown preparation. An exclusive
 lifecycle lock excludes pause/resume/fork/delete while references are inventoried
 and collected; live guests keep running and their storage references are protected.
-It keeps the current generation, the two newest successful generations (normally
-current and one rollback copy), all uncertain generations, and transitive layer
-references. It logs physically reclaimable bytes before deleting. Shared
+It keeps the authoritative current generation and the newest successful checkpoint
+(for explicit recovery after resume drops the index), all uncertain generations,
+and transitive layer references. It does not keep an extra rollback generation.
+It logs physically reclaimable bytes before deleting. Shared
 hardlinks count as reclaimable only when every link will be removed. Invalid
 paths, missing artifacts, ambiguous metadata, or quarantines stop collection safely.
 Interrupted deletion can also require operator review; incomplete artifacts are
