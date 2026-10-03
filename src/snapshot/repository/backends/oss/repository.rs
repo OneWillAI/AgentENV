@@ -392,14 +392,7 @@ impl SnapshotRepository for OssSnapshotRepository {
 
             // 5. Bind alias (if present) with conflict detection.
             if let Some(ref alias) = metadata.alias {
-                if let Err(e) = self.bind_alias(alias.as_ref(), id).await {
-                    // Best-effort rollback. Content-addressed managed layers are intentionally left
-                    // in place; they are shared across snapshots and require separate GC.
-                    if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                        warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after alias bind failure");
-                    }
-                    return Err(e);
-                }
+                self.bind_alias(alias.as_ref(), id).await?;
             }
 
             self.write_committed_record(
@@ -416,6 +409,16 @@ impl SnapshotRepository for OssSnapshotRepository {
         let record = match publish_result {
             Ok(record) => record,
             Err(error) => {
+                // A catalog write can succeed while its response is lost. Never
+                // roll back published data, or treat a failed lookup as absence.
+                match self.read_record(id).await {
+                    Ok(Some(record)) if record.committed.is_some() => return Ok(record),
+                    Ok(_) => {}
+                    Err(reconcile_error) => {
+                        warn!(snapshot_id = %id, error = %reconcile_error, "publication outcome unknown; retaining artifacts for reconciliation");
+                        return Err(error);
+                    }
+                }
                 // Best-effort rollback. Content-addressed managed layers are intentionally left
                 // in place; they are shared across snapshots and require separate GC.
                 if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {

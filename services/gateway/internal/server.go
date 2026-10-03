@@ -646,6 +646,9 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 	if len(parts) == 2 {
 		return r.Method == http.MethodGet || r.Method == http.MethodDelete
 	}
+	if len(parts) == 4 && parts[2] == "snapshot-operations" && parts[3] != "" {
+		return r.Method == http.MethodPut || r.Method == http.MethodGet
+	}
 	if len(parts) != 3 {
 		return false
 	}

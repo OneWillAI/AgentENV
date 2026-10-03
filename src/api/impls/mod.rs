@@ -4,6 +4,7 @@ pub(crate) mod auth;
 pub(crate) mod image_build;
 mod pagination;
 mod sandbox;
+pub(crate) mod snapshot_operations;
 mod snapshots;
 mod template;
 mod template_helpers;
@@ -40,6 +41,8 @@ pub struct ApiImpl {
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
     build_sessions: Arc<image_build::BuildSessions>,
+    snapshot_operations:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, snapshot_operations::Operation>>>,
     create_preparations: Arc<
         tokio::sync::Mutex<
             std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
@@ -71,6 +74,7 @@ impl ApiImpl {
             api_key,
             build_sessions: Arc::new(image_build::BuildSessions::default()),
             create_preparations: Default::default(),
+            snapshot_operations: Default::default(),
         }
     }
 

@@ -57,11 +57,22 @@ pub(super) const MAX_EXTRA_DRIVES: usize = (b'z' - b'c' + 1) as usize;
 #[derive(Debug)]
 pub(crate) struct PersistentSnapshotRootGuard {
     path: PathBuf,
+    _parent: Option<std::sync::Arc<PersistentSnapshotRootGuard>>,
 }
 
 impl PersistentSnapshotRootGuard {
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            _parent: None,
+        }
+    }
+
+    pub(crate) fn child(path: PathBuf, parent: std::sync::Arc<Self>) -> Self {
+        Self {
+            path,
+            _parent: Some(parent),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {

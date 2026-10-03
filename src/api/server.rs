@@ -40,6 +40,7 @@ where
         .merge(host_interaction::router(api_impl.clone()))
         .merge(reboot::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))
+        .merge(super::impls::snapshot_operations::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
         .layer(middleware::from_fn_with_state(
             api_impl.clone(),

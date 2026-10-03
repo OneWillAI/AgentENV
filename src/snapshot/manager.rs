@@ -137,12 +137,19 @@ impl SnapshotManager {
         // the whole continuation.
         let recording = captured_snapshot
             .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
-            .map(|artifacts| crate::snapshot::StartupRecording {
-                trace: tokio::spawn(crate::sandbox::record_startup_pack(
-                    artifacts.snapshot_config().clone(),
-                    artifacts.snapshot_dir().to_path_buf(),
-                )),
-                keep_alive: Box::new(artifacts.snapshot_root_guard()),
+            .map(|artifacts| {
+                let config = artifacts.snapshot_config().clone();
+                let directory = artifacts.snapshot_dir().to_path_buf();
+                let recording_guard = artifacts.snapshot_root_guard();
+                crate::snapshot::StartupRecording {
+                    trace: tokio::spawn(async move {
+                        // A failed publication drops the JoinHandle, which does
+                        // not cancel recording. Keep its inputs alive until exit.
+                        let _guard = recording_guard;
+                        crate::sandbox::record_startup_pack(config, directory).await
+                    }),
+                    keep_alive: Box::new(artifacts.snapshot_root_guard()),
+                }
             });
 
         let record = self

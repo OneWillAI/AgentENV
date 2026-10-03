@@ -272,7 +272,7 @@ async fn prepare_volume_fork_specs(
     Ok((specs, children))
 }
 
-async fn snapshot_sandbox_volumes(
+pub(super) async fn snapshot_sandbox_volumes(
     api: &ApiImpl,
     metadata: &SandboxMetadata,
 ) -> Result<Vec<SnapshotVolume>, models::Error> {

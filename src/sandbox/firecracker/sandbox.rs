@@ -276,6 +276,13 @@ impl FirecrackerCaptureArtifacts {
         snapshot_dir: PathBuf,
         snapshot_root: Arc<PersistentSnapshotRootGuard>,
     ) -> Self {
+        // This capture is temporary even while the source VM retains its live
+        // root. Recording/publication share this child lease; its final drop
+        // removes only the capture directory, then releases the parent lease.
+        let snapshot_root = Arc::new(PersistentSnapshotRootGuard::child(
+            snapshot_dir.clone(),
+            snapshot_root,
+        ));
         Self {
             snapshot_config,
             snapshot_dir,
