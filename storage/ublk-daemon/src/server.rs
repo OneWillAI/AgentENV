@@ -538,6 +538,46 @@ async fn handle_connection(
     };
 
     let response = match request {
+        DaemonRequest::WatchFilesystemUsage { dev_id } => {
+            let target = if let Some(device) = devices.get(&dev_id) {
+                Some(Arc::clone(device.dev.target()))
+            } else if let Some(pool) = &pool_state {
+                pool.active_exclusive
+                    .get(&dev_id)
+                    .map(|device| Arc::clone(device.dev.target()))
+            } else {
+                None
+            };
+            let Some(target) = target else {
+                send_message(
+                    &mut stream,
+                    &DaemonResponse::InvalidRequest {
+                        message: format!("writable device {dev_id} not found"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            };
+            let mut updates = target.watch_filesystem_usage().await;
+            // Do not retain the target: its deletion must close the stream.
+            drop(target);
+            loop {
+                let usage = updates.borrow_and_update().clone();
+                if let Some(usage) = usage {
+                    send_message(&mut stream, &DaemonResponse::FilesystemUsage { usage }).await?;
+                }
+                tokio::select! {
+                    changed = updates.changed() => {
+                        if changed.is_err() { return Ok(()); }
+                    }
+                    // Notice a disconnected observer even while the guest is idle.
+                    input = recv_message::<DaemonRequest>(&mut stream) => {
+                        input?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         DaemonRequest::CreateOverlaybd {
             image_config,
             global_config,

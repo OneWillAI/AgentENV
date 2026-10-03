@@ -15,6 +15,8 @@
 //!   patch,
 //! - `POST {url}/sandbox-hook/stop` — when a sandbox stops, before its
 //!   network slot is released (best-effort: failures are only logged).
+//! - `POST {url}/sandbox-hook/filesystem-usage` — root filesystem observations
+//!   from disk events (best-effort: failures are only logged).
 //!
 //! Sandbox ids are reused across pause/resume cycles, so each start hook
 //! (start-fresh / start-resume) carries a fresh [`SandboxInstanceId`]
@@ -25,12 +27,13 @@
 //! instance for that sandbox (stop delivery is best-effort and may be
 //! reordered relative to a newer start).
 //!
-//! Except for the best-effort stop hook, any hook failure (connection error,
+//! Except for best-effort stop and usage hooks, any hook failure (connection error,
 //! timeout, non-2xx) fails the corresponding sandbox operation. The client is
 //! a process-wide singleton derived from the global config; when no URL is
 //! configured, all calls are skipped.
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -41,6 +44,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
+use crate::sandbox::ublk::UblkDeviceManager;
 use crate::types::SandboxId;
 
 /// Unique identifier of one runtime instance of a sandbox, internal to the
@@ -200,6 +204,24 @@ impl CustomExtensionClient {
         })
     }
 
+    async fn hook_filesystem_usage(
+        &self,
+        sandbox_id: SandboxId,
+        sandbox_instance_id: SandboxInstanceId,
+        usage: models::FilesystemUsage,
+    ) {
+        let request = models::FilesystemUsageHookRequest {
+            sandbox_id: sandbox_id.to_string(),
+            sandbox_instance_id: sandbox_instance_id.to_string(),
+            usage: Box::new(usage),
+        };
+        if let Err(error) =
+            default_api::sandbox_filesystem_usage(&self.configuration, request).await
+        {
+            warn!(%error, %sandbox_id, "custom extension filesystem usage hook failed");
+        }
+    }
+
     /// Invoke the stop hook: a sandbox has stopped.
     ///
     /// Fired whenever a sandbox runtime is torn down — including pause
@@ -208,10 +230,16 @@ impl CustomExtensionClient {
     /// runtime and fires start-resume). Stop notification is best-effort:
     /// delivery failures are logged here and never propagated, so callers
     /// (stop() and Drop) share the same fire-and-forget semantics.
-    async fn hook_stop(&self, sandbox_id: SandboxId, sandbox_instance_id: SandboxInstanceId) {
+    async fn hook_stop(
+        &self,
+        sandbox_id: SandboxId,
+        sandbox_instance_id: SandboxInstanceId,
+        usage: Option<models::FilesystemUsage>,
+    ) {
         let request = models::StopHookRequest {
             sandbox_id: sandbox_id.to_string(),
             sandbox_instance_id: sandbox_instance_id.to_string(),
+            filesystem_usage: usage.map(Box::new),
         };
         if let Err(err) = default_api::sandbox_stop(&self.configuration, request).await {
             warn!(
@@ -249,6 +277,9 @@ pub(crate) struct CustomExtensionHookGuard {
     /// hook is delivered); `None` while the guard has not started or after
     /// its stop hook was delivered, in which case this guard is inert.
     sandbox_instance_id: Option<SandboxInstanceId>,
+    usage_task: Option<tokio::task::JoinHandle<()>>,
+    final_usage: Option<models::FilesystemUsage>,
+    usage_sequence: Arc<AtomicI64>,
 }
 
 impl CustomExtensionHookGuard {
@@ -257,6 +288,9 @@ impl CustomExtensionHookGuard {
             client,
             sandbox_id,
             sandbox_instance_id: None,
+            usage_task: None,
+            final_usage: None,
+            usage_sequence: Arc::new(AtomicI64::new(1)),
         }
     }
 
@@ -325,11 +359,97 @@ impl CustomExtensionHookGuard {
         Ok(())
     }
 
+    /// Forward disk events without polling or coupling guest writes to HTTP.
+    pub(crate) async fn watch_filesystem_usage(&mut self, dev_id: u32) {
+        let Some(instance) = self.sandbox_instance_id else {
+            return;
+        };
+        let mut stream = match UblkDeviceManager::global()
+            .watch_filesystem_usage(dev_id)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                warn!(%error, "filesystem usage subscription unavailable");
+                return;
+            }
+        };
+        let client = Arc::clone(&self.client);
+        let sandbox_id = self.sandbox_id;
+        let sequence = Arc::clone(&self.usage_sequence);
+        self.usage_task = Some(tokio::spawn(async move {
+            loop {
+                match stream.next().await {
+                    Ok(Some(usage)) => {
+                        client
+                            .hook_filesystem_usage(
+                                sandbox_id,
+                                instance,
+                                extension_usage(
+                                    usage,
+                                    false,
+                                    sequence.fetch_add(1, Ordering::Relaxed),
+                                ),
+                            )
+                            .await
+                    }
+                    ended => {
+                        warn!(?ended, %sandbox_id, "filesystem usage stream ended");
+                        client
+                            .hook_filesystem_usage(
+                                sandbox_id,
+                                instance,
+                                models::FilesystemUsage {
+                                    sequence: sequence.fetch_add(1, Ordering::Relaxed),
+                                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                                    used_bytes: None,
+                                    r#final: false,
+                                },
+                            )
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    /// Called after Firecracker exits and before its root disk is released.
+    pub(crate) async fn finish_filesystem_usage(&mut self, dev_id: u32) {
+        if let Some(task) = self.usage_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        match UblkDeviceManager::global()
+            .watch_filesystem_usage(dev_id)
+            .await
+        {
+            Ok(mut stream) => match stream.next().await {
+                Ok(Some(usage)) => {
+                    self.final_usage = Some(extension_usage(
+                        usage,
+                        true,
+                        self.usage_sequence.fetch_add(1, Ordering::Relaxed),
+                    ))
+                }
+                result => warn!(?result, "final filesystem usage unavailable"),
+            },
+            Err(error) => warn!(%error, "final filesystem usage unavailable"),
+        }
+    }
+
     /// Deliver the stop hook now and clear the instance id.
     pub(crate) async fn stop(mut self) {
+        if let Some(task) = self.usage_task.take() {
+            task.abort();
+        }
         if let Some(sandbox_instance_id) = self.sandbox_instance_id.take() {
             self.client
-                .hook_stop(self.sandbox_id, sandbox_instance_id)
+                .hook_stop(
+                    self.sandbox_id,
+                    sandbox_instance_id,
+                    self.final_usage.take(),
+                )
                 .await;
         }
     }
@@ -337,6 +457,9 @@ impl CustomExtensionHookGuard {
 
 impl Drop for CustomExtensionHookGuard {
     fn drop(&mut self) {
+        if let Some(task) = self.usage_task.take() {
+            task.abort();
+        }
         let Some(sandbox_instance_id) = self.sandbox_instance_id else {
             return;
         };
@@ -345,7 +468,9 @@ impl Drop for CustomExtensionHookGuard {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    client.hook_stop(sandbox_id, sandbox_instance_id).await;
+                    client
+                        .hook_stop(sandbox_id, sandbox_instance_id, None)
+                        .await;
                 });
             }
             Err(_) => warn!(
@@ -354,6 +479,19 @@ impl Drop for CustomExtensionHookGuard {
                 "sandbox dropped outside a tokio runtime; skipping lifecycle stop hook"
             ),
         }
+    }
+}
+
+fn extension_usage(
+    usage: uvm_ublk::FilesystemUsage,
+    final_sample: bool,
+    sequence: i64,
+) -> models::FilesystemUsage {
+    models::FilesystemUsage {
+        sequence,
+        observed_at_unix_ms: usage.observed_at_unix_ms.min(i64::MAX as u64) as i64,
+        used_bytes: usage.used_bytes.and_then(|bytes| i64::try_from(bytes).ok()),
+        r#final: final_sample,
     }
 }
 
@@ -697,7 +835,9 @@ pub(crate) mod tests {
         let sandbox_id = SandboxId::new();
         let sandbox_instance_id = SandboxInstanceId::new();
 
-        client.hook_stop(sandbox_id, sandbox_instance_id).await;
+        client
+            .hook_stop(sandbox_id, sandbox_instance_id, None)
+            .await;
 
         let (request_line, body) = rx.recv().unwrap();
         assert_eq!(request_line, "POST /sandbox-hook/stop HTTP/1.1");

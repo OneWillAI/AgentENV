@@ -276,6 +276,46 @@ mod protocol_tests {
 mod client_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn filesystem_usage_stream_preserves_unknown_growth_and_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("usage.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                recv_message::<DaemonRequest>(&mut stream).await.unwrap(),
+                Some(DaemonRequest::WatchFilesystemUsage { dev_id: 7 })
+            ));
+            for (sequence, used_bytes) in [(1, None), (2, Some(4096)), (3, Some(8192))] {
+                send_message(
+                    &mut stream,
+                    &DaemonResponse::FilesystemUsage {
+                        usage: uvm_ublk::FilesystemUsage {
+                            observed_at_unix_ms: sequence,
+                            used_bytes,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = UblkDaemonClient::new_for_test(socket, false);
+        let mut updates = client.watch_filesystem_usage(7).await.unwrap();
+        assert_eq!(updates.next().await.unwrap().unwrap().used_bytes, None);
+        assert_eq!(
+            updates.next().await.unwrap().unwrap().used_bytes,
+            Some(4096)
+        );
+        assert_eq!(
+            updates.next().await.unwrap().unwrap().used_bytes,
+            Some(8192)
+        );
+        assert!(updates.next().await.unwrap().is_none());
+        peer.await.unwrap();
+    }
+
     // ── create_overlaybd ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -702,6 +742,12 @@ mod client_tests {
                 DaemonRequest::CreateOverlaybd { .. } => DaemonResponse::DeviceCreated {
                     dev_id: 10,
                     device_path: PathBuf::from("/dev/ublkb10"),
+                },
+                DaemonRequest::WatchFilesystemUsage { .. } => DaemonResponse::FilesystemUsage {
+                    usage: uvm_ublk::FilesystemUsage {
+                        observed_at_unix_ms: 1,
+                        used_bytes: None,
+                    },
                 },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
                 DaemonRequest::RestackSnapshot { .. } | DaemonRequest::ExportSnapshot { .. } => {

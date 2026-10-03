@@ -16,6 +16,11 @@ const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    /// Stream ext4 observations on writes/flushes, with an initial sample.
+    /// The stream ends when the device is deleted or assigned another image.
+    WatchFilesystemUsage {
+        dev_id: u32,
+    },
     /// Create a raw overlaybd ublk device from an already-materialized image
     /// config. This does not create runtime upper files or rewrite image.json.
     /// Sandbox rootfs and extra drives should use
@@ -162,6 +167,9 @@ pub enum PackRecordingState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    FilesystemUsage {
+        usage: uvm_ublk::FilesystemUsage,
+    },
     DeviceCreated {
         dev_id: u32,
         device_path: PathBuf,

@@ -8,8 +8,8 @@ info:
     lifecycle hooks (under /sandbox-hook/*), invoked by the AENV Firecracker
     sandbox runtime; more capabilities may be added in the future. The runtime
     treats any connection error, timeout, or non-2xx response as a failure of
-    the corresponding sandbox operation (except the best-effort stop
-    notification).
+    the corresponding sandbox operation (except best-effort stop and filesystem
+    usage notifications).
 
     Instance identity: sandboxId alone is reused across pause/resume cycles,
     so every start-fresh / start-resume hook carries a fresh
@@ -86,6 +86,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PatchCustomExtensionParamsHookResponse"
+
+  /sandbox-hook/filesystem-usage:
+    post:
+      operationId: sandboxFilesystemUsage
+      summary: Best-effort ext4 usage observation triggered by root disk writes or flushes.
+      description: >-
+        No polling is required. On-disk ext4 counters may lag the mounted guest.
+        Unknown usage is omitted, never reported as zero. Ignore observations
+        from superseded runtime instances and non-increasing sequence numbers.
+        Delivery failure never fails guest I/O. The stop hook includes a final
+        observation when available, sampled after the VM process stops.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FilesystemUsageHookRequest"
+      responses:
+        "200":
+          description: Observation accepted.
 
   /sandbox-hook/stop:
     post:
@@ -214,6 +234,44 @@ components:
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
 
+    FilesystemUsage:
+      type: object
+      required:
+        - sequence
+        - observedAtUnixMs
+        - final
+      properties:
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        observedAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+        usedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Omitted when measurement failed; never substitute zero.
+        final:
+          type: boolean
+          description: Sampled after the guest process stopped.
+
+    FilesystemUsageHookRequest:
+      type: object
+      required:
+        - sandboxId
+        - sandboxInstanceId
+        - usage
+      properties:
+        sandboxId:
+          type: string
+        sandboxInstanceId:
+          type: string
+        usage:
+          $ref: "#/components/schemas/FilesystemUsage"
+
     StopHookRequest:
       type: object
       required:
@@ -229,3 +287,5 @@ components:
             delivered by that instance's start-fresh / start-resume hook.
             May arrive after a newer start for the same sandboxId; ignore it
             when it does not match the latest started instance.
+        filesystemUsage:
+          $ref: "#/components/schemas/FilesystemUsage"

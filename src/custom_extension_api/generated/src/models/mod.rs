@@ -1,3 +1,7 @@
+pub mod filesystem_usage;
+pub use self::filesystem_usage::FilesystemUsage;
+pub mod filesystem_usage_hook_request;
+pub use self::filesystem_usage_hook_request::FilesystemUsageHookRequest;
 pub mod patch_custom_extension_params_hook_request;
 pub use self::patch_custom_extension_params_hook_request::PatchCustomExtensionParamsHookRequest;
 pub mod patch_custom_extension_params_hook_response;

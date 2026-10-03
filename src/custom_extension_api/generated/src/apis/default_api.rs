@@ -1,7 +1,7 @@
 /*
  * AENV Custom Extension API
  *
- * HTTP API implemented by the custom extension service configured via [custom_extension].url. The custom extension currently supports sandbox lifecycle hooks (under /sandbox-hook/_*), invoked by the AENV Firecracker sandbox runtime; more capabilities may be added in the future. The runtime treats any connection error, timeout, or non-2xx response as a failure of the corresponding sandbox operation (except the best-effort stop notification). Instance identity: sandboxId alone is reused across pause/resume cycles, so every start-fresh / start-resume hook carries a fresh sandboxInstanceId that uniquely identifies one runtime instance of the sandbox. The stop hook carries the sandboxInstanceId of the instance being torn down. Because the stop notification is best-effort and may be delivered out of order (e.g. a pause's stop arriving after the resume's start-resume), the extension should treat (sandboxId, sandboxInstanceId) as the identity of a running instance and ignore stop notifications whose sandboxInstanceId is not the latest started instance for that sandbox. The in-place pause+resume performed during snapshot capture does not fire the stop hook and does not change the instance id.
+ * HTTP API implemented by the custom extension service configured via [custom_extension].url. The custom extension currently supports sandbox lifecycle hooks (under /sandbox-hook/_*), invoked by the AENV Firecracker sandbox runtime; more capabilities may be added in the future. The runtime treats any connection error, timeout, or non-2xx response as a failure of the corresponding sandbox operation (except best-effort stop and filesystem usage notifications). Instance identity: sandboxId alone is reused across pause/resume cycles, so every start-fresh / start-resume hook carries a fresh sandboxInstanceId that uniquely identifies one runtime instance of the sandbox. The stop hook carries the sandboxInstanceId of the instance being torn down. Because the stop notification is best-effort and may be delivered out of order (e.g. a pause's stop arriving after the resume's start-resume), the extension should treat (sandboxId, sandboxInstanceId) as the identity of a running instance and ignore stop notifications whose sandboxInstanceId is not the latest started instance for that sandbox. The in-place pause+resume performed during snapshot capture does not fire the stop hook and does not change the instance id.
  *
  * The version of the OpenAPI document: 0.1.0
  *
@@ -12,6 +12,13 @@ use super::{configuration, ContentType, Error};
 use crate::{apis::ResponseContent, models};
 use reqwest;
 use serde::{de::Error as _, Deserialize, Serialize};
+
+/// struct for typed errors of method [`sandbox_filesystem_usage`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SandboxFilesystemUsageError {
+    UnknownValue(serde_json::Value),
+}
 
 /// struct for typed errors of method [`sandbox_patch_params`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +46,42 @@ pub enum SandboxStartResumeError {
 #[serde(untagged)]
 pub enum SandboxStopError {
     UnknownValue(serde_json::Value),
+}
+
+/// No polling is required. On-disk ext4 counters may lag the mounted guest. Unknown usage is omitted, never reported as zero. Ignore observations from superseded runtime instances and non-increasing sequence numbers. Delivery failure never fails guest I/O. The stop hook includes a final observation when available, sampled after the VM process stops.
+pub async fn sandbox_filesystem_usage(
+    configuration: &configuration::Configuration,
+    filesystem_usage_hook_request: models::FilesystemUsageHookRequest,
+) -> Result<(), Error<SandboxFilesystemUsageError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_body_filesystem_usage_hook_request = filesystem_usage_hook_request;
+
+    let uri_str = format!("{}/sandbox-hook/filesystem-usage", configuration.base_path);
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.json(&p_body_filesystem_usage_hook_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req).await?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text().await?;
+        let entity: Option<SandboxFilesystemUsageError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
 }
 
 /// Called when a user PATCHes the sandbox's custom extension params. The patch document is passed through verbatim; its semantics are defined entirely by the extension. The hook must return the updated full params, which the runtime stores as the new current value. A failure response rejects the patch: the sandbox keeps its previous params and the API call fails. The runtime does not serialize concurrent patches to the same sandbox; if patch semantics are not commutative, the extension must handle concurrency itself.

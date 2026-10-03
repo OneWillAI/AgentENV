@@ -4,11 +4,42 @@ All URIs are relative to *http://localhost*
 
 Method | HTTP request | Description
 ------------- | ------------- | -------------
+[**sandbox_filesystem_usage**](DefaultApi.md#sandbox_filesystem_usage) | **POST** /sandbox-hook/filesystem-usage | Best-effort ext4 usage observation triggered by root disk writes or flushes.
 [**sandbox_patch_params**](DefaultApi.md#sandbox_patch_params) | **POST** /sandbox-hook/patch-params | Applies an extension-defined patch to a sandbox's custom extension params.
 [**sandbox_start_fresh**](DefaultApi.md#sandbox_start_fresh) | **POST** /sandbox-hook/start-fresh | Invoked before a fresh sandbox boots, after its network slot is allocated.
 [**sandbox_start_resume**](DefaultApi.md#sandbox_start_resume) | **POST** /sandbox-hook/start-resume | Invoked before a sandbox resumes from a snapshot, after its network slot is ready.
 [**sandbox_stop**](DefaultApi.md#sandbox_stop) | **POST** /sandbox-hook/stop | Invoked when a sandbox stops, before its network resources are released.
 
+
+
+## sandbox_filesystem_usage
+
+> sandbox_filesystem_usage(filesystem_usage_hook_request)
+Best-effort ext4 usage observation triggered by root disk writes or flushes.
+
+No polling is required. On-disk ext4 counters may lag the mounted guest. Unknown usage is omitted, never reported as zero. Ignore observations from superseded runtime instances and non-increasing sequence numbers. Delivery failure never fails guest I/O. The stop hook includes a final observation when available, sampled after the VM process stops.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**filesystem_usage_hook_request** | [**FilesystemUsageHookRequest**](FilesystemUsageHookRequest.md) |  | [required] |
+
+### Return type
+
+ (empty response body)
+
+### Authorization
+
+No authorization required
+
+### HTTP request headers
+
+- **Content-Type**: application/json
+- **Accept**: Not defined
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
 
 ## sandbox_patch_params

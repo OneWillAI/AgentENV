@@ -1,6 +1,6 @@
 # Rust API client for custom_extension_client
 
-HTTP API implemented by the custom extension service configured via [custom_extension].url. The custom extension currently supports sandbox lifecycle hooks (under /sandbox-hook/_*), invoked by the AENV Firecracker sandbox runtime; more capabilities may be added in the future. The runtime treats any connection error, timeout, or non-2xx response as a failure of the corresponding sandbox operation (except the best-effort stop notification).
+HTTP API implemented by the custom extension service configured via [custom_extension].url. The custom extension currently supports sandbox lifecycle hooks (under /sandbox-hook/_*), invoked by the AENV Firecracker sandbox runtime; more capabilities may be added in the future. The runtime treats any connection error, timeout, or non-2xx response as a failure of the corresponding sandbox operation (except best-effort stop and filesystem usage notifications).
 Instance identity: sandboxId alone is reused across pause/resume cycles, so every start-fresh / start-resume hook carries a fresh sandboxInstanceId that uniquely identifies one runtime instance of the sandbox. The stop hook carries the sandboxInstanceId of the instance being torn down. Because the stop notification is best-effort and may be delivered out of order (e.g. a pause's stop arriving after the resume's start-resume), the extension should treat (sandboxId, sandboxInstanceId) as the identity of a running instance and ignore stop notifications whose sandboxInstanceId is not the latest started instance for that sandbox. The in-place pause+resume performed during snapshot capture does not fire the stop hook and does not change the instance id.
 
 
@@ -27,6 +27,7 @@ All URIs are relative to *http://localhost*
 
 Class | Method | HTTP request | Description
 ------------ | ------------- | ------------- | -------------
+*DefaultApi* | [**sandbox_filesystem_usage**](docs/DefaultApi.md#sandbox_filesystem_usage) | **POST** /sandbox-hook/filesystem-usage | Best-effort ext4 usage observation triggered by root disk writes or flushes.
 *DefaultApi* | [**sandbox_patch_params**](docs/DefaultApi.md#sandbox_patch_params) | **POST** /sandbox-hook/patch-params | Applies an extension-defined patch to a sandbox's custom extension params.
 *DefaultApi* | [**sandbox_start_fresh**](docs/DefaultApi.md#sandbox_start_fresh) | **POST** /sandbox-hook/start-fresh | Invoked before a fresh sandbox boots, after its network slot is allocated.
 *DefaultApi* | [**sandbox_start_resume**](docs/DefaultApi.md#sandbox_start_resume) | **POST** /sandbox-hook/start-resume | Invoked before a sandbox resumes from a snapshot, after its network slot is ready.
@@ -35,6 +36,8 @@ Class | Method | HTTP request | Description
 
 ## Documentation For Models
 
+ - [FilesystemUsage](docs/FilesystemUsage.md)
+ - [FilesystemUsageHookRequest](docs/FilesystemUsageHookRequest.md)
  - [PatchCustomExtensionParamsHookRequest](docs/PatchCustomExtensionParamsHookRequest.md)
  - [PatchCustomExtensionParamsHookResponse](docs/PatchCustomExtensionParamsHookResponse.md)
  - [StartFreshHookRequest](docs/StartFreshHookRequest.md)

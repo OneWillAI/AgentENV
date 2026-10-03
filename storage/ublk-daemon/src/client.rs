@@ -14,6 +14,25 @@ use crate::protocol::{
 };
 use overlaybd::config::UpperMode;
 
+/// Event stream tied to one device image. Dropping it unsubscribes.
+pub struct FilesystemUsageStream {
+    stream: UnixStream,
+    initial: Option<uvm_ublk::FilesystemUsage>,
+}
+
+impl FilesystemUsageStream {
+    pub async fn next(&mut self) -> Result<Option<uvm_ublk::FilesystemUsage>> {
+        if let Some(initial) = self.initial.take() {
+            return Ok(Some(initial));
+        }
+        match recv_message::<DaemonResponse>(&mut self.stream).await? {
+            Some(DaemonResponse::FilesystemUsage { usage }) => Ok(Some(usage)),
+            None => Ok(None),
+            response => bail!("unexpected filesystem usage response: {response:?}"),
+        }
+    }
+}
+
 /// Default timeout for daemon RPC calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -345,6 +364,27 @@ impl UblkDaemonClient {
     /// The socket path this client connects to.
     pub fn socket_path(&self) -> &Path {
         &self.inner.socket_path
+    }
+
+    /// Subscribe without polling. The handshake has the ordinary RPC timeout;
+    /// waiting for later write events has no deadline on an idle guest.
+    pub async fn watch_filesystem_usage(&self, dev_id: u32) -> Result<FilesystemUsageStream> {
+        tokio::time::timeout(DEFAULT_TIMEOUT, async {
+            let mut stream = UnixStream::connect(&self.inner.socket_path).await?;
+            send_message(&mut stream, &DaemonRequest::WatchFilesystemUsage { dev_id }).await?;
+            let mut updates = FilesystemUsageStream {
+                stream,
+                initial: None,
+            };
+            updates.initial = updates.next().await?;
+            anyhow::ensure!(
+                updates.initial.is_some(),
+                "daemon closed filesystem usage subscription"
+            );
+            Ok(updates)
+        })
+        .await
+        .context("filesystem usage subscription timed out")?
     }
 
     /// Create a raw overlaybd-backed ublk device.

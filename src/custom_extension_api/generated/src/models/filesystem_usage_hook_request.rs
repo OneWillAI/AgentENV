@@ -12,43 +12,25 @@ use crate::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StartFreshHookRequest {
+pub struct FilesystemUsageHookRequest {
     #[serde(rename = "sandboxId")]
     pub sandbox_id: String,
-    /// Unique identifier of this runtime instance of the sandbox. A new value is generated for every start-fresh / start-resume; the subsequent stop hook carries the same value.
     #[serde(rename = "sandboxInstanceId")]
     pub sandbox_instance_id: String,
-    /// Host path of the sandbox's network namespace file (e.g. /var/run/netns/agentenv-ns-*).
-    #[serde(rename = "networkNamespacePath")]
-    pub network_namespace_path: String,
-    /// Per-runtime host interaction address routed to this sandbox.
-    #[serde(rename = "hostInteractionIp")]
-    pub host_interaction_ip: String,
-    /// Firecracker process ID after the microVM process exists and before it is started. Present so the extension can place the VM in a lineage cgroup.
-    #[serde(rename = "firecrackerPid", skip_serializing_if = "Option::is_none")]
-    pub firecracker_pid: Option<i32>,
-    /// Opaque JSON object interpreted only by the custom extension. An absent value and an empty object are equivalent: both mean empty params.
-    #[serde(
-        rename = "customExtensionParams",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub custom_extension_params: Option<serde_json::Value>,
+    #[serde(rename = "usage")]
+    pub usage: Box<models::FilesystemUsage>,
 }
 
-impl StartFreshHookRequest {
+impl FilesystemUsageHookRequest {
     pub fn new(
         sandbox_id: String,
         sandbox_instance_id: String,
-        network_namespace_path: String,
-        host_interaction_ip: String,
-    ) -> StartFreshHookRequest {
-        StartFreshHookRequest {
+        usage: models::FilesystemUsage,
+    ) -> FilesystemUsageHookRequest {
+        FilesystemUsageHookRequest {
             sandbox_id,
             sandbox_instance_id,
-            network_namespace_path,
-            host_interaction_ip,
-            firecracker_pid: None,
-            custom_extension_params: None,
+            usage: Box::new(usage),
         }
     }
 }

@@ -1575,6 +1575,12 @@ impl FirecrackerSandbox {
         self.envd_instance = None;
         self.frozen_volume_mounts.clear();
 
+        if let (Some(guard), Some(rootfs)) =
+            (&mut self.custom_extension_hook_guard, &self.rootfs_runtime)
+        {
+            guard.finish_filesystem_usage(rootfs.device.dev_id()).await;
+        }
+
         // Cleanup ublk device (must happen after FC stop, before network cleanup)
         if let Some(runtime) = self.rootfs_runtime.take() {
             if let Err(e) = UblkDeviceManager::global()
@@ -2241,6 +2247,9 @@ impl FirecrackerSandbox {
                     config.common.custom_extension_params.as_ref(),
                 )
                 .await?;
+            if let Some(rootfs) = &self.rootfs_runtime {
+                guard.watch_filesystem_usage(rootfs.device.dev_id()).await;
+            }
             self.custom_extension_hook_guard = Some(guard);
             if let Some(extra) = extra_boot_args.filter(|args| !args.trim().is_empty()) {
                 boot_args = Some(match boot_args.take() {
@@ -2620,6 +2629,9 @@ impl FirecrackerSandbox {
                     config.common.custom_extension_params.as_ref(),
                 )
                 .await?;
+            if let Some(rootfs) = &self.rootfs_runtime {
+                guard.watch_filesystem_usage(rootfs.device.dev_id()).await;
+            }
             self.custom_extension_hook_guard = Some(guard);
         }
 

@@ -9,8 +9,11 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use storage_util::io_ring::AsyncIoRing;
+use tokio::sync::{watch, Mutex};
 
 use super::startup_pack_recorder::StartupPackRecorder;
 use crate::{IOBuffer, UVMUblkTarget, UblkDescOperation};
@@ -19,7 +22,6 @@ const DEFAULT_PHYSICAL_BS_SHIFT: u8 = 12;
 const DEFAULT_IO_OPT_SHIFT: u8 = DEFAULT_PHYSICAL_BS_SHIFT;
 
 /// Internal state of an OverlaybdTarget that can be hot-swapped.
-#[derive(Clone)]
 struct TargetState {
     image_config_path: PathBuf,
     image: Arc<ImageFile>,
@@ -27,9 +29,43 @@ struct TargetState {
     logical_bs_shift: u8,
     physical_bs_shift: u8,
     discard_supported: bool,
+    filesystem_usage: watch::Sender<Option<FilesystemUsage>>,
+    usage_probe: Mutex<()>,
+    metadata_end: AtomicU64,
+}
+
+/// On-disk ext4 counters may lag a mounted guest's journal. This is an
+/// observation, not a hard quota or a reservation of physical worker space.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FilesystemUsage {
+    pub observed_at_unix_ms: u64,
+    pub used_bytes: Option<u64>,
 }
 
 impl TargetState {
+    async fn observe_filesystem_usage(&self) {
+        if self.filesystem_usage.receiver_count() == 0 {
+            return;
+        }
+        // Serialize probes so an older async read cannot overwrite a newer
+        // observation. Failure is explicitly unknown, never zero bytes.
+        let _probe = self.usage_probe.lock().await;
+        let file: Arc<dyn VirtualFile> = self.image.clone();
+        let usage = overlaybd::ext4_stat::ext4_usage(&file).await.ok();
+        if let Some(usage) = &usage {
+            self.metadata_end
+                .store(usage.metadata_end, Ordering::Relaxed);
+        }
+        let used_bytes = usage.map(|usage| usage.used_bytes);
+        self.filesystem_usage.send_replace(Some(FilesystemUsage {
+            observed_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            used_bytes,
+        }));
+    }
+
     fn dev_bytes(&self) -> u64 {
         self.dev_sectors << self.logical_bs_shift
     }
@@ -118,12 +154,24 @@ impl OverlaybdTarget {
             logical_bs_shift,
             physical_bs_shift: DEFAULT_PHYSICAL_BS_SHIFT.max(logical_bs_shift),
             discard_supported,
+            filesystem_usage: watch::channel(None).0,
+            usage_probe: Mutex::new(()),
+            metadata_end: AtomicU64::new(2048),
         };
 
         Ok(Self {
             state: ArcSwap::new(Arc::new(state)),
             recorder: ArcSwapOption::new(None),
         })
+    }
+
+    /// Subscribe to this image's write/flush observations. A pooled-device
+    /// swap closes this stream rather than leaking the next guest's usage.
+    pub async fn watch_filesystem_usage(&self) -> watch::Receiver<Option<FilesystemUsage>> {
+        let state = self.state.load_full();
+        let receiver = state.filesystem_usage.subscribe();
+        state.observe_filesystem_usage().await;
+        receiver
     }
 
     /// Attach (or detach with `None`) a startup-pack first-touch recorder.
@@ -162,6 +210,9 @@ impl OverlaybdTarget {
             logical_bs_shift,
             physical_bs_shift: DEFAULT_PHYSICAL_BS_SHIFT.max(logical_bs_shift),
             discard_supported,
+            filesystem_usage: watch::channel(None).0,
+            usage_probe: Mutex::new(()),
+            metadata_end: AtomicU64::new(2048),
         };
 
         // Per-image attachments must not survive a swap: a pooled device
@@ -240,6 +291,11 @@ impl OverlaybdTarget {
         let written = state.image.write_at_with_ctx(ctx, offset, data).await?;
         if written != len {
             bail!("overlaybd target short write at offset {offset}: expect {len}, wrote {written}");
+        }
+        if offset < state.metadata_end.load(Ordering::Relaxed)
+            && offset.saturating_add(written as u64) > 1024
+        {
+            state.observe_filesystem_usage().await;
         }
         Ok(written)
     }
@@ -382,7 +438,13 @@ impl UVMUblkTarget for OverlaybdTarget {
                 .handle_write(&state, ctx, offset, len, buf)
                 .await
                 .map(|n| n as i32),
-            UblkDescOperation::Flush => state.image.sync().await.map(|_| 0),
+            UblkDescOperation::Flush => match state.image.sync().await {
+                Ok(()) => {
+                    state.observe_filesystem_usage().await;
+                    Ok(0)
+                }
+                Err(error) => Err(error),
+            },
             UblkDescOperation::Discard => self.handle_discard(&state, offset, len).await,
             UblkDescOperation::WriteZeroes => {
                 Err(anyhow::anyhow!("overlaybd target does not support {op:?}"))
@@ -589,5 +651,93 @@ mod tests {
             .await
             .expect("read after discard");
         assert!(got.iter().all(|&b| b == 0));
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn filesystem_usage_follows_group_writes_and_ends_on_reuse() {
+        use std::io::Read;
+        let tmp = TempDir::new().unwrap();
+        let ext4_path = tmp.path().join("ext4.img");
+        std::fs::File::create(&ext4_path)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let mkfs = std::process::Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096"])
+            .arg(&ext4_path)
+            .status()
+            .unwrap();
+        assert!(mkfs.success());
+        let mut superblock = vec![0; 8192];
+        std::fs::File::open(&ext4_path)
+            .unwrap()
+            .read_exact(&mut superblock)
+            .unwrap();
+        let blocks = u32::from_le_bytes(superblock[1028..1032].try_into().unwrap());
+        let free = u32::from_le_bytes(superblock[1036..1040].try_into().unwrap());
+        let expected = u64::from(blocks - free) * 4096;
+
+        let global = write_global_config(&tmp).unwrap();
+        let upper = tmp.path().join("upper.data");
+        prepare_runtime_upper(&upper, None, 64 << 20, UpperMode::Sparse).unwrap();
+        let config = write_sparse_image_config(&tmp, &upper).unwrap();
+        let target = Arc::new(OverlaybdTarget::open(&global, &config).await.unwrap());
+        let mut updates = target.watch_filesystem_usage().await;
+        assert!(updates
+            .borrow_and_update()
+            .as_ref()
+            .unwrap()
+            .used_bytes
+            .is_none());
+        let ring = AsyncIoRingBuilder::new()
+            .nr_sparse_buffer(2)
+            .nr_sparse_file(2)
+            .sqe_entries(8)
+            .cqe_entries(16)
+            .build()
+            .unwrap();
+        // Seed fixture metadata directly; the actual observed operation below
+        // is the guest-style group descriptor write through the ublk boundary.
+        target
+            .state
+            .load()
+            .image
+            .write_at(0, &superblock)
+            .await
+            .unwrap();
+        let mut updates = target.watch_filesystem_usage().await;
+        let observed = updates.borrow_and_update().clone().unwrap();
+        assert_eq!(observed.used_bytes, Some(expected));
+        assert!(observed.observed_at_unix_ms > 0);
+        // A mounted filesystem updates group descriptors without rewriting
+        // the superblock summary. Observe growth from that write alone.
+        let group_free = u16::from_le_bytes(superblock[4108..4110].try_into().unwrap());
+        superblock[4108..4110].copy_from_slice(&(group_free - 256).to_le_bytes());
+        let user_buf = UserBuffer::new(ring.clone(), 4096, 512).await.unwrap();
+        user_buf
+            .subslice_mut(0, 4096)
+            .copy_from_slice(&superblock[4096..]);
+        let mut group_buf = IOBuffer::User(user_buf);
+        let group_write = ublksrv_io_desc {
+            op_flags: ublk_sys::UBLK_IO_OP_WRITE,
+            nr_sectors: 8,
+            start_sector: 8,
+            addr: group_buf.uring_buf_idx() as u64,
+        };
+        assert_eq!(
+            target
+                .handle_io_request(0, 0, group_write, &mut group_buf, None, &ring)
+                .await,
+            4096
+        );
+        updates.changed().await.unwrap();
+        assert_eq!(
+            updates.borrow_and_update().as_ref().unwrap().used_bytes,
+            Some(expected + (1 << 20))
+        );
+        // Reassigning the same pooled device must terminate the old image's
+        // stream even if the new guest happens to use the same backing file.
+        let image = target.state.load().image.clone();
+        target.swap_state(config, image, true).unwrap();
+        assert!(updates.changed().await.is_err());
     }
 }

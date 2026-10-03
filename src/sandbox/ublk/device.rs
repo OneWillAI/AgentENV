@@ -288,6 +288,13 @@ impl UblkDeviceManager {
             .context("ublk daemon client is unavailable")
     }
 
+    pub(crate) async fn watch_filesystem_usage(
+        &self,
+        dev_id: u32,
+    ) -> Result<uvm_ublk_daemon::client::FilesystemUsageStream> {
+        self.require_client()?.watch_filesystem_usage(dev_id).await
+    }
+
     /// Tell the daemon the sandbox owning `device_key` finished booting,
     /// releasing held background downloads. Best-effort: failures only mean
     /// the downloads start after the fallback timeout instead.
