@@ -788,48 +788,61 @@ mod tests {
     #[ignore = "requires an isolated network namespace and CAP_NET_ADMIN"]
     fn host_firewall_restart_preserves_exceptions_without_duplicates() {
         use super::*;
-        let rules = global_host_iptables_commands("10.11.0.0/16".parse().unwrap());
-        reconcile_global_host_iptables(&rules).unwrap();
-        let exception = IptablesRestoreCommand::Insert {
-            table: "filter",
-            chain: "INPUT",
-            position: 1,
-            rule: "-s 10.11.0.8/32 -i veth-+ -p tcp --dport 49984 -j ACCEPT".into(),
-        };
-        apply_iptables_commands(&[exception], OpenFailurePolicy::ReturnErr).unwrap();
-        // Reproduce the old daemon restarting twice over persistent rules.
-        apply_iptables_commands(&rules, OpenFailurePolicy::ReturnErr).unwrap();
-        apply_iptables_commands(&rules, OpenFailurePolicy::ReturnErr).unwrap();
-        reconcile_global_host_iptables(&rules).unwrap();
-        reconcile_global_host_iptables(&rules).unwrap();
-        let output = Command::new("iptables")
-            .args(["-S", "INPUT"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let text = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(text.matches("-j REJECT").count(), 1, "{text}");
-        assert_eq!(text.matches("--ctstate").count(), 1, "{text}");
-        assert!(
-            text.find("--dport 49984").unwrap() < text.find("-j REJECT").unwrap(),
-            "{text}"
-        );
-        for (table, chain, marker) in [
-            ("filter", "FORWARD", "-s 10.11.0.0/16"),
-            ("nat", "POSTROUTING", "-j MASQUERADE"),
-        ] {
-            let output = Command::new("iptables")
-                .args(["-t", table, "-S", chain])
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout)
-                    .matches(marker)
-                    .count(),
-                1
-            );
-        }
+        // The aggregate capability suite runs on the builder host. Isolate
+        // this test's rules even when the caller did not use unshare.
+        crate::privileges::run_with_scoped_capabilities(
+            &[
+                crate::privileges::CAP_SYS_ADMIN,
+                crate::privileges::CAP_NET_ADMIN,
+            ],
+            || {
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)?;
+                let rules = global_host_iptables_commands("10.11.0.0/16".parse().unwrap());
+                reconcile_global_host_iptables(&rules).unwrap();
+                let exception = IptablesRestoreCommand::Insert {
+                    table: "filter",
+                    chain: "INPUT",
+                    position: 1,
+                    rule: "-s 10.11.0.8/32 -i veth-+ -p tcp --dport 49984 -j ACCEPT".into(),
+                };
+                apply_iptables_commands(&[exception], OpenFailurePolicy::ReturnErr).unwrap();
+                // Reproduce the old daemon restarting twice over persistent rules.
+                apply_iptables_commands(&rules, OpenFailurePolicy::ReturnErr).unwrap();
+                apply_iptables_commands(&rules, OpenFailurePolicy::ReturnErr).unwrap();
+                reconcile_global_host_iptables(&rules).unwrap();
+                reconcile_global_host_iptables(&rules).unwrap();
+                let output = Command::new("iptables")
+                    .args(["-S", "INPUT"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert_eq!(text.matches("-j REJECT").count(), 1, "{text}");
+                assert_eq!(text.matches("--ctstate").count(), 1, "{text}");
+                assert!(
+                    text.find("--dport 49984").unwrap() < text.find("-j REJECT").unwrap(),
+                    "{text}"
+                );
+                for (table, chain, marker) in [
+                    ("filter", "FORWARD", "-s 10.11.0.0/16"),
+                    ("nat", "POSTROUTING", "-j MASQUERADE"),
+                ] {
+                    let output = Command::new("iptables")
+                        .args(["-t", table, "-S", chain])
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout)
+                            .matches(marker)
+                            .count(),
+                        1
+                    );
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
     }
     use super::*;
     use index_set::BitSet;
