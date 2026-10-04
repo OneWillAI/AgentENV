@@ -546,7 +546,7 @@ impl NetworkManager {
 
         let commands = global_host_iptables_commands(self.address_plan.host_interaction_cidr());
 
-        match apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr) {
+        match reconcile_global_host_iptables(&commands) {
             Ok(()) => {
                 debug!("installed global host iptables rules for sandbox networking");
                 Ok(())
@@ -575,6 +575,52 @@ impl NetworkManager {
     }
 }
 
+// Retain existing rule positions across process restarts. In particular, do
+// not prepend host isolation ahead of an extension's guest-control exceptions.
+// Old duplicate rules are removed from the front, retaining the original rule.
+fn reconcile_global_host_iptables(commands: &[IptablesRestoreCommand]) -> Result<()> {
+    crate::privileges::run_with_scoped_capabilities(&[crate::privileges::CAP_NET_ADMIN], || {
+        let mut changes = Vec::new();
+        for command in commands {
+            let (table, chain, rule) = match command {
+                IptablesRestoreCommand::Insert {
+                    table, chain, rule, ..
+                }
+                | IptablesRestoreCommand::Append { table, chain, rule } => (*table, *chain, rule),
+                _ => unreachable!("global host rules only insert or append"),
+            };
+            let output = Command::new("iptables")
+                .args(["-w", "5", "-t", table, "-S", chain])
+                .output()?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "inspect global host firewall: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            // Rules below use iptables' canonical -S spelling, including the
+            // explicit default REJECT type and conntrack state ordering.
+            let expected = format!("-A {chain} {rule}");
+            let count = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| *line == expected)
+                .count();
+            if count == 0 {
+                changes.push(command.clone());
+            } else {
+                for _ in 1..count {
+                    changes.push(IptablesRestoreCommand::Delete {
+                        table,
+                        chain,
+                        rule: rule.clone(),
+                    });
+                }
+            }
+        }
+        apply_iptables_commands(&changes, OpenFailurePolicy::ReturnErr)
+    })
+}
+
 fn global_host_iptables_commands(
     host_interaction_cidr: Ipv4Network,
 ) -> [IptablesRestoreCommand; 5] {
@@ -587,14 +633,14 @@ fn global_host_iptables_commands(
             chain: "INPUT",
             position: 1,
             rule: format!(
-                "-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+                "-s {cidr} -i {HOST_VETH_PREFIX}+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
             ),
         },
         IptablesRestoreCommand::Insert {
             table: "filter",
             chain: "INPUT",
             position: 2,
-            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j REJECT"),
+            rule: format!("-s {cidr} -i {HOST_VETH_PREFIX}+ -j REJECT --reject-with icmp-port-unreachable"),
         },
         // Packets are SNATted to the host interaction CIDR inside the sandbox namespace before
         // they enter the host FORWARD chain, so hosts with a DROP FORWARD policy
@@ -602,13 +648,13 @@ fn global_host_iptables_commands(
         IptablesRestoreCommand::Append {
             table: "filter",
             chain: "FORWARD",
-            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j ACCEPT"),
+            rule: format!("-s {cidr} -i {HOST_VETH_PREFIX}+ -j ACCEPT"),
         },
         IptablesRestoreCommand::Append {
             table: "filter",
             chain: "FORWARD",
             rule: format!(
-                "-o {HOST_VETH_PREFIX}+ -d {cidr} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+                "-d {cidr} -o {HOST_VETH_PREFIX}+ -m state --state RELATED,ESTABLISHED -j ACCEPT"
             ),
         },
         IptablesRestoreCommand::Append {
@@ -628,24 +674,24 @@ fn global_host_iptables_delete_commands(
             table: "filter",
             chain: "INPUT",
             rule: format!(
-                "-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+                "-s {cidr} -i {HOST_VETH_PREFIX}+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
             ),
         },
         IptablesRestoreCommand::Delete {
             table: "filter",
             chain: "INPUT",
-            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j REJECT"),
+            rule: format!("-s {cidr} -i {HOST_VETH_PREFIX}+ -j REJECT --reject-with icmp-port-unreachable"),
         },
         IptablesRestoreCommand::Delete {
             table: "filter",
             chain: "FORWARD",
-            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j ACCEPT"),
+            rule: format!("-s {cidr} -i {HOST_VETH_PREFIX}+ -j ACCEPT"),
         },
         IptablesRestoreCommand::Delete {
             table: "filter",
             chain: "FORWARD",
             rule: format!(
-                "-o {HOST_VETH_PREFIX}+ -d {cidr} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+                "-d {cidr} -o {HOST_VETH_PREFIX}+ -m state --state RELATED,ESTABLISHED -j ACCEPT"
             ),
         },
         IptablesRestoreCommand::Delete {
@@ -737,6 +783,54 @@ fn run_command(command: &str, args: &[&str], capabilities: &'static [i32]) -> Op
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[ignore = "requires an isolated network namespace and CAP_NET_ADMIN"]
+    fn host_firewall_restart_preserves_exceptions_without_duplicates() {
+        use super::*;
+        let rules = global_host_iptables_commands("10.11.0.0/16".parse().unwrap());
+        reconcile_global_host_iptables(&rules).unwrap();
+        let exception = IptablesRestoreCommand::Insert {
+            table: "filter",
+            chain: "INPUT",
+            position: 1,
+            rule: "-s 10.11.0.8/32 -i veth-+ -p tcp --dport 49984 -j ACCEPT".into(),
+        };
+        apply_iptables_commands(&[exception], OpenFailurePolicy::ReturnErr).unwrap();
+        // Reproduce the old daemon restarting twice over persistent rules.
+        apply_iptables_commands(&rules, OpenFailurePolicy::ReturnErr).unwrap();
+        apply_iptables_commands(&rules, OpenFailurePolicy::ReturnErr).unwrap();
+        reconcile_global_host_iptables(&rules).unwrap();
+        reconcile_global_host_iptables(&rules).unwrap();
+        let output = Command::new("iptables")
+            .args(["-S", "INPUT"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.matches("-j REJECT").count(), 1, "{text}");
+        assert_eq!(text.matches("--ctstate").count(), 1, "{text}");
+        assert!(
+            text.find("--dport 49984").unwrap() < text.find("-j REJECT").unwrap(),
+            "{text}"
+        );
+        for (table, chain, marker) in [
+            ("filter", "FORWARD", "-s 10.11.0.0/16"),
+            ("nat", "POSTROUTING", "-j MASQUERADE"),
+        ] {
+            let output = Command::new("iptables")
+                .args(["-t", table, "-S", chain])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .matches(marker)
+                    .count(),
+                1
+            );
+        }
+    }
     use super::*;
     use index_set::BitSet;
     use std::collections::HashSet;

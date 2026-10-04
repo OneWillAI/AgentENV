@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, Context, Result};
 use tracing::warn;
 
+#[derive(Clone)]
 pub(super) enum IptablesRestoreCommand {
     NewChain {
         table: &'static str,
