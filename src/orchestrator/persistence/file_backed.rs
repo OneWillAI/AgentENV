@@ -2937,11 +2937,11 @@ mod tests {
         persister
             .persist_paused(&metadata, Some(&root), state.as_ref())
             .await?;
+        let mut record = persister.get_record(&id).await?;
+        assert_eq!(record.unproven_stop_boot_id, current_host_boot_id());
         // A process restart on the same boot must not certify a potentially live VM.
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
         assert!(!loaded[0].paused_runtime_stopped);
-        let mut record = persister.get_record(&id).await?;
-        assert_eq!(record.unproven_stop_boot_id, current_host_boot_id());
         // Model the first different host boot after publication, before stop ack.
         assert!(matches!(
             record.reconcile_stop_proof_for_boot("next-host-boot"),
