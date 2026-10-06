@@ -2207,7 +2207,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
             commit_state: PersistedPausedCommitState::Committed,
             lifecycle: PersistedPausedLifecycle::Paused,
             resuming_boot_id: None,
-            unproven_stop_boot_id: None,
+            // If shutdown interrupts stop acknowledgement, the next host boot
+            // can prove this runtime is gone without requiring a second reboot.
+            unproven_stop_boot_id: current_host_boot_id(),
             metadata: metadata.clone(),
             artifact_root: artifact_root.to_path_buf(),
             state,
@@ -2915,6 +2917,41 @@ mod tests {
         assert!(loaded[0].resume_recovery_pending);
         assert!(loaded[0].paused_state.is_some());
         assert!(persister.sandbox_artifact_root(&metadata.id).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn published_checkpoint_survives_interrupted_stop_on_first_reboot() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let id = SandboxId::new();
+        let root = persister.allocate_artifact_root(&id).await?.unwrap();
+        let state = paused_state(&root);
+        let metadata = SandboxMetadata {
+            id,
+            state: SandboxState::Paused,
+            paused_state: Some(Arc::clone(&state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&root), state.as_ref())
+            .await?;
+        // A process restart on the same boot must not certify a potentially live VM.
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert!(!loaded[0].paused_runtime_stopped);
+        let mut record = persister.get_record(&id).await?;
+        assert_eq!(record.unproven_stop_boot_id, current_host_boot_id());
+        // Model the first different host boot after publication, before stop ack.
+        assert!(matches!(
+            record.reconcile_stop_proof_for_boot("next-host-boot"),
+            StopProofReconciliation::RuntimeAbsent
+        ));
+        persister.put_record(&record).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert!(loaded[0].paused_runtime_stopped);
+        assert!(!loaded[0].resume_recovery_pending);
+        assert!(loaded[0].paused_state.is_some());
         Ok(())
     }
 
