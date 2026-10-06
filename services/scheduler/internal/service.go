@@ -23,6 +23,7 @@ type Service struct {
 	store         BindingStore
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
+	placement     *config.PlacementConfig
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -85,15 +86,25 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	}()
 
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
+	observed := make(map[string]*schedulerv1.NodeSnapshot)
+	if s.placement != nil && s.placement.RequireReady {
+		for _, node := range s.nodes.ListObserved("", time.Now()) {
+			observed[node.GetNodeId()] = node.GetSnapshot()
+		}
+	}
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
+		snapshot := s.nodes.PeekObserved(n.ID)
+		if s.placement != nil && s.placement.RequireReady {
+			snapshot = observed[n.ID]
+		}
 		rich = append(rich, RichNode{
 			Node:     n,
-			Snapshot: s.nodes.PeekObserved(n.ID),
+			Snapshot: snapshot,
 		})
 	}
 
-	eligible := FilterByResourceLimit(rich, s.resourceLimit)
+	eligible := FilterByResourceLimit(filterPlacement(rich, req.GetHint(), s.placement), s.resourceLimit)
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
 	if selectErr != nil {

@@ -57,7 +57,15 @@ type NodeResourceLimit struct {
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
 }
 
+// PlacementConfig is opt-in; absent configuration preserves upstream placement.
+type PlacementConfig struct {
+	MetadataKey    string   `json:"metadata_key"`
+	DefaultNodeIDs []string `json:"default_node_ids"`
+	RequireReady   bool     `json:"require_ready"`
+}
+
 type SchedulerConfig struct {
+	Placement               *PlacementConfig         `json:"placement,omitempty"`
 	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
 	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
 	Strategy                string                   `json:"strategy"`
@@ -73,6 +81,7 @@ type SchedulerConfig struct {
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
+		Placement               *PlacementConfig          `json:"placement"`
 		GRPCListenAddr          *string                   `json:"grpc_listen_addr"`
 		MetricsListenAddr       *string                   `json:"metrics_listen_addr"`
 		Strategy                *string                   `json:"strategy"`
@@ -94,6 +103,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	if parsed.GRPCListenAddr != nil {
 		s.GRPCListenAddr = *parsed.GRPCListenAddr
 	}
+	s.Placement = parsed.Placement
 	if parsed.MetricsListenAddr != nil {
 		s.MetricsListenAddr = *parsed.MetricsListenAddr
 	}
@@ -446,9 +456,12 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		if c.Scheduler.ArtifactStoreCapacity <= 0 {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")
 		}
+		if c.Scheduler.Placement != nil && strings.TrimSpace(c.Scheduler.Placement.MetadataKey) == "" {
+			return errors.New("scheduler.placement.metadata_key is required")
+		}
 		switch strings.ToLower(strings.TrimSpace(c.Scheduler.Discovery.Mode)) {
 		case "static":
-			if len(c.Scheduler.Nodes) == 0 {
+			if len(c.Scheduler.Nodes) == 0 && c.Scheduler.Placement == nil {
 				return errors.New("scheduler.nodes must not be empty")
 			}
 			for _, n := range c.Scheduler.Nodes {
