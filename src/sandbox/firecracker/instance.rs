@@ -352,6 +352,23 @@ impl FirecrackerInstance {
             .with_context(|| format!("Failed to patch rate limiter on drive {}", drive_id))
     }
 
+    /// Check the running process, not merely the worker's installed binary.
+    /// Old VMs must refuse live growth before quiescing or changing storage.
+    pub async fn require_live_disk_grow(&self) -> Result<()> {
+        let version: serde_json::Value = self
+            .client
+            .request::<(), serde_json::Value>(Method::GET, "/version", None)
+            .await?;
+        if version.get("firecracker_version").and_then(|v| v.as_str())
+            != Some("1.15.1-onewill-grow.1")
+        {
+            bail!(
+                "running Firecracker lacks safe live disk growth; no restart fallback is allowed"
+            );
+        }
+        Ok(())
+    }
+
     /// Updates the host backing path for a drive on a loaded snapshot.
     pub async fn patch_drive_path(&self, drive_id: &str, path_on_host: &Path) -> Result<()> {
         let mut partial = PartialDrive::new(drive_id.to_string());

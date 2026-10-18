@@ -753,6 +753,24 @@ impl UblkDaemonClient {
         }
     }
 
+    /// Grow the backing image and kernel capacity in order. A failure can leave
+    /// the backing image larger; retry the same request rather than shrinking.
+    pub async fn grow_overlaybd(&self, dev_id: u32, size_bytes: u64) -> Result<u64> {
+        match self
+            .call(
+                DaemonRequest::GrowOverlaybd { dev_id, size_bytes },
+                Duration::from_secs(60),
+            )
+            .await?
+        {
+            DaemonResponse::OverlaybdGrown { size_bytes } => Ok(size_bytes),
+            DaemonResponse::Error { message } | DaemonResponse::TerminalError { message } => {
+                bail!("daemon: grow dev_id={dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected grow response: {other:?}"),
+        }
+    }
+
     /// Update the virtual size of a ublk device.
     ///
     /// Requires `UBLK_F_UPDATE_SIZE` capability.

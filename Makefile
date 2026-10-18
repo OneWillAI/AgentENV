@@ -118,6 +118,7 @@ coverage:
 test: test-agent test-envd test-ublk
 
 test-unit:
+	python3 tests/freeze_helper_test.py
 	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
 	$(CARGO) test -p aenv --bin aenv
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored

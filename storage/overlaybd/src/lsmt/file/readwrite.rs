@@ -412,6 +412,24 @@ impl LSMTFile {
         Ok(())
     }
 
+    /// Publish a size whose headers have already been durably grown under the
+    /// image's exclusive I/O lock. Invalidate the streaming digest rather than
+    /// scanning the whole upper during a guest write freeze.
+    pub(crate) async fn adopt_grown_size(&self, size: u64) -> Result<()> {
+        ensure!(!self.sealed.load(Ordering::Acquire), "File is sealed.");
+        ensure!(
+            size >= self.virtual_size.load(Ordering::Acquire),
+            "disk shrink is not supported"
+        );
+        *self.append_digest.lock().await = None;
+        if self.file_type == LSMTFileType::SparseReadWrite {
+            self.rw_data_append_offset
+                .store(size + HEADER_SIZE, Ordering::Release);
+        }
+        self.virtual_size.store(size, Ordering::Release);
+        Ok(())
+    }
+
     pub async fn update_vsize(&self, vsize: u64) -> Result<()> {
         // Only the pure append-only log-structured upper maintains an append
         // digest. Sparse and Hybrid can rewrite existing data blocks in place.

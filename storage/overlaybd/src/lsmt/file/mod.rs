@@ -1,3 +1,4 @@
+pub(crate) mod grow;
 mod helper;
 mod readonly;
 mod readwrite;

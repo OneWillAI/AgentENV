@@ -345,6 +345,16 @@ pub trait SandboxBackend: Send + 'static {
     /// config the next cold-create can boot. This must not copy RAM or
     /// processes. The source sandbox stays running.
     async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf>;
+
+    /// Grow the running root disk without stopping the VM or its processes.
+    async fn grow_disk(&mut self, _size_bytes: u64) -> Result<u64> {
+        anyhow::bail!("online disk growth is unsupported by this backend")
+    }
+
+    /// Release capture exclusion after the orchestrator reconciles resources.
+    fn commit_disk_grow(&mut self) -> Result<()> {
+        anyhow::bail!("online disk growth is unsupported by this backend")
+    }
 }
 
 /// Factory interface for creating and restoring sandbox backend instances.

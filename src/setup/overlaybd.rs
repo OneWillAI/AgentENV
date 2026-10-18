@@ -92,8 +92,19 @@ pub async fn ensure_release_tools(
             downloads_dir.display()
         )
     })?;
-    let package_path = downloads_dir.join(asset_name);
-    download_file(&configured_release.package_url, &package_path).await?;
+    // Immutable host releases may bundle their converter instead of downloading
+    // it. Read the selected archive directly so an old download cannot mask it.
+    let package_path = if let Some(path) = configured_release.package_url.strip_prefix("file://") {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("overlaybd local package path must be absolute");
+        }
+        path
+    } else {
+        let path = downloads_dir.join(asset_name);
+        download_file(&configured_release.package_url, &path).await?;
+        path
+    };
 
     let extract_dir = tempfile::tempdir().context("create temp dir for overlaybd release")?;
     extract_overlaybd_package(&package_path, extract_dir.path())?;
@@ -434,6 +445,8 @@ mod tests {
             archive.append_data(&mut header, path, &b"{}"[..])?;
         }
         let package = archive.into_inner()?.finish()?;
+        let bundled = temp.path().join("bundled.tar.gz");
+        std::fs::write(&bundled, &package)?;
         let downloads = Arc::new(AtomicUsize::new(0));
         let requests = Arc::clone(&downloads);
         let arch = crate::setup::deps::detect_arch()?;
@@ -479,6 +492,17 @@ mod tests {
             "tag_name":"future-runtime-release", "asset_name":"other.tar.gz", "digest":null
         }"#,
         )?;
+        assert_eq!(super::ensure_tools_converter_v1(temp.path()).await?, pinned);
+        let local_release = OverlaybdDependencyConfig {
+            version: "bundled-root-converter".into(),
+            url: None,
+            package_url: Some(format!("file://{}", bundled.display())),
+        };
+        // A stale download with the same basename must not replace the bundle.
+        std::fs::create_dir_all(current.join("downloads"))?;
+        std::fs::write(current.join("downloads/bundled.tar.gz"), b"stale")?;
+        super::ensure_release_tools(&local_release, &current, &arch).await?;
+        assert!(super::overlaybd_tools_present(&current));
         assert_eq!(super::ensure_tools_converter_v1(temp.path()).await?, pinned);
         Ok(())
     }

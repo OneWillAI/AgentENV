@@ -17,9 +17,13 @@ network isolation remains essential.
 
 The operation freezes and flushes the guest root filesystem, briefly pauses
 Firecracker, copies the writable disk layer, then resumes and thaws the source.
-Images must provide `/bin/sh`, `fsfreeze`, `flock`, `stat`, and a tmpfs `/run`;
-unsupported images fail before publication. The freeze uses a per-operation
-lease and a 60-second guest watchdog to recover from a lost caller. Thawing an
+Images must provide `/bin/sh`, `fsfreeze`, `flock`, `setsid`, `stat`, and a tmpfs `/run`;
+unsupported images fail before publication. A detached guest supervisor owns the per-operation lease independently of the
+envd caller. It attempts thaw after 10 seconds if freeze acquisition has not
+completed, or after 60 seconds for an ordinary freeze lease. It can attempt thaw
+without waiting for the freeze command; a late freeze completion is thawed again
+before ownership is released. Failed recovery retains exclusion until an explicit
+thaw retry succeeds. Kernel I/O hangs can still exceed these deadlines. Thawing an
 expired lease fails the branch rather than publishing a potentially inconsistent
 copy. A lock and exact lease token prevent an old watchdog thawing a later copy.
 The operation is cancellation-shielded, and thaw is attempted after every error;
@@ -84,3 +88,25 @@ network slot. Runtime custom-extension parameters include the Firecracker PID
 when available, so the hosted extension can configure that VM's network
 namespace. Both values are runtime-local diagnostics/routing inputs; neither is
 an end-user authorization credential.
+
+## Online root disk growth (candidate, not staging-validated)
+
+`POST /sandboxes/{sandbox_id}/disk-grow` accepts `{"sizeMiB": 65536}`
+and returns the achieved block-device `sizeMiB`. It requires the control-plane
+API key and a running VM. This is grow-only: retry the same size after an error.
+A pending grow must be reconciled before requesting a different size or capturing
+a snapshot. The endpoint does not resume a paused VM or restart an unsupported one.
+
+The candidate requires patched Firecracker `1.15.1-onewill-grow.1`, kernel ublk
+capacity-update support, and a mounted whole-device writable ext4 root with
+`findmnt`, `blockdev`, `resize2fs`, `fsfreeze`, `flock`, `setsid`, and tmpfs `/run`.
+It briefly freezes filesystem writes, grows the backing image and block device,
+notifies the guest, thaws, and invokes online ext4 growth. The existing independent
+60-second thaw watchdog is reused. No RAM snapshot or VM pause is part of growth.
+
+A small marker beside the runtime image records only target size, thaw token, and
+completion. Interrupted growth retains larger backing capacity; it never shrinks
+as rollback. An error may therefore mean the backing disk is already larger even
+if the filesystem still needs a retry. Snapshot capture stays excluded until
+filesystem growth and resource accounting finish. Live fault recovery, SSH
+continuity, and snapshot/resume/fork acceptance are still unverified.

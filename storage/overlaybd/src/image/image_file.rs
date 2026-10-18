@@ -66,6 +66,7 @@ impl ImageFileBase {
 
 #[derive(Debug)]
 struct LiveImageState {
+    grow_pending: bool,
     config: ImageConfig,
     base: ImageFileBase,
     premerged_index_cache_dir: PathBuf,
@@ -156,6 +157,44 @@ impl ImageFile {
         })
     }
 
+    /// Grow a live upper without replacing its files or mapped blocks. The
+    /// detached operation retains the exclusive I/O lock if its caller leaves.
+    pub async fn grow(self: &Arc<Self>, size: u64) -> Result<u64> {
+        let image = self.clone();
+        tokio::spawn(async move {
+            let mut state = image.state.write().await;
+            let LiveImageState {
+                base,
+                config,
+                grow_pending,
+                ..
+            } = &mut *state;
+            let current = base.writable().context("grow requires a writable image")?;
+            anyhow::ensure!(size >= image.size_bytes(), "disk shrink is not supported");
+            current.sync().await?;
+            *grow_pending = true;
+            let upper = config.upper.clone();
+            let grown =
+                tokio::task::spawn_blocking(move || crate::lsmt::file::grow::grow(&upper, size))
+                    .await
+                    .context("join upper grow")??;
+            current.adopt_grown_size(grown).await?;
+            image.update_size_metadata(grown);
+            *grow_pending = false;
+            Ok(grown)
+        })
+        .await
+        .context("join image grow")?
+    }
+
+    fn ensure_grow_complete(state: &LiveImageState) -> Result<()> {
+        anyhow::ensure!(
+            !state.grow_pending,
+            "retry incomplete grow before snapshot or seal"
+        );
+        crate::lsmt::file::grow::ensure_complete(&state.config.upper)
+    }
+
     pub fn size_bytes(&self) -> u64 {
         self.size_bytes.load(Ordering::Relaxed)
     }
@@ -191,6 +230,7 @@ impl ImageFile {
 
     pub async fn compact(&self, as_file: Arc<dyn VirtualFile>) -> Result<()> {
         let state = self.state.read().await;
+        Self::ensure_grow_complete(&state)?;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.flatten(as_file).await,
             ImageFileBase::ReadWrite(file) => file.flatten(as_file).await,
@@ -199,6 +239,7 @@ impl ImageFile {
 
     pub async fn export_upper_as_sealed(&self, args: CommitArgs) -> Result<()> {
         let state = self.state.read().await;
+        Self::ensure_grow_complete(&state)?;
         state
             .base
             .writable()
@@ -215,6 +256,7 @@ impl ImageFile {
         tokio::fs::create_dir_all(parent).await?;
         let temporary = tempfile::NamedTempFile::new_in(parent)?;
         let state = self.state.write().await;
+        Self::ensure_grow_complete(&state)?;
         let current = state
             .base
             .writable()
@@ -252,6 +294,7 @@ impl ImageFile {
         // Exclusive rather than shared, unlike `export_upper_as_sealed`: this one
         // modifies the upper it is reading, so no I/O may be in flight beside it.
         let state = self.state.write().await;
+        Self::ensure_grow_complete(&state)?;
         ensure_sealable_upper(&state.config.upper, "close_seal")?;
         let upper_data_path = Path::new(&state.config.upper.data);
         let current = state
@@ -296,6 +339,7 @@ impl ImageFile {
         output_layer_path: &Path,
     ) -> Result<Option<LayerDescriptor>> {
         let mut state = self.state.write().await;
+        Self::ensure_grow_complete(&state)?;
         let upper_mode = state.config.upper.writable_mode();
         let upper_data_path = PathBuf::from(&state.config.upper.data);
         let upper_index_path = (!state.config.upper.index.is_empty())
@@ -462,6 +506,7 @@ impl ImageFile {
         let base = match (lowers.file, upper_file) {
             (Some(lower), Some(upper)) => InitializedImageFile {
                 state: LiveImageState {
+                    grow_pending: false,
                     config: config.clone(),
                     base: ImageFileBase::ReadWrite(stack_files(&upper, &lower, false).await?),
                     premerged_index_cache_dir: premerged_index_cache_dir.clone(),
@@ -473,6 +518,7 @@ impl ImageFile {
             },
             (Some(lower), None) => InitializedImageFile {
                 state: LiveImageState {
+                    grow_pending: false,
                     config: config.clone(),
                     base: ImageFileBase::ReadOnly(lower),
                     premerged_index_cache_dir: premerged_index_cache_dir.clone(),
@@ -484,6 +530,7 @@ impl ImageFile {
             },
             (None, Some(upper)) => InitializedImageFile {
                 state: LiveImageState {
+                    grow_pending: false,
                     config: config.clone(),
                     base: ImageFileBase::ReadWrite(upper),
                     premerged_index_cache_dir,
@@ -632,6 +679,10 @@ impl ImageFile {
             ));
         }
 
+        let recovery_upper = upper.clone();
+        tokio::task::spawn_blocking(move || crate::lsmt::file::grow::recover(&recovery_upper))
+            .await
+            .context("join upper grow recovery")??;
         let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper.data, false)?);
         let idx_file = match upper.writable_mode() {
             UpperMode::Sparse => None,
@@ -841,7 +892,7 @@ impl VirtualFile for ImageFile {
             .context("writing read-only image file")?
             .write_at(offset, data)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(written)
     }
 
@@ -901,7 +952,7 @@ impl VirtualFile for ImageFile {
                 .context("writing read-only image file")?
                 .write_at_with_ctx(ctx, offset, data)
                 .await?;
-            self.refresh_size_metadata().await?;
+            self.update_size_metadata(Self::base_size(&state.base).await?);
             Ok(written)
         })
     }
@@ -921,7 +972,7 @@ impl VirtualFile for ImageFile {
                 .context("writing read-only image file")?
                 .write_bytes_at_with_ctx(ctx, offset, data)
                 .await?;
-            self.refresh_size_metadata().await?;
+            self.update_size_metadata(Self::base_size(&state.base).await?);
             Ok(written)
         })
     }
@@ -934,7 +985,7 @@ impl VirtualFile for ImageFile {
             .context("discarding read-only image file")?
             .discard(offset, len)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(())
     }
 
@@ -944,13 +995,14 @@ impl VirtualFile for ImageFile {
 
     async fn truncate(&self, size: u64) -> Result<()> {
         let state = self.state.read().await;
+        Self::ensure_grow_complete(&state)?;
         state
             .base
             .writable()
             .context("truncating read-only image file")?
             .truncate(size)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(())
     }
 
@@ -3074,6 +3126,128 @@ mod tests {
         assert_eq!(image.size().await.expect("refresh size"), 4096);
         assert_eq!(image.size_bytes(), 4096);
         assert_eq!(image.num_lbas(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_live_grow_preserves_data_and_new_capacity_after_reopen_and_snapshot() {
+        for mode in [UpperMode::LogStructured, UpperMode::HybridLogStructured] {
+            let tmp = TempDir::new().unwrap();
+            let data = tmp.path().join("upper.data");
+            let index = tmp.path().join("upper.index");
+            create_initialized_upper_with_mode(&data, Some(&index), 8192, mode)
+                .await
+                .unwrap();
+            let config = ImageConfig {
+                upper: UpperConfig {
+                    mode: Some(mode),
+                    data: data.to_string_lossy().into_owned(),
+                    index: index.to_string_lossy().into_owned(),
+                    ..UpperConfig::default()
+                },
+                download_override: Some(DownloadConfig::default()),
+                ..ImageConfig::default()
+            };
+            let image = Arc::new(
+                ImageFile::open(config.clone(), build_service(&tmp).await, None)
+                    .await
+                    .unwrap(),
+            );
+            let original = vec![0x31; 8192];
+            image.write_at(0, &original).await.unwrap();
+            assert_eq!(image.grow(32768).await.unwrap(), 32768);
+            assert_eq!(image.num_lbas(), 64);
+            assert_eq!(image.read_at(0, 8192).await.unwrap().as_ref(), original);
+            assert_eq!(
+                image.read_at(8192, 24576).await.unwrap().as_ref(),
+                vec![0; 24576]
+            );
+            let added = vec![0xa7; 24576];
+            image.write_at(8192, &added).await.unwrap();
+            image.sync().await.unwrap();
+            assert!(image.grow(16384).await.is_err());
+            assert_eq!(image.grow(32768).await.unwrap(), 32768);
+            drop(image);
+            let reopened = ImageFile::open(config, build_service(&tmp).await, None)
+                .await
+                .unwrap();
+            assert_eq!(reopened.size_bytes(), 32768);
+            assert_eq!(reopened.read_at(8192, 24576).await.unwrap().as_ref(), added);
+            let snapshot = tmp.path().join("snapshot.data");
+            reopened.create_snapshot_copy(&snapshot).await.unwrap();
+            let snapshot_config = ImageConfig {
+                lowers: vec![LayerConfig {
+                    file: snapshot.to_string_lossy().into_owned(),
+                    ..LayerConfig::default()
+                }],
+                download_override: Some(DownloadConfig::default()),
+                ..ImageConfig::default()
+            };
+            let sealed = ImageFile::open(snapshot_config, build_service(&tmp).await, None)
+                .await
+                .unwrap();
+            assert_eq!(sealed.size_bytes(), 32768);
+            assert_eq!(sealed.read_at(0, 8192).await.unwrap().as_ref(), original);
+            assert_eq!(sealed.read_at(8192, 24576).await.unwrap().as_ref(), added);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_completes_with_snapshot_waiting_for_exclusive_access() {
+        let tmp = TempDir::new().expect("tempdir");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 4096)
+            .await
+            .unwrap();
+        let config = ImageConfig {
+            upper: UpperConfig {
+                data: upper_data.to_string_lossy().into_owned(),
+                index: upper_index.to_string_lossy().into_owned(),
+                ..UpperConfig::default()
+            },
+            download_override: Some(DownloadConfig::default()),
+            ..ImageConfig::default()
+        };
+        let image = ImageFile::open(config, build_service(&tmp).await, None)
+            .await
+            .unwrap();
+        let index = {
+            let state = image.state.read().await;
+            state.base.writable().unwrap().index()
+        };
+        let index_guard = index.write().await;
+        let payload = vec![0x5a; 4096];
+        let write = image.write_at(0, &payload);
+        tokio::pin!(write);
+        // Hold a real write inside the image, then queue a snapshot behind it.
+        assert!(futures_util::poll!(&mut write).is_pending());
+        let output = tmp.path().join("snapshot.data");
+        let snapshot = image.create_snapshot_copy(&output);
+        tokio::pin!(snapshot);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert!(futures_util::poll!(&mut snapshot).is_pending());
+                if image.state.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("snapshot must queue for exclusive access");
+        drop(index_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (written, snapshot) = tokio::join!(write, snapshot);
+            assert_eq!(written.unwrap(), payload.len());
+            snapshot.unwrap();
+        })
+        .await
+        .expect("queued exclusive access must not deadlock the active write");
+        assert_eq!(
+            image.read_at(0, payload.len()).await.unwrap().as_ref(),
+            payload
+        );
+        image.write_at(0, &vec![0x6b; 4096]).await.unwrap();
     }
 
     /// Mocked remote-path test: ImageService::create_image_file -> mocked registry ->

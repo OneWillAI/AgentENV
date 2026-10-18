@@ -736,6 +736,25 @@ impl SandboxBackend for FirecrackerSandbox {
         FirecrackerSandbox::branch_user_disk(self, output_dir).await
     }
 
+    async fn grow_disk(&mut self, size_bytes: u64) -> Result<u64> {
+        self.grow_user_disk(size_bytes).await
+    }
+
+    fn commit_disk_grow(&mut self) -> Result<()> {
+        let runtime = self
+            .rootfs_runtime
+            .as_ref()
+            .context("missing rootfs runtime")?;
+        let mut intent = super::disk_grow::GrowIntent::read(&runtime.image_config_path)?
+            .context("missing disk grow intent")?;
+        anyhow::ensure!(
+            self.current_rootfs_virtual_size == Some(intent.target_bytes),
+            "disk capacity differs from grow intent"
+        );
+        intent.complete = true;
+        intent.save(&runtime.image_config_path)
+    }
+
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
         self.current_custom_extension_params = params;
     }
@@ -794,6 +813,9 @@ impl FirecrackerSandbox {
     }
 
     fn snapshot_rootfs_virtual_size(&self) -> Result<u64> {
+        if let Some(runtime) = &self.rootfs_runtime {
+            super::disk_grow::GrowIntent::ensure_complete(&runtime.image_config_path)?;
+        }
         self.current_rootfs_virtual_size.context(
             "rootfs virtual size cache missing; sandbox must record the user image block-device size before snapshot; ensure start() was called before pause() or snapshot",
         )
@@ -1540,7 +1562,7 @@ impl FirecrackerSandbox {
         debug!("resuming paused sandbox in-place");
         self.fc_instance.resume().await?;
         if let Some(token) = self.cold_boot_freeze_token.clone() {
-            self.disk_branch_freeze("thaw", &token).await?;
+            self.disk_maintenance("thaw", &token).await?;
             self.cold_boot_freeze_token = None;
         }
         Ok(())
@@ -1773,7 +1795,7 @@ impl FirecrackerSandbox {
         // Record ownership before the RPC: a lost reply may still have frozen
         // the guest. Rollback must prove thaw, otherwise retain the live VM.
         self.cold_boot_freeze_token = Some(token.clone());
-        self.disk_branch_freeze("freeze-stop", &token).await?;
+        self.disk_maintenance("freeze-stop", &token).await?;
         self.fc_instance.pause().await?;
         let disk = self.export_user_disk(output_dir).await?;
         // This is a new upper over an immutable export, so use the explicit
@@ -1808,13 +1830,14 @@ impl FirecrackerSandbox {
     /// Pause Firecracker, copy the writable overlay, then resume. Does not
     /// snapshot RAM or clone processes.
     async fn branch_user_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
+        self.snapshot_rootfs_virtual_size()?;
         tokio::fs::create_dir_all(output_dir)
             .await
             .with_context(|| format!("create disk-branch dir {}", output_dir.display()))?;
         // Pausing vCPUs alone leaves dirty guest metadata behind. A disk-only
         // cold boot cannot recover that memory, unlike a full VM snapshot.
         let token = Uuid::new_v4().to_string();
-        let frozen = self.disk_branch_freeze("freeze", &token).await;
+        let frozen = self.disk_maintenance("freeze", &token).await;
         let branched = match frozen {
             Ok(()) => match self.fc_instance.pause().await {
                 Ok(()) => {
@@ -1833,7 +1856,7 @@ impl FirecrackerSandbox {
         };
         // This also validates that the watchdog did not thaw before copying
         // finished. Never publish a branch after losing the freeze lease.
-        let thawed = self.disk_branch_freeze("thaw", &token).await;
+        let thawed = self.disk_maintenance("thaw", &token).await;
         match (branched, thawed) {
             (Ok(path), Ok(())) => Ok(path),
             (Err(error), Ok(())) => Err(error),
@@ -1844,40 +1867,103 @@ impl FirecrackerSandbox {
         }
     }
 
-    async fn disk_branch_freeze(&mut self, action: &str, token: &str) -> Result<()> {
+    async fn grow_user_disk(&mut self, size_bytes: u64) -> Result<u64> {
+        use super::disk_grow::GrowIntent;
+        anyhow::ensure!(
+            size_bytes != 0 && size_bytes.is_multiple_of(1 << 20),
+            "disk size must be a positive whole MiB"
+        );
+        let runtime = self
+            .rootfs_runtime
+            .clone()
+            .context("live grow requires a writable runtime image")?;
+        anyhow::ensure!(
+            size_bytes
+                >= self
+                    .current_rootfs_virtual_size
+                    .context("missing running disk size")?,
+            "disk shrink is not supported"
+        );
+        self.fc_instance.require_live_disk_grow().await?;
+        UblkDeviceManager::global().require_live_grow().await?;
+        // A prior caller may have lost its response while the guest was frozen.
+        // Its token can release only its own lease; preflight rejects a remaining lease.
+        if let Some(prior) = GrowIntent::read(&runtime.image_config_path)? {
+            if !prior.complete {
+                let _ = self
+                    .disk_maintenance("thaw", &prior.token.to_string())
+                    .await;
+            }
+        }
+        self.disk_maintenance("preflight", &size_bytes.to_string())
+            .await?;
+        let intent = GrowIntent::begin(&runtime.image_config_path, size_bytes)?;
+        let token = intent.token.to_string();
+        let result = async {
+            self.disk_maintenance("freeze", &token).await?;
+            let actual = UblkDeviceManager::global()
+                .grow_device(&runtime.device, size_bytes)
+                .await?;
+            // Never restore the old size after irreversible backing growth.
+            self.current_rootfs_virtual_size = Some(actual);
+            if let Some(runtime) = self.rootfs_runtime.as_mut() {
+                runtime.actual_virtual_size = actual;
+            }
+            // Snapshot restore recreates this relative path in a new work directory.
+            self.fc_instance
+                .patch_drive_path(USER_ROOTFS_DRIVE_ID, Path::new(USER_ROOTFS_DRIVE_PATH))
+                .await?;
+            self.disk_maintenance("capacity", &actual.to_string())
+                .await?;
+            Ok::<_, anyhow::Error>(actual)
+        }
+        .await;
+        let thaw = self.disk_maintenance("thaw", &token).await;
+        let actual = match (result, thaw) {
+            (Ok(actual), Ok(())) => actual,
+            (Err(error), Ok(())) => return Err(error),
+            (result, Err(error)) => return Err(error).context(format!("thaw after disk grow (grow result: {result:?}); independent watchdog remains responsible for recovery")),
+        };
+        self.disk_maintenance("filesystem", &actual.to_string())
+            .await?;
+        Ok(actual)
+    }
+
+    async fn disk_maintenance(&self, action: &str, argument: &str) -> Result<()> {
+        let (script, timeout) = match action {
+            "freeze" | "freeze-stop" | "thaw" => (include_str!("disk-freeze.sh"), 15),
+            "preflight" | "capacity" | "filesystem" => (include_str!("disk-grow.sh"), 120),
+            _ => bail!("unknown disk maintenance action: {action}"),
+        };
         let envd = self
             .envd_instance
             .as_ref()
             .context("sandbox is not running")?
             .clone();
         let operation = action.to_owned();
-        let token = token.to_owned();
+        let argument = argument.to_owned();
         let handle = tokio::runtime::Handle::current();
-        // The envd process transport is !Send. Keep it on one blocking task,
-        // as template execution does, without changing lifecycle trait bounds.
+        // The envd process transport is !Send. Keep it on one blocking task.
         let output = tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 Executor::new(envd)
+                    .with_root_user()
                     .run_command_with_opts(
                         "/bin/sh",
-                        &[
-                            "-c",
-                            include_str!("disk-freeze.sh"),
-                            "disk-freeze",
-                            &operation,
-                            &token,
-                        ],
-                        &ProcessOpts::new().with_timeout(std::time::Duration::from_secs(15)),
+                        &["-c", script, "disk-maintenance", &operation, &argument],
+                        &ProcessOpts::new().with_timeout(std::time::Duration::from_secs(timeout)),
                     )
                     .await
             })
         })
         .await
-        .context("join disk-branch filesystem operation")?
-        .with_context(|| format!("{action} guest root filesystem for disk-branch"))?;
-        if output.exit_code != 0 {
-            bail!("disk-branch {action} failed: {}", output.stderr.trim());
-        }
+        .context("join guest disk maintenance")?
+        .with_context(|| format!("{action} guest root filesystem"))?;
+        anyhow::ensure!(
+            output.exit_code == 0,
+            "disk {action} failed: {}",
+            output.stderr.trim()
+        );
         Ok(())
     }
 

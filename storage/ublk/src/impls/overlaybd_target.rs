@@ -25,7 +25,6 @@ const DEFAULT_IO_OPT_SHIFT: u8 = DEFAULT_PHYSICAL_BS_SHIFT;
 struct TargetState {
     image_config_path: PathBuf,
     image: Arc<ImageFile>,
-    dev_sectors: u64,
     logical_bs_shift: u8,
     physical_bs_shift: u8,
     discard_supported: bool,
@@ -67,7 +66,7 @@ impl TargetState {
     }
 
     fn dev_bytes(&self) -> u64 {
-        self.dev_sectors << self.logical_bs_shift
+        self.image.size_bytes()
     }
 }
 
@@ -91,7 +90,7 @@ impl fmt::Debug for OverlaybdTarget {
         let state = self.state.load();
         f.debug_struct("OverlaybdTarget")
             .field("image_config_path", &state.image_config_path)
-            .field("dev_sectors", &state.dev_sectors)
+            .field("dev_sectors", &state.image.num_lbas())
             .field("logical_bs_shift", &state.logical_bs_shift)
             .field("physical_bs_shift", &state.physical_bs_shift)
             .field("discard_supported", &state.discard_supported)
@@ -150,7 +149,6 @@ impl OverlaybdTarget {
         let state = TargetState {
             image_config_path,
             image,
-            dev_sectors,
             logical_bs_shift,
             physical_bs_shift: DEFAULT_PHYSICAL_BS_SHIFT.max(logical_bs_shift),
             discard_supported,
@@ -206,7 +204,6 @@ impl OverlaybdTarget {
         let new_state = TargetState {
             image_config_path,
             image,
-            dev_sectors,
             logical_bs_shift,
             physical_bs_shift: DEFAULT_PHYSICAL_BS_SHIFT.max(logical_bs_shift),
             discard_supported,
@@ -400,7 +397,7 @@ impl UVMUblkTarget for OverlaybdTarget {
     fn ublk_dev_params(&self, dev_info: &ublk_sys::ublksrv_ctrl_dev_info) -> ublk_sys::ublk_params {
         let state = self.state.load();
         build_ublk_params(
-            state.dev_sectors,
+            state.image.num_lbas(),
             state.logical_bs_shift,
             state.physical_bs_shift,
             dev_info.max_io_buf_bytes,

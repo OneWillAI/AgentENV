@@ -147,6 +147,8 @@ struct PoolState {
     /// Per-image locks keep restack mutation exclusive with image opens for
     /// the same image config without serializing unrelated sandbox resumes.
     image_locks: DashMap<ImageLockKey, Arc<RwLock<()>>>,
+    // Keep a device alive and on the same image through grow/notification.
+    device_locks: DashMap<u32, Arc<Mutex<()>>>,
     /// Coalesces asynchronous pool refill work so concurrent acquire/release
     /// requests do not all synchronously create replacement ublk devices.
     refill_inflight: AtomicBool,
@@ -177,6 +179,7 @@ impl PoolState {
             active_shared: DashMap::new(),
             shared_by_dev_id: DashMap::new(),
             image_locks: DashMap::new(),
+            device_locks: DashMap::new(),
             refill_inflight: AtomicBool::new(false),
             config,
             features,
@@ -537,7 +540,31 @@ async fn handle_connection(
         return Ok(());
     };
 
+    let locked_device = match &request {
+        DaemonRequest::GrowOverlaybd { dev_id, .. }
+        | DaemonRequest::UpdateSize { dev_id, .. }
+        | DaemonRequest::Delete { dev_id }
+        | DaemonRequest::ReleaseOverlaybd { dev_id }
+        | DaemonRequest::ExportSnapshot { dev_id, .. }
+        | DaemonRequest::RestackSnapshot { dev_id, .. } => Some(*dev_id),
+        _ => None,
+    };
+    let _device_guard = if let (Some(pool), Some(dev_id)) = (&pool_state, locked_device) {
+        let lock = pool
+            .device_locks
+            .entry(dev_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        Some(lock.lock_owned().await)
+    } else {
+        None
+    };
+
     let response = match request {
+        DaemonRequest::GrowOverlaybd { dev_id, size_bytes } => {
+            handle_grow_overlaybd(&pool_state, dev_id, size_bytes).await
+        }
+
         DaemonRequest::WatchFilesystemUsage { dev_id } => {
             let target = if let Some(device) = devices.get(&dev_id) {
                 Some(Arc::clone(device.dev.target()))
@@ -1804,6 +1831,47 @@ async fn idle_released_device(
         schedule_idle_pool_refill(Arc::clone(pool), ctrl_ring, virtual_size);
     }
     tracing::info!(dev_id, "device returned to idle pool on placeholder");
+}
+
+async fn handle_grow_overlaybd(
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+    size_bytes: u64,
+) -> Result<DaemonResponse> {
+    let pool = pool_state
+        .as_ref()
+        .context("live grow requires the device pool")?;
+    anyhow::ensure!(
+        pool.supports_update_size(),
+        "UBLK_F_UPDATE_SIZE not supported by kernel"
+    );
+    let (image, config) = {
+        let entry = pool
+            .active_exclusive
+            .get(&dev_id)
+            .context("grow requires an active exclusive device")?;
+        (entry.image.clone(), entry.image_config.clone())
+    };
+    let lock = pool.image_lock(&config);
+    let _image_guard = lock.write().await;
+    let actual = image.grow(size_bytes).await?;
+    // ImageFile publishes capacity only after durable headers. The target reads
+    // that capacity directly, so it accepts new sectors before the kernel does.
+    let update = {
+        let entry = pool
+            .active_exclusive
+            .get(&dev_id)
+            .context("grow device disappeared")?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&entry.image, &image),
+            "grow device image changed"
+        );
+        update_device_size(&entry.dev, actual / 512)
+    };
+    update
+        .await
+        .context("notify kernel of grown image; retry grow to reconcile")?;
+    Ok(DaemonResponse::OverlaybdGrown { size_bytes: actual })
 }
 
 async fn handle_update_size(

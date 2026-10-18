@@ -7,6 +7,7 @@
 mod cold_boot;
 mod config;
 mod connector;
+mod disk_grow;
 mod factory;
 mod instance;
 mod mmds;
