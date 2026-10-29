@@ -81,6 +81,10 @@ impl FirecrackerColdBootState {
 }
 
 impl PausedSandboxState for FirecrackerColdBootState {
+    fn is_cold_boot(&self) -> bool {
+        true
+    }
+
     fn encode(&self) -> Result<Value> {
         self.config.validate_persisted()?;
         serde_json::to_value(self).context("encode disk-only boot record")

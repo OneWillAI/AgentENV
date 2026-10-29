@@ -2202,6 +2202,68 @@ where
         .await
     }
 
+    /// Stop without retaining RAM, preserving the disk and current tools version.
+    pub async fn shutdown_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("shutdown", sandbox_id, async move {
+            this.ensure_accepting_lifecycle_operations()?;
+            loop {
+                let metadata = this
+                    .store
+                    .get(&sandbox_id)
+                    .await?
+                    .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+                Self::require_resume_recovery_resolved(&metadata)?;
+                match metadata.state {
+                    SandboxState::Pausing | SandboxState::Resuming => {
+                        this.wait_for_transition(sandbox_id, metadata.state).await?;
+                    }
+                    SandboxState::Paused => {
+                        if !metadata.paused_runtime_stopped {
+                            let handle = this.sandboxes.read().await.get(&sandbox_id).cloned();
+                            let handle = handle.ok_or(OrchestratorError::InvalidSandboxState {
+                                sandbox_id,
+                                state: metadata.state,
+                            })?;
+                            this.stop_and_ack_paused_runtime(
+                                sandbox_id,
+                                &handle,
+                                metadata.paused_state.as_ref(),
+                            )
+                            .await?;
+                        }
+                        if metadata
+                            .paused_state
+                            .as_ref()
+                            .is_some_and(|state| state.is_cold_boot())
+                        {
+                            return Ok(());
+                        }
+                        // A memory checkpoint must be reopened before its disk can
+                        // be safely retained as an independent cold-boot record.
+                        Arc::clone(&this)
+                            .resume_sandbox_inner(
+                                sandbox_id,
+                                NewTimeout::EnsureMinimum(Duration::from_secs(300)),
+                            )
+                            .await?;
+                    }
+                    SandboxState::Running => {
+                        this.preserve_sandbox(
+                            sandbox_id,
+                            Some(&metadata.runtime_versions.tools_drive_version),
+                        )
+                        .await?;
+                    }
+                    state => {
+                        return Err(OrchestratorError::InvalidSandboxState { sandbox_id, state })
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     /// Apply the node's installed tools release to this sandbox's retained
     /// disk. Product maintenance admission and initialization belong to the
     /// caller. The selected version is also the retry identity: after capture,

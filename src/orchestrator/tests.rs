@@ -2482,6 +2482,70 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 }
 
 #[tokio::test]
+async fn shutdown_retains_disk_without_memory_and_pause_remains_resumable() -> anyhow::Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let artifacts = TempDir::new()?;
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        RecordingPersister::with_artifact_root(artifacts.path().to_path_buf()),
+    );
+    let computer = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let other = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(computer.id).await?;
+    let paused = orchestrator.get_sandbox(&computer.id).await?.unwrap();
+    assert!(!paused.paused_state.as_ref().unwrap().is_cold_boot());
+
+    // Convert an already suspended computer, and recover a failed VM stop
+    // without replacing its retained disk or stopping another computer.
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "temporary stop failure".into(),
+        },
+    );
+    orchestrator
+        .shutdown_sandbox(computer.id)
+        .await
+        .expect_err("injected stop failure");
+    orchestrator.shutdown_sandbox(computer.id).await?;
+    orchestrator.shutdown_sandbox(computer.id).await?;
+    let stopped = orchestrator.get_sandbox(&computer.id).await?.unwrap();
+    assert_eq!(stopped.state, SandboxState::Paused);
+    assert!(stopped.paused_runtime_stopped);
+    assert!(stopped.paused_state.as_ref().unwrap().is_cold_boot());
+    assert_eq!(
+        stopped.runtime_versions.tools_drive_version,
+        computer.runtime_versions.tools_drive_version
+    );
+    assert_eq!(
+        orchestrator.get_sandbox(&other.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+
+    let started = orchestrator
+        .resume_sandbox(computer.id, NewTimeout::Set(Duration::from_secs(60)))
+        .await?;
+    assert_eq!(started.id, computer.id);
+    assert_eq!(started.state, SandboxState::Running);
+    orchestrator.shutdown_sandbox(computer.id).await?;
+    assert!(orchestrator
+        .get_sandbox(&computer.id)
+        .await?
+        .unwrap()
+        .paused_state
+        .as_ref()
+        .unwrap()
+        .is_cold_boot());
+    Ok(())
+}
+
+#[tokio::test]
 async fn reboot_retries_retained_runtime_stop_without_stopping_other_sandboxes(
 ) -> anyhow::Result<()> {
     setup();

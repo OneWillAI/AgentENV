@@ -22,7 +22,36 @@ where
 {
     Router::new()
         .route("/sandboxes/{sandbox_id}/reboot", post(reboot::<I>))
+        .route("/sandboxes/{sandbox_id}/shutdown", post(shutdown::<I>))
         .with_state(api_impl)
+}
+
+async fn shutdown<I>(State(api): State<I>, Path(id): Path<String>, headers: HeaderMap) -> Response
+where
+    I: AsRef<ApiImpl> + Send + Sync,
+{
+    if api
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-API-Key")
+        .await
+        .is_none()
+    {
+        return error(StatusCode::UNAUTHORIZED, "API key is required".into());
+    }
+    let Ok(id) = SandboxId::parse_str(&id) else {
+        return error(StatusCode::NOT_FOUND, "sandbox not found".into());
+    };
+    match api.as_ref().orchestrator().shutdown_sandbox(id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(OrchestratorError::SandboxNotFound(_)) => {
+            error(StatusCode::NOT_FOUND, "sandbox not found".into())
+        }
+        Err(OrchestratorError::InvalidSandboxState { state, .. }) => error(
+            StatusCode::CONFLICT,
+            format!("sandbox cannot shut down from {state:?}"),
+        ),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
 }
 
 async fn reboot<I>(

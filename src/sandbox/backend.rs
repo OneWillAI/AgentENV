@@ -32,6 +32,11 @@ use crate::types::SandboxId;
 pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     fn encode(&self) -> Result<Value>;
 
+    /// A retained disk that will cold boot rather than restore memory.
+    fn is_cold_boot(&self) -> bool {
+        false
+    }
+
     /// Local artifacts this paused sandbox will reopen on resume.
     /// The orchestrator only carries this value to the image-liveness layer; it
     /// does not interpret the backend-specific artifact identities inside it.

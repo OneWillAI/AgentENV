@@ -39,6 +39,23 @@ impl PausedSandboxState for MockSnapshot {
 }
 
 #[derive(Debug)]
+struct MockColdBootState;
+
+impl PausedSandboxState for MockColdBootState {
+    fn encode(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({"cold_boot": true}))
+    }
+
+    fn is_cold_boot(&self) -> bool {
+        true
+    }
+
+    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
+        RuntimeArtifactSet::empty()
+    }
+}
+
+#[derive(Debug)]
 pub struct MockCapturedSnapshot;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -325,7 +342,8 @@ impl SandboxBackend for MockSandboxBackend {
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
         // The mock exercises lifecycle ordering; disk/RAM format behavior is
         // covered by the real Firecracker backend's tests.
-        self.pause(Some(artifact_root)).await
+        self.pause(Some(artifact_root)).await?;
+        Ok(Arc::new(MockColdBootState))
     }
 
     async fn pause(
@@ -537,8 +555,11 @@ impl SandboxBackendFactory for MockBackendFactory {
     fn decode_paused_state(
         &self,
         _artifact_root: std::path::PathBuf,
-        _state: serde_json::Value,
+        state: serde_json::Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
+        if state.get("cold_boot").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(Arc::new(MockColdBootState));
+        }
         Ok(Arc::new(MockSnapshot))
     }
 }

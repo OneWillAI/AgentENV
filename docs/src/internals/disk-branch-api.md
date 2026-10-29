@@ -84,3 +84,14 @@ network slot. Runtime custom-extension parameters include the Firecracker PID
 when available, so the hosted extension can configure that VM's network
 namespace. Both values are runtime-local diagnostics/routing inputs; neither is
 an end-user authorization credential.
+
+## Shutdown without memory retention
+
+`POST /sandboxes/{id}/shutdown` requires the node API key and returns 204 after
+the disk-only recovery record is durable and the VM has stopped. It reuses the
+cold-boot retention path with the computer's current tools version, without
+requesting a tools upgrade. Repeating shutdown is safe. A memory-paused computer
+is resumed first to capture its disk; a subsequent connect cold-boots the retained
+disk with the same sandbox identity. `/pause` continues to preserve memory.
+The existing cold-boot restriction on writable attached drives still applies;
+unsupported captures fail without silently switching to memory preservation.
