@@ -95,3 +95,28 @@ is resumed first to capture its disk; a subsequent connect cold-boots the retain
 disk with the same sandbox identity. `/pause` continues to preserve memory.
 The existing cold-boot restriction on writable attached drives still applies;
 unsupported captures fail without silently switching to memory preservation.
+
+
+## Online root disk growth
+
+`POST /sandboxes/{sandbox_id}/disk-grow` accepts `{"sizeMiB": 65536}`
+and returns the achieved block-device `sizeMiB`. It requires the node API key
+and a running VM. Growth never shrinks or restarts a computer.
+
+The sequence checks filesystem and runtime compatibility, durably increases
+capacity in the existing writable image configuration, updates ublk and
+Firecracker, then runs mounted ext4 growth. It does not freeze the filesystem,
+pause the VM, replace Firecracker's asynchronous I/O engine, or rewrite live
+OverlayBD headers. The image I/O lock excludes storage mutation while capacity
+is published. Snapshot exports carry the effective capacity in their sealed layers.
+
+Failure can leave a larger block device with a smaller filesystem. Retrying the
+same target finishes the remaining steps; no shrink rollback is attempted.
+Capture remains blocked by an in-memory flag until a successful retry finishes
+guest resizing and resource accounting.
+There is no separate operation journal or paired-header redo log.
+
+This requires patched Firecracker `1.15.1-onewill-grow.1`, kernel ublk
+capacity-update support, and a whole-device writable ext4 root with `findmnt`,
+`blockdev`, `dumpe2fs`, and `resize2fs`. Legacy `sparse_super2` filesystems
+are rejected before mutation; this endpoint does not migrate them.

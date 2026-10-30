@@ -107,6 +107,7 @@ pub(crate) struct MaterializeOverlaybdRuntimeRequest<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedSourceUpper {
+    virtual_size: Option<u64>,
     data_path: PathBuf,
     index_path: Option<PathBuf>,
     target_path: Option<PathBuf>,
@@ -261,6 +262,12 @@ pub(crate) async fn resolve_overlaybd_virtual_size(
 ) -> Result<u64> {
     let image_cfg = load_image_config(image_config)
         .with_context(|| format!("load overlaybd image config '{}'", image_config.display()))?;
+
+    // Live growth leaves the lower layers unchanged. Their trailers no longer
+    // describe the capacity of the writable image.
+    if let Some(size) = image_cfg.upper.virtual_size {
+        return Ok(size);
+    }
 
     for layer in image_cfg.lowers.iter().rev() {
         let Some(local_path) = resolve_local_layer_path(layer) else {
@@ -535,6 +542,7 @@ fn resolve_source_upper(image_config_path: &Path) -> Result<Option<ResolvedSourc
     }
 
     Ok(Some(ResolvedSourceUpper {
+        virtual_size: upper.virtual_size,
         data_path: resolve_config_path(base, &upper.data)?,
         index_path: (!upper.index.is_empty())
             .then(|| resolve_config_path(base, &upper.index))
@@ -585,6 +593,7 @@ fn materialize_overlaybd_image_config(
             })
         }
         ResolvedUpperMode::Existing(upper) => json!({
+            "virtualSize": upper.virtual_size,
             "mode": upper.writable_mode,
             "index": match upper.index_path.as_ref() {
                 Some(path) => relative_path(runtime_dir, path)?.to_string_lossy().into_owned(),
@@ -1008,12 +1017,15 @@ mod tests {
     async fn materialize_writable_existing_upper_reuses_source_upper() {
         let temp = tempfile::tempdir().unwrap();
         let (cache, global_config) = test_cache(temp.path()).await;
+        let lower = temp.path().join("lower.data");
+        create_sealed_lower(&lower, &temp.path().join("lower.index"), &[0x31; 8192]).await;
         let source = write_source(
             temp.path(),
             json!({
-                "lowers": [],
+                "lowers": [{ "file": lower }],
                 "upper": {
                     "mode": "logStructured",
+                    "virtualSize": 16384,
                     "data": "existing-upper.data",
                     "index": "existing-upper.index"
                 },
@@ -1024,13 +1036,13 @@ mod tests {
 
         let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
         request.runtime_upper_mode = UpperMode::Sparse;
-        request.known_source_virtual_size = Some(16384);
         let runtime = materialize_overlaybd_runtime(request).await.unwrap();
 
         assert_eq!(runtime.actual_virtual_size, 16384);
         assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
         let image: Value =
             serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
+        assert_eq!(image["upper"]["virtualSize"], json!(16384));
         assert_eq!(image["upper"]["data"], json!("../existing-upper.data"));
         assert_eq!(image["upper"]["index"], json!("../existing-upper.index"));
     }

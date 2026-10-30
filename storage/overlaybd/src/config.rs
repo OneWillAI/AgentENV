@@ -34,6 +34,9 @@ impl LayerConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UpperConfig {
+    /// Durable online capacity; immutable upper headers retain their original size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<UpperMode>,
     pub index: String,
@@ -1273,6 +1276,7 @@ mod tests {
                 size: 0,
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: Some(UpperMode::LogStructured),
                 index: "./upper.index".to_string(),
                 data: "./upper.data".to_string(),

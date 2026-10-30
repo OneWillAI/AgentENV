@@ -37,6 +37,7 @@ where
         .route_layer(middleware::from_fn(optional_connect_body))
         .merge(proxy::router(api_impl.clone()))
         .merge(disk_branch::router(api_impl.clone()))
+        .merge(super::disk_grow::router(api_impl.clone()))
         .merge(host_interaction::router(api_impl.clone()))
         .merge(reboot::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))

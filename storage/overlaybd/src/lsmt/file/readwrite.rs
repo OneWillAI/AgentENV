@@ -412,6 +412,28 @@ impl LSMTFile {
         Ok(())
     }
 
+    /// Apply durable configuration capacity without rewriting the live headers.
+    pub(crate) async fn adopt_grown_size(&self, size: u64) -> Result<()> {
+        ensure!(!self.sealed.load(Ordering::Acquire), "File is sealed.");
+        ensure!(
+            size >= self.virtual_size.load(Ordering::Acquire),
+            "disk shrink is not supported"
+        );
+        ensure!(
+            size > 0 && size.is_multiple_of(HEADER_SIZE),
+            "invalid grow size"
+        );
+        if self.file_type == LSMTFileType::SparseReadWrite {
+            self.rw_data_file
+                .truncate(size.checked_add(HEADER_SIZE).context("grow overflow")?)
+                .await?;
+            self.rw_data_append_offset
+                .store(size + HEADER_SIZE, Ordering::Release);
+        }
+        self.virtual_size.store(size, Ordering::Release);
+        Ok(())
+    }
+
     pub async fn update_vsize(&self, vsize: u64) -> Result<()> {
         // Only the pure append-only log-structured upper maintains an append
         // digest. Sparse and Hybrid can rewrite existing data blocks in place.

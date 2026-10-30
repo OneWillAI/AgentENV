@@ -504,6 +504,23 @@ impl UblkDeviceManager {
         Ok(())
     }
 
+    /// Grow the live writable image before publishing kernel block capacity.
+    pub(crate) async fn require_live_grow(&self) -> Result<()> {
+        let features = self.require_client()?.get_features().await?;
+        anyhow::ensure!(
+            features & uvm_ublk::ublk_caps::UBLK_F_UPDATE_SIZE != 0,
+            "kernel does not support live ublk capacity updates"
+        );
+        Ok(())
+    }
+
+    /// Grow the live writable image before publishing kernel block capacity.
+    pub(crate) async fn grow_device(&self, device: &UblkDevice, size_bytes: u64) -> Result<u64> {
+        self.require_client()?
+            .grow_overlaybd(device.dev_id, size_bytes)
+            .await
+    }
+
     /// Request a non-mutating snapshot of an overlaybd device's upper layer.
     pub(crate) async fn export_snapshot_device(
         &self,

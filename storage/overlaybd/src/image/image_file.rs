@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use std::fmt;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -154,6 +154,51 @@ impl ImageFile {
             block_size,
             prefetcher: initialized.prefetcher,
         })
+    }
+
+    /// Publish capacity in the existing image config before exposing new sectors.
+    /// Headers and existing data are untouched; retry only advances sizes.
+    pub async fn grow(self: &Arc<Self>, config_path: &Path, size: u64) -> Result<u64> {
+        anyhow::ensure!(size > 0 && size.is_multiple_of(4096), "invalid grow size");
+        let image = self.clone();
+        let config_path = config_path.to_path_buf();
+        tokio::spawn(async move {
+            let mut state = image.state.write().await;
+            anyhow::ensure!(size >= image.size_bytes(), "disk shrink is not supported");
+            let current = state
+                .base
+                .writable()
+                .context("grow requires a writable image")?;
+            current.sync().await?;
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&config_path)?)?;
+            let upper = config
+                .get_mut("upper")
+                .and_then(|value| value.as_object_mut())
+                .context("grow requires an upper config")?;
+            anyhow::ensure!(
+                size >= upper
+                    .get("virtualSize")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                "disk shrink is not supported"
+            );
+            upper.insert("virtualSize".into(), size.into());
+            let parent = config_path.parent().context("image config has no parent")?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            temporary.write_all(&serde_json::to_vec(&config)?)?;
+            temporary.as_file().sync_all()?;
+            temporary
+                .persist(&config_path)
+                .map_err(|error| error.error)?;
+            std::fs::File::open(parent)?.sync_all()?;
+            current.adopt_grown_size(size).await?;
+            state.config.upper.virtual_size = Some(size);
+            image.update_size_metadata(size);
+            Ok(size)
+        })
+        .await
+        .context("join image grow")?
     }
 
     pub fn size_bytes(&self) -> u64 {
@@ -642,7 +687,11 @@ impl ImageFile {
                 Some(Arc::new(LocalFile::open_rw(&upper.index, false)?) as Arc<dyn VirtualFile>)
             }
         };
-        Ok(Some(open_file_rw(data_file, idx_file).await?))
+        let file = open_file_rw(data_file, idx_file).await?;
+        if let Some(size) = upper.virtual_size {
+            file.adopt_grown_size(size).await?;
+        }
+        Ok(Some(file))
     }
 
     async fn open_localfile_path(layer: &LayerConfig) -> Result<Option<PathBuf>> {
@@ -841,7 +890,7 @@ impl VirtualFile for ImageFile {
             .context("writing read-only image file")?
             .write_at(offset, data)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(written)
     }
 
@@ -901,7 +950,7 @@ impl VirtualFile for ImageFile {
                 .context("writing read-only image file")?
                 .write_at_with_ctx(ctx, offset, data)
                 .await?;
-            self.refresh_size_metadata().await?;
+            self.update_size_metadata(Self::base_size(&state.base).await?);
             Ok(written)
         })
     }
@@ -921,7 +970,7 @@ impl VirtualFile for ImageFile {
                 .context("writing read-only image file")?
                 .write_bytes_at_with_ctx(ctx, offset, data)
                 .await?;
-            self.refresh_size_metadata().await?;
+            self.update_size_metadata(Self::base_size(&state.base).await?);
             Ok(written)
         })
     }
@@ -934,7 +983,7 @@ impl VirtualFile for ImageFile {
             .context("discarding read-only image file")?
             .discard(offset, len)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(())
     }
 
@@ -950,7 +999,7 @@ impl VirtualFile for ImageFile {
             .context("truncating read-only image file")?
             .truncate(size)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(())
     }
 
@@ -1441,6 +1490,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -1500,6 +1550,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: Some(UpperMode::Sparse),
                 index: String::new(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -1548,6 +1599,7 @@ mod tests {
             repo_blob_url: String::new(),
             lowers: Vec::new(),
             upper: UpperConfig {
+                virtual_size: None,
                 mode: Some(UpperMode::Sparse),
                 index: String::new(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -1612,6 +1664,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -1661,6 +1714,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -1751,6 +1805,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: Some(UpperMode::Sparse),
                 index: String::new(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -1837,6 +1892,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: Some(UpperMode::HybridLogStructured),
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -1925,6 +1981,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -2086,6 +2143,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -2148,6 +2206,7 @@ mod tests {
             repo_blob_url: String::new(),
             lowers: Vec::new(),
             upper: UpperConfig {
+                virtual_size: None,
                 mode: Some(UpperMode::HybridLogStructured),
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -2289,6 +2348,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -2347,6 +2407,7 @@ mod tests {
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: tmp
                     .path()
@@ -3048,6 +3109,7 @@ mod tests {
             repo_blob_url: String::new(),
             lowers: Vec::new(),
             upper: UpperConfig {
+                virtual_size: None,
                 mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
@@ -3074,6 +3136,150 @@ mod tests {
         assert_eq!(image.size().await.expect("refresh size"), 4096);
         assert_eq!(image.size_bytes(), 4096);
         assert_eq!(image.num_lbas(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_live_grow_preserves_data_and_new_capacity_after_reopen_and_snapshot() {
+        for mode in [
+            UpperMode::LogStructured,
+            UpperMode::HybridLogStructured,
+            UpperMode::Sparse,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let data = tmp.path().join("upper.data");
+            let index = tmp.path().join("upper.index");
+            create_initialized_upper_with_mode(&data, Some(&index), 8192, mode)
+                .await
+                .unwrap();
+            let config = ImageConfig {
+                upper: UpperConfig {
+                    mode: Some(mode),
+                    data: data.to_string_lossy().into_owned(),
+                    index: if mode == UpperMode::Sparse {
+                        String::new()
+                    } else {
+                        index.to_string_lossy().into_owned()
+                    },
+                    ..UpperConfig::default()
+                },
+                download_override: Some(DownloadConfig::default()),
+                ..ImageConfig::default()
+            };
+            let config_path = tmp.path().join("image.json");
+            std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let header_before = std::fs::read(&data).unwrap()[..4096].to_vec();
+            let image = Arc::new(
+                ImageFile::open(config.clone(), build_service(&tmp).await, None)
+                    .await
+                    .unwrap(),
+            );
+            let original = vec![0x31; 8192];
+            image.write_at(0, &original).await.unwrap();
+            assert!(image
+                .grow(&tmp.path().join("missing.json"), 32768)
+                .await
+                .is_err());
+            assert_eq!(image.size_bytes(), 8192);
+            assert_eq!(image.read_at(0, 8192).await.unwrap().as_ref(), original);
+            assert_eq!(image.grow(&config_path, 32768).await.unwrap(), 32768);
+            assert_eq!(image.num_lbas(), 64);
+            assert_eq!(image.read_at(0, 8192).await.unwrap().as_ref(), original);
+            assert_eq!(
+                image.read_at(8192, 24576).await.unwrap().as_ref(),
+                vec![0; 24576]
+            );
+            let added = vec![0xa7; 24576];
+            image.write_at(8192, &added).await.unwrap();
+            image.sync().await.unwrap();
+            assert!(image.grow(&config_path, 16384).await.is_err());
+            assert_eq!(image.grow(&config_path, 32768).await.unwrap(), 32768);
+            assert_eq!(
+                &std::fs::read(&data).unwrap()[..4096],
+                header_before.as_slice()
+            );
+            drop(image);
+            let config = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+            let reopened = ImageFile::open(config, build_service(&tmp).await, None)
+                .await
+                .unwrap();
+            assert_eq!(reopened.size_bytes(), 32768);
+            assert_eq!(reopened.read_at(8192, 24576).await.unwrap().as_ref(), added);
+            let snapshot = tmp.path().join("snapshot.data");
+            reopened.create_snapshot_copy(&snapshot).await.unwrap();
+            let snapshot_config = ImageConfig {
+                lowers: vec![LayerConfig {
+                    file: snapshot.to_string_lossy().into_owned(),
+                    ..LayerConfig::default()
+                }],
+                download_override: Some(DownloadConfig::default()),
+                ..ImageConfig::default()
+            };
+            let sealed = ImageFile::open(snapshot_config, build_service(&tmp).await, None)
+                .await
+                .unwrap();
+            assert_eq!(sealed.size_bytes(), 32768);
+            assert_eq!(sealed.read_at(0, 8192).await.unwrap().as_ref(), original);
+            assert_eq!(sealed.read_at(8192, 24576).await.unwrap().as_ref(), added);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_completes_with_snapshot_waiting_for_exclusive_access() {
+        let tmp = TempDir::new().expect("tempdir");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 4096)
+            .await
+            .unwrap();
+        let config = ImageConfig {
+            upper: UpperConfig {
+                data: upper_data.to_string_lossy().into_owned(),
+                index: upper_index.to_string_lossy().into_owned(),
+                ..UpperConfig::default()
+            },
+            download_override: Some(DownloadConfig::default()),
+            ..ImageConfig::default()
+        };
+        let image = ImageFile::open(config, build_service(&tmp).await, None)
+            .await
+            .unwrap();
+        let index = {
+            let state = image.state.read().await;
+            state.base.writable().unwrap().index()
+        };
+        let index_guard = index.write().await;
+        let payload = vec![0x5a; 4096];
+        let write = image.write_at(0, &payload);
+        tokio::pin!(write);
+        // Hold a real write inside the image, then queue a snapshot behind it.
+        assert!(futures_util::poll!(&mut write).is_pending());
+        let output = tmp.path().join("snapshot.data");
+        let snapshot = image.create_snapshot_copy(&output);
+        tokio::pin!(snapshot);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert!(futures_util::poll!(&mut snapshot).is_pending());
+                if image.state.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("snapshot must queue for exclusive access");
+        drop(index_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (written, snapshot) = tokio::join!(write, snapshot);
+            assert_eq!(written.unwrap(), payload.len());
+            snapshot.unwrap();
+        })
+        .await
+        .expect("queued exclusive access must not deadlock the active write");
+        assert_eq!(
+            image.read_at(0, payload.len()).await.unwrap().as_ref(),
+            payload
+        );
+        image.write_at(0, &vec![0x6b; 4096]).await.unwrap();
     }
 
     /// Mocked remote-path test: ImageService::create_image_file -> mocked registry ->

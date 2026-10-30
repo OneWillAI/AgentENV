@@ -124,11 +124,109 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_complete: tokio::sync::Mutex::new(false),
         lifecycle_gate: RwLock::new(()),
+        operations: Mutex::new(HashMap::new()),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         create_idempotency: Mutex::new(HashMap::new()),
         volume_manager: None,
     })
+}
+
+#[tokio::test]
+async fn lifecycle_serialization_survives_caller_cancellation_without_blocking_other_guests() {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let guest = SandboxId::new();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let caller = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        async move {
+            orchestrator
+                .run_cancellation_safe("disk-grow", guest, async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    caller.abort();
+    let mut following = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .run_cancellation_safe("snapshot", guest, async { Ok(()) })
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut following)
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.run_cancellation_safe("snapshot", SandboxId::new(), async { Ok(()) }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), following)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failed_disk_grow_reports_irreversible_capacity_and_retry_finishes_without_stop(
+) -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        DisabledSandboxPersister,
+    );
+    let guest = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    behavior.set_on_operation(MockOperation::GrowDisk, {
+        let weak = Arc::downgrade(&behavior);
+        Arc::new(move || {
+            let behavior = weak.upgrade().unwrap();
+            behavior.set_runtime_info(SandboxRuntimeInfo {
+                rootfs_virtual_size: Some(64 << 20),
+                ..Default::default()
+            });
+        })
+    });
+    behavior.push_action(
+        MockOperation::GrowDisk,
+        MockAction::Fail {
+            message: "guest notification failed after backing growth".into(),
+        },
+    );
+    assert!(orchestrator
+        .grow_sandbox_disk(guest.id, 64 << 20)
+        .await
+        .is_err());
+    let current = orchestrator.get_sandbox(&guest.id).await?.unwrap();
+    assert_eq!(current.state, SandboxState::Running);
+    assert_eq!(current.resources.disk_size_mib, 64);
+    assert_eq!(
+        orchestrator.grow_sandbox_disk(guest.id, 64 << 20).await?,
+        64 << 20
+    );
+    assert_eq!(behavior.stop_calls(), 0);
+    Ok(())
 }
 
 enum StoreAction {

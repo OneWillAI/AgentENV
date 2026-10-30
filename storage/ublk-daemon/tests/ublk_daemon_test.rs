@@ -772,6 +772,9 @@ mod client_tests {
                     }
                 }
                 DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
+                DaemonRequest::GrowOverlaybd { size_bytes, .. } => {
+                    DaemonResponse::OverlaybdGrown { size_bytes }
+                }
                 DaemonRequest::UpdateSize { .. } => DaemonResponse::SizeUpdated,
                 DaemonRequest::NotifySandboxReady { .. } => DaemonResponse::Ok,
                 DaemonRequest::StartPackRecording { .. } => DaemonResponse::Ok,

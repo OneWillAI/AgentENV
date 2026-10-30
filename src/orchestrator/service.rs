@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Weak,
 };
 use std::time::{Duration, Instant, SystemTime};
 
@@ -160,6 +160,10 @@ pub struct Orchestrator<
     shutdown_tx: watch::Sender<bool>,
     shutdown_complete: Mutex<bool>,
     lifecycle_gate: RwLock<()>,
+    // Serialize lifecycle claims as well as backend access for one sandbox.
+    // In particular, pause must not copy pre-grow metadata while grow owns
+    // the backend handle. Weak entries do not retain deleted sandboxes.
+    operations: Mutex<HashMap<SandboxId, Weak<RwLock<()>>>>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     create_idempotency: Mutex<HashMap<String, Arc<CreateIdempotencyEntry>>>,
@@ -288,6 +292,7 @@ where
             shutdown_tx,
             shutdown_complete: Mutex::new(false),
             lifecycle_gate: RwLock::new(()),
+            operations: Mutex::new(HashMap::new()),
             image_refs,
             access_tokens,
             create_idempotency: Mutex::new(create_idempotency),
@@ -542,6 +547,17 @@ where
         entries
     }
 
+    async fn operation_lock(&self, sandbox_id: SandboxId) -> Arc<RwLock<()>> {
+        let mut locks = self.operations.lock().await;
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&sandbox_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(RwLock::new(()));
+        locks.insert(sandbox_id, Arc::downgrade(&lock));
+        lock
+    }
+
     async fn run_cancellation_safe<T>(
         self: &Arc<Self>,
         operation: &'static str,
@@ -554,6 +570,14 @@ where
         let (tx, rx) = oneshot::channel();
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            let operation_lock = this.operation_lock(sandbox_id).await;
+            // Resize excludes lifecycle claims for this guest. Other lifecycle
+            // calls retain their existing concurrent join/replay semantics.
+            let (resize_guard, operation_guard) = if operation == "disk-grow" {
+                (Some(operation_lock.write().await), None)
+            } else {
+                (None, Some(operation_lock.read().await))
+            };
             let guard = this.lifecycle_gate.read().await;
             let result = match this.ensure_accepting_lifecycle_operations() {
                 Ok(()) => future.await,
@@ -565,6 +589,8 @@ where
                 }
             };
             drop(guard);
+            drop(operation_guard);
+            drop(resize_guard);
             if matches!(operation, "pause" | "reboot" | "evict") && result.is_ok() {
                 let _exclusive = this.lifecycle_gate.write().await;
                 this.collect_checkpoints().await;
@@ -1181,6 +1207,52 @@ where
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
             this.fork_sandbox_inner(source_sandbox_id, child_specs, new_timeout)
                 .await
+        })
+        .await
+    }
+
+    /// Grow the running root disk while excluding lifecycle claims for this VM.
+    pub async fn grow_sandbox_disk(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        size_bytes: u64,
+    ) -> Result<u64> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("disk-grow", sandbox_id, async move {
+            let metadata = this
+                .store
+                .get(&sandbox_id)
+                .await?
+                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+            if metadata.state != SandboxState::Running {
+                return Err(OrchestratorError::InvalidSandboxState {
+                    sandbox_id,
+                    state: metadata.state,
+                });
+            }
+            let handle = this
+                .sandboxes
+                .read()
+                .await
+                .get(&sandbox_id)
+                .cloned()
+                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+            let mut sandbox = handle.lock().await;
+            let grown = sandbox.grow_disk(size_bytes).await;
+            // Even a failed grow may have irreversibly enlarged the backing disk.
+            let resources = resources_with_runtime_info(metadata.resources, sandbox.runtime_info());
+            this.store
+                .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                    metadata.resources = resources;
+                })
+                .await?;
+            let actual = grown.map_err(|source| OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::DiskGrow,
+                source,
+            })?;
+            sandbox.finish_disk_grow();
+            Ok(actual)
         })
         .await
     }

@@ -114,6 +114,11 @@ pub enum DaemonRequest {
     ReleaseOverlaybd {
         dev_id: u32,
     },
+    /// Durably grow an exclusively owned writable image, then its ublk device.
+    GrowOverlaybd {
+        dev_id: u32,
+        size_bytes: u64,
+    },
     /// Update the virtual size of a ublk device (requires UBLK_F_UPDATE_SIZE).
     UpdateSize {
         dev_id: u32,
@@ -186,6 +191,9 @@ pub enum DaemonResponse {
     },
     Released,
     SizeUpdated,
+    OverlaybdGrown {
+        size_bytes: u64,
+    },
     Features {
         flags: u64,
     },

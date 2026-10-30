@@ -42,6 +42,7 @@ pub enum SandboxOperation {
     SnapshotVolumes,
     Fork,
     DiskBranch,
+    DiskGrow,
     UpdateNetwork,
     PatchCustomExtensionParams,
     Stop,

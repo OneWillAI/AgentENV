@@ -74,6 +74,7 @@ pub enum MockOperation {
     Fork,
     ForkChild,
     BranchDisk,
+    GrowDisk,
     Stop,
     UpdateNetwork,
 }
@@ -477,6 +478,14 @@ impl SandboxBackend for MockSandboxBackend {
     async fn branch_disk(&mut self, output_dir: &Path) -> Result<PathBuf> {
         self.behavior.apply_async(MockOperation::BranchDisk).await?;
         Ok(output_dir.join("image.json"))
+    }
+
+    async fn grow_disk(&mut self, size_bytes: u64) -> Result<u64> {
+        self.behavior.apply_async(MockOperation::GrowDisk).await?;
+        let mut info = self.behavior.runtime_info();
+        info.rootfs_virtual_size = Some(size_bytes);
+        self.behavior.set_runtime_info(info);
+        Ok(size_bytes)
     }
 }
 

@@ -615,6 +615,7 @@ async fn test_registry_e2e_upper_write_sync_reopen_persist() -> Result<()> {
         .len();
 
     rw_cfg.upper = UpperConfig {
+        virtual_size: None,
         mode: None,
         index: upper_index.to_string_lossy().into_owned(),
         data: upper_data.to_string_lossy().into_owned(),
@@ -747,6 +748,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
     let upper_index = work_root.join("compact-upper.index");
     create_initialized_upper(&upper_data, &upper_index, 0).await?;
     rw_cfg.upper = UpperConfig {
+        virtual_size: None,
         mode: None,
         index: upper_index.to_string_lossy().into_owned(),
         data: upper_data.to_string_lossy().into_owned(),
